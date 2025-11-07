@@ -1,3 +1,4 @@
+--[[pod_format="raw",created="2025-11-07 21:17:10",modified="2025-11-07 21:48:08",revision=1]]
 -- sprite rendering pipeline
 
 -- render sprites with z-buffer occlusion

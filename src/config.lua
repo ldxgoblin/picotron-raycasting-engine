@@ -1,8 +1,9 @@
+--[[pod_format="raw",created="2025-11-07 21:17:14",modified="2025-11-07 21:48:05",revision=1]]
 -- engine configuration
 
 -- screen constants
-screen_width=320
-screen_height=180
+screen_width=480
+screen_height=270
 screen_center_x=160
 screen_center_y=90
 ray_count=320

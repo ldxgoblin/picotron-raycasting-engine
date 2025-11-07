@@ -1,18 +1,19 @@
--- picotron raycast engine v1.0
+--[[pod_format="raw",created="2025-11-07 21:04:06",modified="2025-11-07 22:18:51",revision=5]]
+-- nonboy raycast engine v1.0
 -- main entry point
 
-include"config.lua"
-include"raycast.lua"
-include"render.lua"
-include"render_sprite.lua"
-include"door_system.lua"
-include"dungeon_gen.lua"
+include"src/config.lua"
+include"src/raycast.lua"
+include"src/render.lua"
+include"src/render_sprite.lua"
+include"src/door_system.lua"
+include"src/dungeon_gen.lua"
 
 -- constants
 player_collision_radius=0.15
 
 function _init()
- window(480,270)
+ window(screen_width,screen_height)
  
  -- frame counter for ai timing
  frame_ct=0
@@ -234,17 +235,17 @@ function _update()
  end
  
  -- debug ray casting
- if debug_mode then
-  local sa,ca=sin(player.a),cos(player.a)
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
-  printh("debug: z="..flr(z*100)/100.." hx="..flr(hx*100)/100.." hy="..flr(hy*100)/100.." tile="..tile.." tx="..flr(tx*100)/100)
-  local ob,dist=hitscan(player.x,player.y,ca,sa)
-  if ob then
-   printh("debug: obj found at dist="..flr(dist*100)/100.." kind="..(ob.kind or "unknown"))
-  else
-   printh("debug: no obj hit")
+  if debug_mode then
+   local sa,ca=sin(player.a),cos(player.a)
+   local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
+   printh("debug: z="..(flr(z*100)/100).." hx="..(flr(hx*100)/100).." hy="..(flr(hy*100)/100).." tile="..tile.." tx="..(flr(tx*100)/100))
+   local ob,dist=hitscan(player.x,player.y,ca,sa)
+   if ob then
+    printh("debug: obj found at dist="..(flr(dist*100)/100).." kind="..(ob.kind or "unknown"))
+   else
+    printh("debug: no obj hit")
+   end
   end
- end
 end
 
 function _draw()
@@ -259,7 +260,7 @@ function _draw()
   
   -- hud
   print("pos:"..flr(player.x)..","..flr(player.y),2,2,7)
-  print("ang:"..flr(player.a*100)/100,2,10,7)
+  print("ang:"..(flr(player.a*100)/100),2,10,7)
   print("fps:"..stat(7),2,18,7)
   print("hp:"..player.hp,2,26,7)
   print("[x] toggle map",2,34,7)
@@ -279,9 +280,9 @@ function _draw()
    local sa,ca=sin(player.a),cos(player.a)
    local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
    print("debug on [tab]",2,42,11)
-   print("z="..flr(z*100)/100,2,50,7)
+   print("z="..(flr(z*100)/100),2,50,7)
    print("tile="..tile,2,58,7)
-   print("tx="..flr(tx*100)/100,2,66,7)
+   print("tx="..(flr(tx*100)/100),2,66,7)
    print("floor: "..floor.typ.tex,2,74,7)
    print("roof: "..roof.typ.tex,2,82,7)
   end

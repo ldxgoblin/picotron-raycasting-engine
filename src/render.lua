@@ -1,3 +1,4 @@
+--[[pod_format="raw",created="2025-11-07 21:17:11",modified="2025-11-07 21:48:08",revision=1]]
 -- rendering pipeline
 
 -- get sprite sheet for tline3d

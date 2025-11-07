@@ -1,3 +1,4 @@
+--[[pod_format="raw",created="2025-11-07 21:17:12",modified="2025-11-07 21:48:07",revision=1]]
 -- raycasting core
 
 -- sign helper

@@ -1,3 +1,4 @@
+--[[pod_format="raw",created="2025-11-07 21:17:14",modified="2025-11-07 21:48:06",revision=1]]
 -- door animation system
 
 -- create a door
