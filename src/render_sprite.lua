@@ -3,10 +3,6 @@
 
 -- render sprites with z-buffer occlusion
 function render_sprites()
- palt(0,false)
- palt(14,true)
- local src=get_texture_source()
- 
  local sa,ca=sin(player.a),cos(player.a)
  local vvolg=screen_center_x/sdist
  
@@ -76,14 +72,17 @@ function render_sprites()
  end
  
  -- draw sprites back-to-front
- drawobjs(sobj,sa,ca,src)
+ drawobjs(sobj,sa,ca)
  
  clip()
  pal()
 end
 
--- draw objects from sorted list
-function drawobjs(sobj,sa,ca,src)
+-- draw objects from sorted list with individual 32x32 sprites (color 0=opaque, color 14=transparent)
+function drawobjs(sobj,sa,ca)
+ palt(0,false)
+ palt(14,true)
+ 
  for ob in all(sobj) do
   if not ob or not ob.typ or not ob.rel then
    goto skip_obj
@@ -93,10 +92,44 @@ function drawobjs(sobj,sa,ca,src)
   local x=ob.rel[1]
   local z=ob.rel[2]
   
+  -- fetch sprite for this object
+  local base_sprite_index = ob.sprite_index or t.mx
+  local sprite_index = base_sprite_index
+  
+  -- handle animation with sequential sprite indexes
+  if t.framect then
+   local fr=flr(ob.frame or 0)
+   if ob.animloop then
+    fr=fr%t.framect
+   else
+    fr=min(fr,t.framect-1)
+   end
+   sprite_index = base_sprite_index + fr
+  end
+  
+  -- validate sprite exists; if animation overflow, reset to base
+  local test_src = get_spr(sprite_index)
+  if not test_src then
+   if sprite_index ~= base_sprite_index then
+    -- animation frame overflow detected
+    if not warned_sprites[base_sprite_index] then
+     printh("warning: animation frame overflow for sprite "..base_sprite_index..", clamping to base")
+     warned_sprites[base_sprite_index]=true
+    end
+    sprite_index = base_sprite_index
+   end
+  end
+  
+  local src,is_fallback = get_texture_source(sprite_index)
+  if is_fallback then
+   src = error_texture
+  end
+  
   -- get vertical offset (can be animated)
   local y=ob.y or t.y
   if t.yoffs then
-   local frame_idx=flr(ob.frame%#t.yoffs)+1
+   local frame = ob.frame or 0
+   local frame_idx=flr(frame%#t.yoffs)+1
    if frame_idx>0 and frame_idx<=#t.yoffs then
     y+=t.yoffs[frame_idx]
    end
@@ -118,47 +151,44 @@ function drawobjs(sobj,sa,ca,src)
    y0=y*sdist/z0+screen_center_y
    y1=y*sdist/z1+screen_center_y
   else
-   -- upright sprite
+   -- upright sprite (use world-space height t.h, not pixel size sprite_size)
    local sy=y*f+screen_center_y
    local h=t.h*f
    y0=sy-h/2
    y1=sy+h/2
   end
   
-  -- calculate sprite sheet coordinates
-  local sx_sheet=t.mx
-  local sy_sheet=t.my
-  local sxd=t.mw/w
-  local syd=t.mh/(y1-y0+0.01)
+  -- map screen dimensions to 32x32 sprite UV space
+  local size=sprite_size or 32
+  local sxd=size/w
+  local syd=size/(y1-y0+0.01)
   
-  -- handle animation
-  if t.framect then
-   local fr=flr(ob.frame)
-   if ob.animloop then
-    fr=fr%t.framect
-   else
-    fr=min(fr,t.framect-1)
-   end
-   sx_sheet+=fr*t.mw
-  end
+  -- UV coordinates start at (0,0) for top-left of 32x32 sprite
+  local u0 = 0
+  local v0 = 0
   
   -- compute floating left/top edges for sub-pixel adjustment
   local lx=sx-w/2
   local fy0=y0
   
-  -- clamp to screen bounds
+  -- clamp to screen bounds (0 to screen_width-1 for X, 0 to screen_height-1 for Y)
   local x0=max(0,ceil(lx))
-  local x1=min(ray_count-1,flr(sx+w/2))
-  -- adjust sx_sheet for x clipping
+  local x1=min(screen_width-1,flr(sx+w/2))
+  -- adjust u0 for x clipping
   if x0>lx then
-   sx_sheet+=(x0-lx)*sxd
+   u0+=(x0-lx)*sxd
   end
   
   y0=max(0,ceil(fy0))
   y1=min(screen_height-1,flr(y1))
-  -- adjust sy_sheet for y clipping
+  -- adjust v0 for y clipping
   if y0>fy0 then
-   sy_sheet+=(y0-fy0)*syd
+   v0+=(y0-fy0)*syd
+  end
+  
+  -- guard against degenerate vertical or horizontal span
+  if y1<=y0 or x1<x0 then
+   goto skip_obj
   end
   
   -- set fog and palette
@@ -172,11 +202,14 @@ function drawobjs(sobj,sa,ca,src)
   for px=x0,x1 do
    if z<zbuf[px+1] then
     -- not occluded, draw column
-    local u_offset=sx_sheet+(px-x0)*sxd
-    tline3d(src,px,y0,px,y1,u_offset,sy_sheet,u_offset,sy_sheet+t.mh,1,1)
+    local u_offset=u0+(px-x0)*sxd
+    tline3d(src,px,y0,px,y1,u_offset,v0,u_offset,v0+size,1,1)
    end
   end
   
   ::skip_obj::
  end
+ 
+ -- restore transparency mask to defaults
+ palt()
 end

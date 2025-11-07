@@ -4,14 +4,18 @@
 -- screen constants
 screen_width=480
 screen_height=270
-screen_center_x=160
-screen_center_y=90
-ray_count=320
+screen_center_x=240
+screen_center_y=135
+ray_count=480
+-- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2, ray_count must equal screen_width
 sdist=200 -- default; computed dynamically in raycast_scene() based on fov
 map_size=128
 objgrid_size=5
 objgrid_array_size=26
 fov=0.5
+
+-- sprite configuration
+sprite_size=32
 
 -- fog configuration (optional enhancements)
 fogdist=250 -- fog distance parameter for quadratic falloff (scaled from PICO-8's 100-150)
@@ -31,42 +35,41 @@ player_move_speed=0.1 -- units per frame when moving
 door_anim_speed=0.06 -- door open/close speed per frame
 door_close_delay=90 -- frames before door auto-closes
 
--- floor/ceiling types
+-- floor/ceiling types (tex indexes from gfx/1_surfaces.gfx, offset 32)
 planetyps={
  -- stone_tile
- {tex=0,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
+ {tex=32,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
  -- dirt
- {tex=1,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
+ {tex=33,scale=1,height=0.5,lit=true,xvel=0,yvel=0},
  -- stone_ceiling
- {tex=2,scale=1,height=0.5,lit=false,xvel=0,yvel=0},
+ {tex=34,scale=1,height=0.5,lit=false,xvel=0,yvel=0},
  -- sky
- {tex=8,scale=2,height=1,lit=false,xvel=0.01,yvel=0},
+ {tex=35,scale=2,height=1,lit=false,xvel=0.01,yvel=0},
  -- night_sky
- {tex=9,scale=2,height=1,lit=false,xvel=0.005,yvel=0}
+ {tex=36,scale=2,height=1,lit=false,xvel=0.005,yvel=0}
 }
 
--- wall texture sets
+-- wall texture sets (sprite indexes from gfx/0_walls.gfx)
 texsets={
- -- none (for empty space)
- {base=0,variants={0}},
+ -- none (removed to avoid collision with brick variant 0)
  -- brick
- {base=1,variants={1,2,3,4}},
+ {base=0,variants={0,1,2,3}},
  -- cobblestone
- {base=5,variants={5,6,7,8}},
+ {base=4,variants={4,5,6,7}},
  -- wood_plank
- {base=9,variants={9,10,11,12}},
+ {base=8,variants={8,9,10,11}},
  -- stone
- {base=13,variants={13,14,15,16}},
+ {base=12,variants={12,13,14,15}},
  -- grass (outdoor)
- {base=17,variants={17,18,19,20}},
+ {base=16,variants={16,17,18,19}},
  -- earth (outdoor)
- {base=21,variants={21,22,23,24}}
+ {base=20,variants={20,21,22,23}}
 }
 
--- door types (tile IDs, must not overlap with floor 0)
-door_normal=64
-door_locked=65
-door_stay_open=66
+-- door types (sprite indexes from gfx/0_walls.gfx)
+door_normal=24
+door_locked=25
+door_stay_open=26
 
 -- helper: check if tile is a door
 function is_door(val)
@@ -108,47 +111,48 @@ test_door_open=nil -- if set to a value 0.0-1.0, forces all doors to this open s
 test_door_x=nil -- if set, only affects door at this position
 test_door_y=nil -- if set, only affects door at this position
 
--- object type definitions
+-- object type definitions (mx=sprite index from gfx files, my deprecated, mw/mh use sprite_size)
+-- NOTE: my=0 is deprecated and maintained for backward compatibility only; will be removed once rendering code migrates
 obj_types={
- player={solid=true,w=0.4,mx=98,my=9,mw=8,mh=8,y=0.4,h=0.8,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="player"},
- enemy={solid=true,w=0.4,mx=103,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
- item={solid=false,w=0.3,mx=80,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="generic"},
- key={solid=false,w=0.3,mx=98,my=10,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="key"},
- heart={solid=false,w=0.3,mx=88,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup",subtype="heart"},
- decoration={solid=false,w=0.3,mx=92,my=0,mw=8,mh=16,y=0.3,h=0.4,flat=false,lit=0,framect=4,animspd=0.25,yoffs=nil,kind="decorative"},
- hostile_npc={solid=true,w=0.4,mx=103,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
- non_hostile_npc={solid=false,w=0.4,mx=110,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="non_hostile_npc"},
- direct_pickup={solid=false,w=0.2,mx=80,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup"},
- interactable_chest={solid=false,w=0.3,mx=85,my=0,mw=8,mh=8,y=0.3,h=0.3,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="chest"},
- interactable_shrine={solid=false,w=0.4,mx=90,my=0,mw=8,mh=16,y=0.3,h=0.5,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="shrine"},
- interactable_trap={solid=false,w=0.2,mx=95,my=0,mw=8,mh=8,y=0.4,h=0.1,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="trap"},
- interactable_note={solid=false,w=0.3,mx=100,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="note"},
- interactable_exit={solid=false,w=0.3,mx=100,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="exit"}
+ player={solid=true,w=0.4,mx=0,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.8,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="player"},
+ enemy={solid=true,w=0.4,mx=64,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
+ item={solid=false,w=0.3,mx=128,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="generic"},
+ key={solid=false,w=0.3,mx=129,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=nil,animspd=nil,yoffs=nil,kind="direct_pickup",subtype="key"},
+ heart={solid=false,w=0.3,mx=130,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup",subtype="heart"},
+ decoration={solid=false,w=0.3,mx=148,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.4,flat=false,lit=0,framect=4,animspd=0.25,yoffs=nil,kind="decorative"},
+ hostile_npc={solid=true,w=0.4,mx=64,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
+ non_hostile_npc={solid=false,w=0.4,mx=73,my=0,mw=sprite_size,mh=sprite_size,y=0.1,h=0.8,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="non_hostile_npc"},
+ direct_pickup={solid=false,w=0.2,mx=128,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup"},
+ interactable_chest={solid=false,w=0.3,mx=131,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.3,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="chest"},
+ interactable_shrine={solid=false,w=0.4,mx=132,my=0,mw=sprite_size,mh=sprite_size,y=0.3,h=0.5,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="shrine"},
+ interactable_trap={solid=false,w=0.2,mx=133,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.1,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="trap"},
+ interactable_note={solid=false,w=0.3,mx=134,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=true,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="note"},
+ interactable_exit={solid=false,w=0.3,mx=135,my=0,mw=sprite_size,mh=sprite_size,y=0.4,h=0.2,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="exit"}
 }
 
--- enemy type definitions
+-- enemy type definitions (sprite indexes from gfx/2_characters.gfx, offset 64)
 enemy_types={
- {name="rat",difficulty=1,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=1,hp=1},
- {name="bat",difficulty=2,min_count=1,max_count=4,obj_type=obj_types.hostile_npc,sprite=2,hp=1},
- {name="slime",difficulty=3,min_count=2,max_count=5,obj_type=obj_types.hostile_npc,sprite=3,hp=2},
- {name="skeleton",difficulty=4,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=4,hp=3},
- {name="goblin",difficulty=5,min_count=2,max_count=4,obj_type=obj_types.hostile_npc,sprite=5,hp=3},
- {name="orc",difficulty=6,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=6,hp=4},
- {name="troll",difficulty=7,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=7,hp=5},
- {name="demon",difficulty=8,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=8,hp=6},
- {name="dragon",difficulty=9,min_count=1,max_count=1,obj_type=obj_types.hostile_npc,sprite=9,hp=10}
+ {name="rat",difficulty=1,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=64,hp=1},
+ {name="bat",difficulty=2,min_count=1,max_count=4,obj_type=obj_types.hostile_npc,sprite=65,hp=1},
+ {name="slime",difficulty=3,min_count=2,max_count=5,obj_type=obj_types.hostile_npc,sprite=66,hp=2},
+ {name="skeleton",difficulty=4,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=67,hp=3},
+ {name="goblin",difficulty=5,min_count=2,max_count=4,obj_type=obj_types.hostile_npc,sprite=68,hp=3},
+ {name="orc",difficulty=6,min_count=1,max_count=3,obj_type=obj_types.hostile_npc,sprite=69,hp=4},
+ {name="troll",difficulty=7,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=70,hp=5},
+ {name="demon",difficulty=8,min_count=1,max_count=2,obj_type=obj_types.hostile_npc,sprite=71,hp=6},
+ {name="dragon",difficulty=9,min_count=1,max_count=1,obj_type=obj_types.hostile_npc,sprite=72,hp=10}
 }
 
--- decoration type definitions
+-- decoration type definitions (sprite indexes from gfx/3_props.gfx, offset 148)
 decoration_types={
- {name="torch",difficulty=1,obj_type=obj_types.decoration,gen_tags={"lit","uni"},theme_tags={"dng","lit"},sprite=10},
- {name="barrel",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"dng","house"},sprite=11},
- {name="crate",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni2"},theme_tags={"dng","house"},sprite=12},
- {name="pillar",difficulty=2,obj_type=obj_types.decoration,gen_tags={"big"},theme_tags={"dng","dem"},sprite=13},
- {name="statue",difficulty=3,obj_type=obj_types.decoration,gen_tags={"rare"},theme_tags={"dng","dem"},sprite=14},
- {name="chest",difficulty=2,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"dng","house"},sprite=15},
- {name="tree",difficulty=1,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"out"},sprite=16},
- {name="rock",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"out"},sprite=17}
+ {name="torch",difficulty=1,obj_type=obj_types.decoration,gen_tags={"lit","uni"},theme_tags={"dng","lit"},sprite=148},
+ {name="barrel",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"dng","house"},sprite=149},
+ {name="crate",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni2"},theme_tags={"dng","house"},sprite=150},
+ {name="pillar",difficulty=2,obj_type=obj_types.decoration,gen_tags={"big"},theme_tags={"dng","dem"},sprite=151},
+ {name="statue",difficulty=3,obj_type=obj_types.decoration,gen_tags={"rare"},theme_tags={"dng","dem"},sprite=152},
+ {name="chest",difficulty=2,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"dng","house"},sprite=153},
+ {name="tree",difficulty=1,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"out"},sprite=154},
+ {name="rock",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"out"},sprite=155}
 }
 
 -- theme definitions

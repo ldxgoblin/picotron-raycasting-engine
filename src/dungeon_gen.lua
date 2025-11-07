@@ -390,10 +390,14 @@ function find_spawn_point(rect)
   if x>=0 and x<128 and y>=0 and y<128 and wallgrid[x][y]==0 then
    local valid=true
    for obj in all(gen_objects) do
-    local dx,dy=abs(obj.x-x),abs(obj.y-y)
-    if dx<1 and dy<1 then
-     valid=false
-     break
+    local ox=obj.pos and obj.pos[1] or obj.x
+    local oy=obj.pos and obj.pos[2] or obj.y
+    if ox and oy then
+     local dx,dy=abs(ox-x),abs(oy-y)
+     if dx<1 and dy<1 then
+      valid=false
+      break
+     end
     end
    end
    
@@ -582,8 +586,22 @@ function generate_npcs()
    if x then
     -- 70% hostile, 30% non-hostile
     if rnd(1)<gen_params.npc_hostile_ratio then
+     -- select enemy type based on current difficulty level
+     local available_enemies = {}
+     for enemy in all(enemy_types) do
+      if enemy.difficulty <= gen_params.difficulty then
+       add(available_enemies, enemy)
+      end
+     end
+     -- fallback to rat if no enemies available
+     if #available_enemies == 0 then
+      available_enemies = {enemy_types[1]}
+     end
+     local enemy_type = available_enemies[flr(rnd(#available_enemies))+1]
+     
      -- hostile npc with patrol or follow behavior
      local ai_type=rnd(1)<0.5 and "patrol" or "follow"
+     -- sprite_index from enemy_types configuration (64-72 range)
      local ob={
       pos={x,y},
       typ=obj_types.hostile_npc,
@@ -593,7 +611,8 @@ function generate_npcs()
       autoanim=true,
       ai_type=ai_type,
       patrol_index=0,
-      patrol_points={}
+      patrol_points={},
+      sprite_index=enemy_type.sprite
      }
      -- generate patrol points if patrol mode
      if ai_type=="patrol" then
@@ -609,14 +628,15 @@ function generate_npcs()
      end
      add(gen_objects,ob)
     else
-     -- non-hostile npc
+     -- non-hostile NPCs use sprite 73
      local ob={
       pos={x,y},
       typ=obj_types.non_hostile_npc,
       rel={0,0},
       frame=0,
       animloop=true,
-      autoanim=false
+      autoanim=false,
+      sprite_index=obj_types.non_hostile_npc.mx
      }
      add(gen_objects,ob)
     end
@@ -717,7 +737,8 @@ function generate_decorations()
         if room_decor_count>=max_decor then break end
         if rnd(1)<0.5 then
          local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
-         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+         -- sprite_index from decoration_types configuration (148-155 range)
+         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
          add(gen_objects,ob)
          room_decor_count+=1
         end
@@ -732,7 +753,7 @@ function generate_decorations()
         if room_decor_count>=max_decor then break end
         if rnd(1)<0.6 then
          local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
-         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
          add(gen_objects,ob)
          room_decor_count+=1
         end
@@ -746,7 +767,7 @@ function generate_decorations()
        if room_decor_count>=max_decor then break end
        local x,y=find_spawn_point(rect)
        if x then
-        local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+        local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
         add(gen_objects,ob)
         room_decor_count+=1
        end
@@ -758,14 +779,14 @@ function generate_decorations()
       local cx,cy=flr((rect[1]+rect[3])/2)+0.5,flr((rect[2]+rect[4])/2)+0.5
       if rnd(1)<0.5 then
        -- center
-       local ob={pos={cx,cy},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       local ob={pos={cx,cy},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
        add(gen_objects,ob)
        room_decor_count+=1
       else
        -- random corner
        local corners={{rect[1]+1.5,rect[2]+1.5},{rect[3]-0.5,rect[2]+1.5},{rect[1]+1.5,rect[4]-0.5},{rect[3]-0.5,rect[4]-0.5}}
        local corner=corners[flr(rnd(#corners))+1]
-       local ob={pos={corner[1],corner[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       local ob={pos={corner[1],corner[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
        add(gen_objects,ob)
        room_decor_count+=1
       end
@@ -775,7 +796,7 @@ function generate_decorations()
       -- rare: single spawn
       local x,y=find_spawn_point(rect)
       if x then
-       local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
        add(gen_objects,ob)
        room_decor_count+=1
       end
@@ -795,7 +816,7 @@ function generate_decorations()
       end
       if #walls>0 then
        local pos=walls[flr(rnd(#walls))+1]
-       local ob={pos={pos[1],pos[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       local ob={pos={pos[1],pos[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,sprite_index=dec.sprite}
        add(gen_objects,ob)
        room_decor_count+=1
       end

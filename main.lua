@@ -45,6 +45,7 @@ function _init()
  map={}
  map.walls=userdata("i16",128,128)
  map.doors=userdata("i16",128,128)
+ map.floors=userdata("i16",128,128)
  
  -- helper: get wall tile
  -- Purpose: Retrieve wall tile ID at grid position with fallback
@@ -87,6 +88,36 @@ function _init()
    map.doors:set(x,y,val or 0)
   end
  end
+
+ -- helper: get floor tile
+ -- Purpose: Retrieve floor type ID at grid position
+ -- Parameters: x, y (grid coordinates 0-127)
+ -- Returns: floor type ID (0=use global default, 1-8=specific floor type from planetyps)
+ -- Notes: Floor type IDs map to indices in the planetyps table defined in config.lua
+ function get_floor(x,y)
+  if x>=0 and x<128 and y>=0 and y<128 then
+   return map.floors:get(x,y) or 0
+  end
+  return 0
+ end
+
+ -- helper: set floor tile
+ -- Purpose: Store per-cell floor type IDs for varied floor textures
+ -- Parameters: x, y (grid coordinates 0-127), val (floor type ID 0-8)
+ -- Notes: 0=use global default floor type, 1-8=specific floor type from planetyps
+ function set_floor(x,y,val)
+  if x>=0 and x<128 and y>=0 and y<128 then
+   -- normalize val to valid range 0-8
+   if type(val)~="number" or val==nil then
+    val=0
+   elseif val<0 then
+    val=0
+   elseif val>8 then
+    val=8
+   end
+   map.floors:set(x,y,val)
+  end
+ end
  
  -- compatibility layer: expose wallgrid as table for dungeon generator
  wallgrid={}
@@ -97,6 +128,13 @@ function _init()
   for j=0,127 do
    wallgrid[i][j]=0
    doorgrid[i][j]=nil
+  end
+ end
+ 
+ -- initialize floor data
+ for i=0,127 do
+  for j=0,127 do
+   set_floor(i,j,0)
   end
  end
   
@@ -135,7 +173,52 @@ function _init()
  -- test door mode
  test_door_mode=false
 
+ -- create error texture for missing sprites (bright magenta checkerboard)
+ error_texture = userdata("u8", 32, 32)
+ for y=0,31 do
+  for x=0,31 do
+   local color = ((flr(x/4) + flr(y/4)) % 2 == 0) and 8 or 14
+   error_texture:set(x, y, color)
+  end
+ end
+
+ -- validate all configured sprites exist (comment out for production)
+ validate_sprite_configuration()
+
  printh("picotron raycast engine v1.0")
+end
+
+-- validate sprite configuration at startup (optional, can be disabled for performance)
+function validate_sprite_configuration()
+ -- check enemy sprites
+ for enemy in all(enemy_types) do
+  if not get_spr(enemy.sprite) then
+   printh("WARNING: enemy sprite "..enemy.sprite.." ("..enemy.name..") not found in GFX files")
+  end
+ end
+ 
+ -- check decoration sprites
+ for dec in all(decoration_types) do
+  if not get_spr(dec.sprite) then
+   printh("WARNING: decoration sprite "..dec.sprite.." ("..dec.name..") not found in GFX files")
+  end
+ end
+ 
+ -- check wall texture sprites
+ for texset in all(texsets) do
+  for variant in all(texset.variants) do
+   if not get_spr(variant) then
+    printh("WARNING: wall texture sprite "..variant.." not found in GFX files")
+   end
+  end
+ end
+ 
+ -- check floor/ceiling sprites
+ for typ in all(planetyps) do
+  if not get_spr(typ.tex) then
+   printh("WARNING: floor/ceiling sprite "..typ.tex.." not found in GFX files")
+  end
+ end
 end
 
 function _update()
@@ -307,14 +390,23 @@ function draw_minimap()
  local scale=2
  local ox,oy=10,10
  
- -- draw wallgrid
+ -- draw wallgrid with floor data to distinguish corridors from void
  for x=0,127 do
   for y=0,127 do
-   if wallgrid[x][y]>0 then
-    rectfill(ox+x*scale,oy+y*scale,ox+x*scale+scale-1,oy+y*scale+scale-1,5)
+   local wall=wallgrid[x][y]
+   local floor_val=get_floor(x,y)
+   local color
+   if wall>0 then
+    -- wall tile
+    color=5
+   elseif floor_val>0 then
+    -- carved corridor/room floor (floor type set during generation)
+    color=6
    else
-    rectfill(ox+x*scale,oy+y*scale,ox+x*scale+scale-1,oy+y*scale+scale-1,1)
+    -- uncarved void (wall=0, floor=0)
+    color=1
    end
+   rectfill(ox+x*scale,oy+y*scale,ox+x*scale+scale-1,oy+y*scale+scale-1,color)
   end
  end
  

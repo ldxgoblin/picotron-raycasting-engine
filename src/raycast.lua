@@ -126,7 +126,7 @@ end
 function raycast_scene()
  -- compute projection distance from FOV (fov is half-angle in radians)
  -- sdist = screen_center_x / tan(half_fov) ensures proper perspective mapping
- sdist=screen_center_x/tan(fov)
+ sdist=screen_center_x/math.tan(fov)
  
  local sa,ca=sin(player.a),cos(player.a)
  minx,maxx=999,-999
@@ -144,7 +144,8 @@ function raycast_scene()
   local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,sa,ca)
   
   zbuf[i+1]=z
-  tbuf[i+1]={tile=tile,tx=tx}
+  tbuf[i+1].tile=tile
+  tbuf[i+1].tx=tx
   
   -- track bounds for object culling
   minx=min(minx,hx)
