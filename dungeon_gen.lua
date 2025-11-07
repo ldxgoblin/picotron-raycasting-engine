@@ -12,6 +12,11 @@ function is_wall(val)
  return val>0 and val<door_normal
 end
 
+-- helper: check if tile is a door
+function is_door(val)
+ return val>=door_normal and val<=door_stay_open
+end
+
 -- helper: check if tile is an exit
 function is_exit(val)
  return val>=exit_start and val<=exit_end
@@ -142,6 +147,7 @@ function create_corridor(n1,n2)
   for x=bx1+1,bx2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
+				set_floor(x,y,1)
    end
   end
 
@@ -172,6 +178,7 @@ function create_corridor(n1,n2)
   for y=by1+1,by2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
+				set_floor(x,y,1)
    end
   end
 
@@ -206,6 +213,7 @@ function create_corridor(n1,n2)
   for x=bx1_horiz+1,bx2_horiz-1 do
    if x>=0 and x<128 and n1.midy>=0 and n1.midy<128 then
 				set_wall(x,n1.midy,0)
+				set_floor(x,n1.midy,1)
    end
   end
   
@@ -229,6 +237,7 @@ function create_corridor(n1,n2)
   for y=by1_vert+1,by2_vert-1 do
    if jx>=0 and jx<128 and y>=0 and y<128 then
 				set_wall(jx,y,0)
+				set_floor(jx,y,1)
    end
   end
 
@@ -275,27 +284,38 @@ function try_generate_room()
  return true
 end
 
--- helper: apply wall at position with bounds and door/exit checking
-function apply_wall_at(x, y, tex)
- if x >= 0 and x < 128 and y >= 0 and y < 128 then
-  if not (is_door(get_wall(x, y)) or is_exit(get_wall(x, y))) then
-   set_wall(x, y, tex)
-  end
- end
-end
-
 -- helper: apply wall textures to room perimeter
 function apply_room_walls(rect,tex)
  -- ensure tex is never 0
  if tex==0 then tex=1 end
  
  for x=rect[1],rect[3] do
-  apply_wall_at(x, rect[2]-1, tex)
-  apply_wall_at(x, rect[4]+1, tex)
+  if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
+   -- skip if door or exit tile
+		if not (is_door(get_wall(x,rect[2]-1)) or is_exit(get_wall(x,rect[2]-1))) then
+			set_wall(x,rect[2]-1,tex)
+   end
+  end
+  if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
+   -- skip if door or exit tile
+		if not (is_door(get_wall(x,rect[4]+1)) or is_exit(get_wall(x,rect[4]+1))) then
+			set_wall(x,rect[4]+1,tex)
+   end
+  end
  end
  for y=rect[2],rect[4] do
-  apply_wall_at(rect[1]-1, y, tex)
-  apply_wall_at(rect[3]+1, y, tex)
+  if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
+   -- skip if door or exit tile
+		if not (is_door(get_wall(rect[1]-1,y)) or is_exit(get_wall(rect[1]-1,y))) then
+			set_wall(rect[1]-1,y,tex)
+   end
+  end
+  if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
+   -- skip if door or exit tile
+		if not (is_door(get_wall(rect[3]+1,y)) or is_exit(get_wall(rect[3]+1,y))) then
+			set_wall(rect[3]+1,y,tex)
+   end
+  end
  end
 end
 
@@ -303,6 +323,26 @@ end
 function random_wall_texture()
  local set=texsets[flr(rnd(#texsets-1))+2] -- skip texsets[1] which is floor
  return set.variants[flr(rnd(#set.variants))+1]
+end
+
+-- helper: get theme-appropriate wall texture set
+function theme_wall_texture(theme)
+ if theme=="out" then
+  -- outdoor: grass or earth variants
+  local idx=rnd(1)<0.5 and 6 or 7 -- grass or earth
+  return texsets[idx]
+ elseif theme=="dem" then
+  -- demon: stone or cobblestone
+  local idx=rnd(1)<0.5 and 3 or 5
+  return texsets[idx]
+ elseif theme=="house" then
+  -- house: wood plank
+  return texsets[4]
+ else
+  -- default dungeon: brick or cobblestone
+  local idx=rnd(1)<0.5 and 2 or 3
+  return texsets[idx]
+ end
 end
 
 -- helper: find accessible rooms from start via edges
@@ -349,7 +389,7 @@ function find_spawn_point(rect)
   if x>=0 and x<128 and y>=0 and y<128 and wallgrid[x][y]==0 then
    local valid=true
    for obj in all(gen_objects) do
-    local dx,dy=abs(obj.pos[1]-x),abs(obj.pos[2]-y)
+    local dx,dy=abs(obj.x-x),abs(obj.y-y)
     if dx<1 and dy<1 then
      valid=false
      break
@@ -639,32 +679,124 @@ end
 
 -- generate decorations in rooms
 function generate_decorations()
+ local current_theme=gen_params.theme or "dng"
+ local theme_config=themes[current_theme] or themes.dng
+ local decor_prob=theme_config.decor_prob or 0.8
+ 
  for node in all(gen_nodes) do
   local rect=node.rect
   local w,h=rect[3]-rect[1]+1,rect[4]-rect[2]+1
+  local room_decor_count=0
+  local max_decor=gen_params.max_decorations_per_room or 12
   
   -- uniform grid pattern
   for dec in all(decoration_types) do
-   if dec.gen_tags then
+   if room_decor_count>=max_decor then break end
+   
+   -- filter by theme: check if any theme_tags match current_theme
+   local theme_match=false
+   if dec.theme_tags then
+    for tag in all(dec.theme_tags) do
+     if tag==current_theme then
+      theme_match=true
+      break
+     end
+    end
+   else
+    theme_match=true -- no theme_tags means always match
+   end
+   
+   if theme_match and dec.gen_tags then
     for tag in all(dec.gen_tags) do
-     if tag=="uni" and rnd(1)<0.3 then
+     if room_decor_count>=max_decor then break end
+     
+     if tag=="uni" and rnd(1)<0.3*decor_prob then
       for dx=2,w-2,3 do
        for dy=2,h-2,3 do
+        if room_decor_count>=max_decor then break end
         if rnd(1)<0.5 then
          local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
          local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
          add(gen_objects,ob)
+         room_decor_count+=1
         end
        end
+       if room_decor_count>=max_decor then break end
       end
-     elseif tag=="scatter" and rnd(1)<0.2 then
+      
+     elseif tag=="uni2" and rnd(1)<0.4*decor_prob then
+      -- denser uniform grid
+      for dx=1,w-1,2 do
+       for dy=1,h-1,2 do
+        if room_decor_count>=max_decor then break end
+        if rnd(1)<0.6 then
+         local x,y=rect[1]+dx+0.5,rect[2]+dy+0.5
+         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+         add(gen_objects,ob)
+         room_decor_count+=1
+        end
+       end
+       if room_decor_count>=max_decor then break end
+      end
+      
+     elseif tag=="scatter" and rnd(1)<0.2*decor_prob then
       local count=flr(rnd(3))+1
       for i=1,count do
+       if room_decor_count>=max_decor then break end
        local x,y=find_spawn_point(rect)
        if x then
         local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
         add(gen_objects,ob)
+        room_decor_count+=1
        end
+      end
+      
+     elseif tag=="big" and rnd(1)<0.15*decor_prob then
+      if room_decor_count>=max_decor then break end
+      -- large object: place at room center or corner
+      local cx,cy=flr((rect[1]+rect[3])/2)+0.5,flr((rect[2]+rect[4])/2)+0.5
+      if rnd(1)<0.5 then
+       -- center
+       local ob={pos={cx,cy},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      else
+       -- random corner
+       local corners={{rect[1]+1.5,rect[2]+1.5},{rect[3]-0.5,rect[2]+1.5},{rect[1]+1.5,rect[4]-0.5},{rect[3]-0.5,rect[4]-0.5}}
+       local corner=corners[flr(rnd(#corners))+1]
+       local ob={pos={corner[1],corner[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      end
+      
+     elseif tag=="rare" and rnd(1)<0.05*decor_prob then
+      if room_decor_count>=max_decor then break end
+      -- rare: single spawn
+      local x,y=find_spawn_point(rect)
+      if x then
+       local ob={pos={x,y},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       add(gen_objects,ob)
+       room_decor_count+=1
+      end
+      
+     elseif tag=="lit" and rnd(1)<0.25*decor_prob then
+      if room_decor_count>=max_decor then break end
+      -- lit: bias toward walls or doorways
+      local walls={}
+      -- collect wall-adjacent floor tiles
+      for x=rect[1]+1,rect[3]-1 do
+       if get_wall(x,rect[2])>0 then add(walls,{x+0.5,rect[2]+1.5}) end
+       if get_wall(x,rect[4])>0 then add(walls,{x+0.5,rect[4]-0.5}) end
+      end
+      for y=rect[2]+1,rect[4]-1 do
+       if get_wall(rect[1],y)>0 then add(walls,{rect[1]+1.5,y+0.5}) end
+       if get_wall(rect[3],y)>0 then add(walls,{rect[3]-0.5,y+0.5}) end
+      end
+      if #walls>0 then
+       local pos=walls[flr(rnd(#walls))+1]
+       local ob={pos={pos[1],pos[2]},typ=dec.obj_type,rel={0,0},frame=0,animloop=true,autoanim=true,decoration_type=dec}
+       add(gen_objects,ob)
+       room_decor_count+=1
       end
      end
     end
@@ -703,27 +835,43 @@ function generate_dungeon()
   end
  end
  
- -- apply wall textures
- for node in all(gen_nodes) do
-  apply_room_walls(node.rect,random_wall_texture())
- end
- 
- -- generate gameplay content
- generate_gameplay()
- 
- -- set floor and ceiling types based on difficulty
- if gen_params.difficulty<=3 then
-  floor.typ=planetyps[1] -- stone_tile
-  roof.typ=planetyps[3] -- stone_ceiling
- elseif gen_params.difficulty<=6 then
-  floor.typ=planetyps[2] -- dirt
-  roof.typ=planetyps[3] -- stone_ceiling
+ -- assign global theme before gameplay generation
+ local theme_roll=rnd(1)
+ local selected_theme="dng"
+ if theme_roll<0.7 then
+  selected_theme="dng"
+ elseif theme_roll<0.9 then
+  selected_theme="out"
  else
-  floor.typ=planetyps[1] -- stone_tile
-  roof.typ=planetyps[5] -- night_sky
+  selected_theme="dem"
  end
+ gen_params.theme=selected_theme
+ local theme_config=themes[selected_theme] or themes.dng
+ 
+ -- set floor and ceiling types based on theme
+ local floor_idx=1
+ local roof_idx=3
+ if theme_config.floor=="stone_tile" then floor_idx=1
+ elseif theme_config.floor=="dirt" then floor_idx=2
+ end
+ if theme_config.roof=="stone_ceiling" then roof_idx=3
+ elseif theme_config.roof=="sky" then roof_idx=4
+ elseif theme_config.roof=="night_sky" then roof_idx=5
+ end
+ floor.typ=planetyps[floor_idx]
+ roof.typ=planetyps[roof_idx]
  floor.x,floor.y=0,0
  roof.x,roof.y=0,0
+ 
+ -- apply wall textures based on theme
+ for node in all(gen_nodes) do
+  local texset=theme_wall_texture(selected_theme)
+  local tex=texset.variants[flr(rnd(#texset.variants))+1]
+  apply_room_walls(node.rect,tex)
+ end
+ 
+ -- generate gameplay content (now aware of theme)
+ generate_gameplay()
  
  -- populate objgrid from gen_objects
  for ob in all(gen_objects) do

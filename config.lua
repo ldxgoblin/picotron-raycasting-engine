@@ -55,7 +55,11 @@ texsets={
  -- wood_plank
  {base=9,variants={9,10,11,12}},
  -- stone
- {base=13,variants={13,14,15,16}}
+ {base=13,variants={13,14,15,16}},
+ -- grass (outdoor)
+ {base=17,variants={17,18,19,20}},
+ -- earth (outdoor)
+ {base=21,variants={21,22,23,24}}
 }
 
 -- door types (tile IDs, must not overlap with floor 0)
@@ -112,7 +116,7 @@ obj_types={
  heart={solid=false,w=0.3,mx=88,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup",subtype="heart"},
  decoration={solid=false,w=0.3,mx=92,my=0,mw=8,mh=16,y=0.3,h=0.4,flat=false,lit=0,framect=4,animspd=0.25,yoffs=nil,kind="decorative"},
  hostile_npc={solid=true,w=0.4,mx=103,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=4,animspd=0.25,yoffs={0,-0.01,0,-0.01},kind="hostile_npc",ai_type="follow",follow_speed=0.05,follow_range=20,patrol_speed=0.03},
- non_hostile_npc={solid=true,w=0.4,mx=110,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="non_hostile_npc"},
+ non_hostile_npc={solid=false,w=0.4,mx=110,my=0,mw=16,mh=40,y=0.1,h=0.8,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="non_hostile_npc"},
  direct_pickup={solid=false,w=0.2,mx=80,my=0,mw=8,mh=8,y=0.4,h=0.2,flat=false,lit=nil,framect=2,animspd=0.1,yoffs={0,0.05},kind="direct_pickup"},
  interactable_chest={solid=false,w=0.3,mx=85,my=0,mw=8,mh=8,y=0.3,h=0.3,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="chest"},
  interactable_shrine={solid=false,w=0.4,mx=90,my=0,mw=8,mh=16,y=0.3,h=0.5,flat=false,lit=nil,framect=1,animspd=0,yoffs=nil,kind="interactable",subtype="shrine"},
@@ -136,12 +140,23 @@ enemy_types={
 
 -- decoration type definitions
 decoration_types={
- {name="torch",difficulty=1,obj_type=obj_types.decoration,gen_tags={"lit","uni"},sprite=10},
- {name="barrel",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},sprite=11},
- {name="crate",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni2"},sprite=12},
- {name="pillar",difficulty=2,obj_type=obj_types.decoration,gen_tags={"big"},sprite=13},
- {name="statue",difficulty=3,obj_type=obj_types.decoration,gen_tags={"rare"},sprite=14},
- {name="chest",difficulty=2,obj_type=obj_types.decoration,gen_tags={"scatter"},sprite=15}
+ {name="torch",difficulty=1,obj_type=obj_types.decoration,gen_tags={"lit","uni"},theme_tags={"dng","lit"},sprite=10},
+ {name="barrel",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"dng","house"},sprite=11},
+ {name="crate",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni2"},theme_tags={"dng","house"},sprite=12},
+ {name="pillar",difficulty=2,obj_type=obj_types.decoration,gen_tags={"big"},theme_tags={"dng","dem"},sprite=13},
+ {name="statue",difficulty=3,obj_type=obj_types.decoration,gen_tags={"rare"},theme_tags={"dng","dem"},sprite=14},
+ {name="chest",difficulty=2,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"dng","house"},sprite=15},
+ {name="tree",difficulty=1,obj_type=obj_types.decoration,gen_tags={"scatter"},theme_tags={"out"},sprite=16},
+ {name="rock",difficulty=1,obj_type=obj_types.decoration,gen_tags={"uni"},theme_tags={"out"},sprite=17}
+}
+
+-- theme definitions
+themes={
+ dng={floor="stone_tile",roof="stone_ceiling",decor_prob=0.8},
+ out={floor="dirt",roof="sky",decor_prob=0.5},
+ dem={floor="stone_tile",roof="night_sky",decor_prob=0.9},
+ house={floor="stone_tile",roof="stone_ceiling",decor_prob=0.7},
+ dark={floor="stone_tile",roof="night_sky",decor_prob=0.6}
 }
 
 -- fog palettes (distance-based)

@@ -32,6 +32,14 @@ Walls use single 8×8 tiles sampled vertically. Texture sets provide variants fo
 | 14 | (14,0) | stone | Stone variant 2 |
 | 15 | (15,0) | stone | Stone variant 3 |
 | 16 | (0,1) | stone | Stone variant 4 |
+| 17 | (1,1) | grass | Grass variant 1 (outdoor theme) |
+| 18 | (2,1) | grass | Grass variant 2 (outdoor theme) |
+| 19 | (3,1) | grass | Grass variant 3 (outdoor theme) |
+| 20 | (4,1) | grass | Grass variant 4 (outdoor theme) |
+| 21 | (5,1) | earth | Earth variant 1 (outdoor theme) |
+| 22 | (6,1) | earth | Earth variant 2 (outdoor theme) |
+| 23 | (7,1) | earth | Earth variant 3 (outdoor theme) |
+| 24 | (8,1) | earth | Earth variant 4 (outdoor theme) |
 
 **Wall Fill Tile**: `wall_fill_tile = 1` (used as background fill during generation)
 
@@ -74,10 +82,10 @@ Doors occupy single 8×8 tiles in the map but render as vertical slices that sli
 
 ### NPCs (16×40 pixels, upright)
 
-| Object Type | Sprite Coords | Frames | Anim Speed | Y-Offset | Solid | Kind |
-|-------------|---------------|--------|------------|----------|-------|------|
-| hostile_npc | (103,0) | 4 | 0.25 | [0,-0.01,0,-0.01] | yes | hostile_npc |
-| non_hostile_npc | (110,0) | 1 | 0 | nil | yes | non_hostile_npc |
+| Object Type | Sprite Coords | Frames | Anim Speed | Y-Offset | Solid | Kind | AI Type |
+|-------------|---------------|--------|------------|----------|-------|------|---------|
+| hostile_npc | (103,0) | 4 | 0.25 | [0,-0.01,0,-0.01] | yes | hostile_npc | patrol/follow |
+| non_hostile_npc | (110,0) | 1 | 0 | nil | no | non_hostile_npc | none |
 
 **Memory Layout**: `mx=103, my=0, mw=16, mh=40` means sprite starts at pixel (103,0), size 16×40.  
 **Frame Advancement**: Horizontal offset `+mw` per frame (frame 0: x=103, frame 1: x=119, etc.)
@@ -104,16 +112,87 @@ Doors occupy single 8×8 tiles in the map but render as vertical slices that sli
 
 ### Decorations (8×16 pixels, upright)
 
-| Decoration | Sprite Coords | Frames | Anim Speed | Lit | Gen Tags |
-|------------|---------------|--------|------------|-----|----------|
-| torch | (92,0) | 4 | 0.25 | yes | ["lit","uni"] |
-| barrel | (92,0) | 4 | 0.25 | no | ["uni"] |
-| crate | (92,0) | 4 | 0.25 | no | ["uni2"] |
-| pillar | (92,0) | 4 | 0.25 | no | ["big"] |
-| statue | (92,0) | 4 | 0.25 | no | ["rare"] |
-| chest_deco | (92,0) | 4 | 0.25 | no | ["scatter"] |
+| Decoration | Sprite Coords | Frames | Anim Speed | Lit | Gen Tags | Theme Tags |
+|------------|---------------|--------|------------|-----|----------|------------|
+| torch | (92,0) | 4 | 0.25 | yes | ["lit","uni"] | ["dng","lit"] |
+| barrel | (92,0) | 4 | 0.25 | no | ["uni"] | ["dng","house"] |
+| crate | (92,0) | 4 | 0.25 | no | ["uni2"] | ["dng","house"] |
+| pillar | (92,0) | 4 | 0.25 | no | ["big"] | ["dng","dem"] |
+| statue | (92,0) | 4 | 0.25 | no | ["rare"] | ["dng","dem"] |
+| chest_deco | (92,0) | 4 | 0.25 | no | ["scatter"] | ["dng","house"] |
+| tree | sprite 16 | 4 | 0.25 | no | ["scatter"] | ["out"] |
+| rock | sprite 17 | 4 | 0.25 | no | ["uni"] | ["out"] |
+
+**Gen Tags**:
+- `uni`: Uniform grid (3-spacing)
+- `uni2`: Dense uniform grid (2-spacing)
+- `scatter`: Random placement (1-3 per room)
+- `big`: Single large object (center or corner)
+- `rare`: Low-probability spawn (5% chance)
+- `lit`: Wall-adjacent placement (torches near walls/doors)
+
+**Theme Tags**: Filter decorations by current dungeon theme (see Theme System below)
 
 **Note**: All decorations currently share sprite coords (92,0). Update with unique coordinates for visual variety.
+
+## Theme System
+
+### Theme Definitions
+Five environment presets control floor/ceiling textures and decoration filtering:
+
+| Theme | Code | Floor | Ceiling | Decor Prob | Wall Textures | Description |
+|-------|------|-------|---------|------------|---------------|-------------|
+| Dungeon | `dng` | stone_tile | stone_ceiling | 0.8 | brick, cobblestone | Classic stone corridors |
+| Outdoor | `out` | dirt | sky | 0.5 | grass, earth | Open-air environments |
+| Demon | `dem` | stone_tile | night_sky | 0.9 | stone, cobblestone | Dark demonic architecture |
+| House | `house` | stone_tile | stone_ceiling | 0.7 | wood_plank | Indoor wooden structures |
+| Dark | `dark` | stone_tile | night_sky | 0.6 | brick, stone | Shadowy dungeons |
+
+**Assignment**: Random per floor (70% dungeon, 20% outdoor, 10% demon)
+
+### Theme-Aware Systems
+
+**Wall Textures** (`theme_wall_texture(theme)`):
+- `out`: 50/50 grass or earth texture sets
+- `dem`: 50/50 stone or cobblestone
+- `house`: wood_plank variants
+- `dng`: 50/50 brick or cobblestone (default)
+
+**Decoration Spawning** (`generate_decorations()`):
+- Filters decorations by `theme_tags` matching current theme
+- Adjusts spawn density via theme's `decor_prob` multiplier
+- Respects per-room cap (`max_decorations_per_room = 12`)
+
+**Examples**:
+- Outdoor theme: spawns trees/rocks (theme_tags `["out"]`), skips torches/barrels
+- Demon theme: spawns pillars/statues (theme_tags `["dem"]`), high decoration density
+
+## Enemy AI System
+
+### AI Behaviors
+Hostile NPCs use one of two AI types assigned during generation:
+
+**Patrol** (`ai_type="patrol"`):
+- Stores 4 random waypoints in `patrol_points` array
+- Cycles to next waypoint only when current is reached (distance < 0.1)
+- Movement speed: `patrol_speed = 0.03` units/frame
+- Uses Euclidean distance for pathfinding
+
+**Follow** (`ai_type="follow"`):
+- Moves toward player when within `follow_range = 20` units
+- Movement speed: `follow_speed = 0.05` units/frame
+- Stops when distance < 0.1 to prevent jittering
+- Uses Euclidean distance for direction calculation
+
+### AI Update Loop
+- **Rate Limiting**: Runs every `ai_update_rate = 2` frames (deterministic frame counter)
+- **Movement**: Uses `trymoveto_pos()` for collision-aware sliding
+- **Spatial Sync**: Calls `update_object_grid(ob, old_x, old_y)` after position changes
+- **Collision**: Respects walls, doors, and solid objects via `iscol()`
+
+### NPC Properties
+- **Hostile**: solid=true, triggers combat on proximity
+- **Non-Hostile**: solid=false (passable to prevent corridor blocking), no AI updates
 
 ## Memory Banks and Userdata
 
@@ -201,3 +280,5 @@ All assets reside in **sprite sheet 0** (`get_spr(0)`), accessible via `get_text
 4. **Transparency**: Color 14 is treated as transparent for sprites (`palt(14, true)`)
 5. **Animation**: Place frames horizontally (e.g., 4-frame animation uses 4 adjacent 8×8 tiles)
 6. **Flat vs Upright**: Flat sprites (traps, notes) render on ground plane; upright sprites billboard to camera
+7. **Theme Textures**: Ensure grass/earth variants (tiles 17-24) have outdoor color palette for consistency
+8. **Decoration Sprites**: Assign unique sprite coords for trees/rocks to differentiate from placeholder (92,0)

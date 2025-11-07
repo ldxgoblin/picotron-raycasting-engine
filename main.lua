@@ -14,6 +14,9 @@ player_collision_radius=0.15
 function _init()
  window(480,270)
  
+ -- frame counter for ai timing
+ frame_ct=0
+ 
  -- player state
  player={
   x=64,y=64,
@@ -135,6 +138,9 @@ function _init()
 end
 
 function _update()
+ -- increment frame counter
+ frame_ct+=1
+ 
  -- combat gating: skip normal updates when in combat
  if in_combat then
   update_combat()
@@ -143,6 +149,12 @@ function _update()
  
  update_input()
  update_doors()
+ 
+ -- update npc ai (rate limited, deterministic frame check)
+ if frame_ct%ai_update_rate==0 then
+  update_npc_ai()
+ end
+ 
  cam={player.x,player.y}
  
  -- update floor/ceiling scrolling
@@ -495,6 +507,33 @@ function trymoveto(pos,target_x,target_y,radius,opendoors,isplayer)
  return false
 end
 
+-- movement wrapper for pos[1]/pos[2] array positions
+function trymoveto_pos(pos_array,target_x,target_y,radius,opendoors,isplayer)
+ radius=radius or player_collision_radius
+ opendoors=opendoors or false
+ isplayer=isplayer or false
+ 
+ -- try direct movement
+ if not radius or not iscol(target_x,target_y,radius,opendoors,isplayer) then
+  pos_array[1],pos_array[2]=target_x,target_y
+  return true
+ end
+ 
+ -- try x-only movement
+ if abs(pos_array[1]-target_x)>0.01 and not iscol(target_x,pos_array[2],radius,opendoors,isplayer) then
+  pos_array[1]=target_x
+  return true
+ end
+ 
+ -- try y-only movement
+ if abs(pos_array[2]-target_y)>0.01 and not iscol(pos_array[1],target_y,radius,opendoors,isplayer) then
+  pos_array[2]=target_y
+  return true
+ end
+ 
+ return false
+end
+
 function update_input()
  local sa,ca=sin(player.a),cos(player.a)
  
@@ -726,5 +765,62 @@ function update_combat()
   in_combat=false
   current_target=nil
   printh("exited combat")
+ end
+end
+
+-- update npc ai (basic patrol and follow)
+function update_npc_ai()
+ for ob in all(objects) do
+  if ob.typ and ob.typ.kind=="hostile_npc" and ob.ai_type then
+   local old_x,old_y=ob.pos[1],ob.pos[2]
+   
+   if ob.ai_type=="patrol" then
+    -- patrol: cycle through patrol_points
+    if ob.patrol_points and #ob.patrol_points>0 then
+     -- initialize patrol_index if nil or 0
+     if not ob.patrol_index or ob.patrol_index==0 then
+      ob.patrol_index=1
+     end
+     
+     local target=ob.patrol_points[ob.patrol_index]
+     if target then
+      local dx=target.x-ob.pos[1]
+      local dy=target.y-ob.pos[2]
+      local dist=sqrt(dx*dx+dy*dy)
+      
+      -- reached waypoint: advance to next
+      if dist<0.1 then
+       ob.patrol_index=(ob.patrol_index%#ob.patrol_points)+1
+      else
+       -- move toward current waypoint
+       if dist>0 then
+        local spd=ob.typ.patrol_speed or 0.03
+        local nx=ob.pos[1]+dx/dist*spd
+        local ny=ob.pos[2]+dy/dist*spd
+        trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+       end
+      end
+     end
+    end
+    
+   elseif ob.ai_type=="follow" then
+    -- follow: move toward player if in range
+    local dx=player.x-ob.pos[1]
+    local dy=player.y-ob.pos[2]
+    local dist=sqrt(dx*dx+dy*dy)
+    local follow_range=ob.typ.follow_range or 20
+    if dist<follow_range and dist>0.1 then
+     local spd=ob.typ.follow_speed or 0.05
+     local nx=ob.pos[1]+dx/dist*spd
+     local ny=ob.pos[2]+dy/dist*spd
+     trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+    end
+   end
+   
+   -- update spatial grid after movement
+   if old_x~=ob.pos[1] or old_y~=ob.pos[2] then
+    update_object_grid(ob,old_x,old_y)
+   end
+  end
  end
 end
