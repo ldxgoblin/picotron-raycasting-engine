@@ -3,17 +3,24 @@
 -- get sprite sheet for tline3d
 function get_texture_source()
  -- return sprite sheet userdata (index 0)
- return get_spr(0)
+ local src=get_spr(0)
+ if not src then
+  printh("warning: sprite sheet 0 not found")
+  return userdata("u8",128,128)
+ end
+ return src
 end
 
 -- track last applied fog level to reduce palette changes
 last_fog_level=-1
+prev_pal={}
 
 -- apply distance-based fog (with caching for performance)
 function set_fog(z)
  if z<=0 then
   pal()
   last_fog_level=-1
+  prev_pal={}
   return
  end
  
@@ -32,7 +39,11 @@ function set_fog(z)
  if level~=last_fog_level then
   local p=pals[level+1]
   for i=0,63 do
-   pal(i,p[i+1])
+   -- incremental update: only apply if value changed
+   if p[i+1]~=prev_pal[i] then
+    pal(i,p[i+1])
+    prev_pal[i]=p[i+1]
+   end
   end
   last_fog_level=level
  end

@@ -8,6 +8,9 @@ include"render_sprite.lua"
 include"door_system.lua"
 include"dungeon_gen.lua"
 
+-- constants
+player_collision_radius=0.15
+
 function _init()
  window(480,270)
  
@@ -15,9 +18,21 @@ function _init()
  player={
   x=64,y=64,
   a=0,
-  spd=0.1,
-  keys={}
+  spd=player_move_speed,
+  keys={},
+  hp=100
  }
+ 
+ -- interaction state
+ interaction_active=false
+ current_interact=nil
+ 
+ -- combat state
+ in_combat=false
+ current_target=nil
+ 
+ -- trap message timer
+ trap_msg_timer=0
  
  -- camera
  cam={player.x,player.y}
@@ -26,9 +41,12 @@ function _init()
  map={}
  map.walls=userdata("i16",128,128)
  map.doors=userdata("i16",128,128)
- map.floors=userdata("i16",128,128)
  
  -- helper: get wall tile
+ -- Purpose: Retrieve wall tile ID at grid position with fallback
+ -- Parameters: x, y (grid coordinates 0-127)
+ -- Returns: tile ID (0=empty, >0=wall/door/exit)
+ -- Notes: Checks userdata first, falls back to wallgrid table for compatibility
  function get_wall(x,y)
   if x>=0 and x<128 and y>=0 and y<128 then
    local val=map.walls:get(x,y)
@@ -66,13 +84,6 @@ function _init()
   end
  end
  
- -- helper: set floor tile
- function set_floor(x,y,val)
-  if x>=0 and x<128 and y>=0 and y<128 then
-   map.floors:set(x,y,val or 0)
-  end
- end
- 
  -- compatibility layer: expose wallgrid as table for dungeon generator
  wallgrid={}
  doorgrid={}
@@ -87,6 +98,7 @@ function _init()
   
  doors={}
  objects={}
+ animated_objects={}
  objgrid={}
  for gx=0,objgrid_array_size do
   objgrid[gx+1]={}
@@ -123,6 +135,12 @@ function _init()
 end
 
 function _update()
+ -- combat gating: skip normal updates when in combat
+ if in_combat then
+  update_combat()
+  return
+ end
+ 
  update_input()
  update_doors()
  cam={player.x,player.y}
@@ -134,19 +152,13 @@ function _update()
  roof.y+=roof.typ.yvel or 0
  
  -- update object animations
- for gx=1,objgrid_array_size+1 do
-  for gy=1,objgrid_array_size+1 do
-   for ob in all(objgrid[gx][gy]) do
-    if ob.typ and ob.typ.framect then
-     if ob.autoanim then
-      ob.frame+=ob.typ.animspd
-      if ob.animloop then
-       ob.frame=ob.frame%ob.typ.framect
-      else
-       ob.frame=min(ob.frame,ob.typ.framect-1)
-      end
-     end
-    end
+ for ob in all(animated_objects) do
+  if ob.typ and ob.typ.framect then
+   ob.frame+=ob.typ.animspd
+   if ob.animloop then
+    ob.frame=ob.frame%ob.typ.framect
+   else
+    ob.frame=min(ob.frame,ob.typ.framect-1)
    end
   end
  end
@@ -156,9 +168,14 @@ function _update()
   view_mode=view_mode=="3d" and "2d" or "3d"
  end
  
- -- toggle debug mode
- if btnp(4) then -- z key
+ -- debug mode toggle (moved from btnp(4) to avoid conflict)
+ if keyp("tab") then
   debug_mode=not debug_mode
+ end
+ 
+ -- decrement trap message timer
+ if trap_msg_timer>0 then
+  trap_msg_timer-=1
  end
  
  -- toggle test door mode (when not in 2d map view)
@@ -232,25 +249,47 @@ function _draw()
   print("pos:"..flr(player.x)..","..flr(player.y),2,2,7)
   print("ang:"..flr(player.a*100)/100,2,10,7)
   print("fps:"..stat(7),2,18,7)
-  print("[x] toggle map",2,26,7)
+  print("hp:"..player.hp,2,26,7)
+  print("[x] toggle map",2,34,7)
+  
+  -- interaction prompt
+  if interaction_active and current_interact then
+   print("[E]/Z: interact",screen_center_x-40,screen_height-20,11)
+  end
+  
+  -- trap message
+  if trap_msg_timer>0 then
+   print("trap sprung!",screen_center_x-30,screen_center_y,8)
+  end
   
   -- debug overlay
   if debug_mode then
    local sa,ca=sin(player.a),cos(player.a)
    local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
-   print("debug on [z]",2,34,11)
-   print("z="..flr(z*100)/100,2,42,7)
-   print("tile="..tile,2,50,7)
-   print("tx="..flr(tx*100)/100,2,58,7)
-   print("floor: "..floor.typ.tex,2,66,7)
-   print("roof: "..roof.typ.tex,2,74,7)
+   print("debug on [tab]",2,42,11)
+   print("z="..flr(z*100)/100,2,50,7)
+   print("tile="..tile,2,58,7)
+   print("tx="..flr(tx*100)/100,2,66,7)
+   print("floor: "..floor.typ.tex,2,74,7)
+   print("roof: "..roof.typ.tex,2,82,7)
   end
  else
   draw_minimap()
  end
+ 
+ -- combat overlay
+ if in_combat then
+  rectfill(0,screen_height-40,screen_width,screen_height,0)
+  print("entering combat...",screen_center_x-40,screen_center_y,8)
+  print("[esc] exit (temp)",screen_center_x-40,screen_center_y+10,7)
+ end
 end
 
 -- draw 2d minimap for testing
+-- Purpose: Render 2D top-down debug view of dungeon
+-- Algorithm: Scale 128×128 map to 256×256 pixels (scale=2)
+-- Displays: Walls, rooms, doors, objects, player position and facing
+-- Notes: Toggled with X button, useful for debugging generation
 function draw_minimap()
  local scale=2
  local ox,oy=10,10
@@ -281,11 +320,14 @@ function draw_minimap()
  -- draw objects
  for ob in all(objects) do
   local c=7
-  if ob.kind=="enemy" then c=8
-  elseif ob.kind=="heart" then c=14
-  elseif ob.kind=="key" then c=9
-  elseif ob.kind=="exit" then c=12
-  elseif ob.kind=="decoration" then c=13
+  if ob.typ and ob.typ.kind=="hostile_npc" then c=8
+  elseif ob.typ and ob.typ.kind=="direct_pickup" then
+   if ob.typ.subtype=="heart" then c=14
+   elseif ob.typ.subtype=="key" then c=9
+   end
+  elseif ob.typ and ob.typ.kind=="interactable" then
+   if ob.typ.subtype=="exit" then c=12 end
+  elseif ob.typ and ob.typ.kind=="decorative" then c=13
   end
   local x=ob.pos[1]
   local y=ob.pos[2]
@@ -307,6 +349,11 @@ function draw_minimap()
 end
 
 -- unified collision check for walls, doors, and objects
+-- Purpose: Unified collision detection for walls, doors, and objects
+-- Parameters: px, py (world position), radius (collision radius), opendoors (auto-open doors), isplayer (enable key checking)
+-- Returns: boolean (true if collision detected)
+-- Algorithm: Grid-based wall check + spatial partitioning for objects
+-- Side effects: Opens doors, prevents door closing when player inside
 function iscol(px,py,radius,opendoors,isplayer)
  local col=false
  opendoors=opendoors or false
@@ -379,15 +426,17 @@ function iscol(px,py,radius,opendoors,isplayer)
  for gx=gx_min,gx_max do
   for gy=gy_min,gy_max do
    for ob in all(objgrid[gx+1][gy+1]) do
-    if not ob.typ or not ob.typ.solid then
-     continue
-    end
-    
-    local ox=ob.pos[1]-px
-    local oy=ob.pos[2]-py
-    if max(abs(ox),abs(oy))<ob.typ.w then
-     col=true
-     break
+    if ob.typ and ob.typ.solid then
+     local ox=ob.pos[1]-px
+     local oy=ob.pos[2]-py
+     if max(abs(ox),abs(oy))<ob.typ.w then
+      col=true
+      -- trigger interaction on solid contact if player
+      if isplayer then
+       check_interactions_at(px,py)
+      end
+      break
+     end
     end
    end
    if col then break end
@@ -416,8 +465,12 @@ function iscol(px,py,radius,opendoors,isplayer)
 end
 
 -- movement wrapper with sliding collision
+-- Purpose: Movement with sliding collision (try diagonal, then X, then Y)
+-- Parameters: pos (table with x,y), target_x, target_y, radius, opendoors, isplayer
+-- Returns: boolean (true if any movement succeeded)
+-- Algorithm: Three-phase collision check for smooth wall sliding
 function trymoveto(pos,target_x,target_y,radius,opendoors,isplayer)
- radius=radius or 0.15
+ radius=radius or player_collision_radius
  opendoors=opendoors or false
  isplayer=isplayer or false
  
@@ -447,30 +500,46 @@ function update_input()
  
  -- movement
  if btn(0) then -- left
-  player.a-=0.02
+  player.a-=player_rotation_speed
  end
  if btn(1) then -- right
-  player.a+=0.02
+  player.a+=player_rotation_speed
  end
  if btn(2) then -- up
   local nx=player.x+ca*player.spd
   local ny=player.y+sa*player.spd
-  trymoveto(player,nx,ny,0.15,true,true)
+  trymoveto(player,nx,ny,player_collision_radius,true,true)
  end
  if btn(3) then -- down
   local nx=player.x-ca*player.spd
   local ny=player.y-sa*player.spd
-  trymoveto(player,nx,ny,0.15,true,true)
+  trymoveto(player,nx,ny,player_collision_radius,true,true)
+ end
+ 
+ -- check for interactions every frame
+ check_interactions()
+ 
+ -- interaction input: E key or Z button
+ if keyp("e") or btnp(4) then
+  handle_interact()
  end
 end
 
 -- add object to objgrid
+-- Purpose: Add object to spatial partitioning grid
+-- Parameters: ob (object with pos array)
+-- Side effects: Adds to objgrid cell based on position, adds to animated_objects if autoanim=true
+-- Notes: Used during dungeon generation and object spawning
 function addobject(ob)
  if not ob.pos then return end
  local gx=flr(ob.pos[1]/objgrid_size)
  local gy=flr(ob.pos[2]/objgrid_size)
  if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
   add(objgrid[gx+1][gy+1],ob)
+  -- add to animated list if autoanim is true
+  if ob.autoanim then
+   add(animated_objects,ob)
+  end
  end
 end
 
@@ -481,6 +550,10 @@ function removeobject(ob)
  local gy=flr(ob.pos[2]/objgrid_size)
  if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
   deli(objgrid[gx+1][gy+1],ob)
+  -- also remove from animated list
+  if ob.autoanim then
+   deli(animated_objects,ob)
+  end
  end
 end
 
@@ -498,5 +571,160 @@ function update_object_grid(ob,old_x,old_y)
   if new_gx>=0 and new_gx<=objgrid_array_size and new_gy>=0 and new_gy<=objgrid_array_size then
    add(objgrid[new_gx+1][new_gy+1],ob)
   end
+ end
+end
+
+-- check interactions around player position
+-- Purpose: Scan nearby objects for proximity-based interactions
+-- Algorithm: 3×3 objgrid cell scan around player
+-- Side effects: Auto-collects pickups, triggers combat, sets interaction flags
+-- Notes: Called every frame in _update()
+function check_interactions()
+ check_interactions_at(player.x,player.y)
+end
+
+-- check interactions at specific position (avoids recursion)
+function check_interactions_at(px,py)
+ local gx_center=flr(px/objgrid_size)
+ local gy_center=flr(py/objgrid_size)
+ 
+ -- scan 3x3 block around player
+ local closest_interact=nil
+ local closest_dist=999
+ 
+ for gx=gx_center-1,gx_center+1 do
+  for gy=gy_center-1,gy_center+1 do
+   if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
+    for ob in all(objgrid[gx+1][gy+1]) do
+     if ob.pos and ob.typ then
+      local dx=ob.pos[1]-px
+      local dy=ob.pos[2]-py
+      local dist=abs(dx)+abs(dy)
+      
+      -- direct pickup: auto-collect
+      if ob.typ.kind=="direct_pickup" and dist<interaction_range then
+       collect_item(ob)
+       removeobject(ob)
+       deli(objects,ob)
+      
+      -- hostile npc: trigger combat
+      elseif ob.typ.kind=="hostile_npc" and dist<combat_trigger_range then
+       in_combat=true
+       current_target=ob
+      
+      -- interactable: set flag for closest
+      elseif ob.typ.kind=="interactable" and dist<interaction_range then
+       -- trap: immediate effect
+       if ob.typ.subtype=="trap" then
+        player.hp=max(0,player.hp-10)
+        trap_msg_timer=60
+        removeobject(ob)
+        deli(objects,ob)
+       elseif dist<closest_dist then
+        closest_interact=ob
+        closest_dist=dist
+       end
+      end
+     end
+    end
+   end
+  end
+ end
+ 
+ -- update interaction state
+ if closest_interact then
+  interaction_active=true
+  current_interact=closest_interact
+ else
+  interaction_active=false
+  current_interact=nil
+ end
+end
+
+-- collect item (pickup)
+-- Purpose: Handle pickup collection and inventory updates
+-- Parameters: ob (object with typ.subtype)
+-- Side effects: Adds to player.keys, increases player.hp
+-- Notes: Called by check_interactions_at() for direct_pickup objects
+function collect_item(ob)
+ if ob.typ.subtype=="key" and ob.keynum then
+  add(player.keys,{keynum=ob.keynum})
+  printh("collected key "..ob.keynum)
+ elseif ob.typ.subtype=="heart" then
+  player.hp=min(100,player.hp+20)
+  printh("collected heart")
+ else
+  printh("collected item")
+ end
+end
+
+-- handle interaction when player presses E/Z
+-- Purpose: Process player-initiated interactions (E key / Z button)
+-- Algorithm: Switch on current_interact.typ.subtype
+-- Side effects: Opens chests, activates shrines, reads notes, triggers floor transition
+-- Notes: Only runs when interaction_active flag is true
+function handle_interact()
+ if not interaction_active or not current_interact then return end
+ 
+ local subtype=current_interact.typ and current_interact.typ.subtype or "unknown"
+ 
+ if subtype=="chest" then
+  -- open chest (placeholder)
+  player.hp=min(100,player.hp+10)
+  printh("opened chest")
+  removeobject(current_interact)
+  deli(objects,current_interact)
+  
+ elseif subtype=="shrine" then
+  -- activate shrine (placeholder)
+  player.hp=100
+  printh("activated shrine")
+  
+ elseif subtype=="note" then
+  -- read note (placeholder)
+  printh("read note")
+  removeobject(current_interact)
+  deli(objects,current_interact)
+  
+ elseif subtype=="exit" then
+  -- trigger next floor
+  printh("using exit portal")
+  generate_new_floor()
+  
+ end
+ 
+ -- clear interaction state after handling
+ interaction_active=false
+ current_interact=nil
+end
+
+-- generate new floor (regenerate dungeon)
+function generate_new_floor()
+ -- increment difficulty
+ gen_params.difficulty=min(gen_params.max_difficulty,gen_params.difficulty+1)
+ 
+ -- clear existing objects
+ for gx=1,objgrid_array_size+1 do
+  for gy=1,objgrid_array_size+1 do
+   objgrid[gx][gy]={}
+  end
+ end
+ objects={}
+ animated_objects={}
+ doors={}
+ 
+ -- regenerate dungeon
+ start_pos,gen_stats=generate_dungeon()
+ 
+ printh("floor complete! difficulty: "..gen_params.difficulty)
+end
+
+-- update combat (placeholder)
+function update_combat()
+ -- temp exit: press escape or menu button
+ if keyp("escape") or btnp(6) then
+  in_combat=false
+  current_target=nil
+  printh("exited combat")
  end
 end

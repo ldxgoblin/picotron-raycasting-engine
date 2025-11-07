@@ -9,7 +9,8 @@ end
 
 -- vector length
 function length(x,y)
- x/=16 y/=16
+ x/=16
+ y/=16
  return sqrt(x*x+y*y)*16
 end
 
@@ -62,7 +63,7 @@ function raycast(x,y,dx,dy,sa,ca)
  vz+=vdz*vstep
  
  -- ray marching
- while true do
+ for iter=1,256 do
   if hz<vz then
    -- horizontal closer
    local gx,gy=flr(hx),flr(hy)
@@ -114,17 +115,10 @@ function raycast(x,y,dx,dy,sa,ca)
    vy+=vdy
    vz+=vdz
   end
-  
-  -- escape condition: both rays out of bounds and moving away
-  local hx_out=(flr(hx)<0 and hdx<0) or (flr(hx)>=map_size and hdx>0)
-  local hy_out=(flr(hy)<0 and hdy<0) or (flr(hy)>=map_size and hdy>0)
-  local vx_out=(flr(vx)<0 and vdx<0) or (flr(vx)>=map_size and vdx>0)
-  local vy_out=(flr(vy)<0 and vdy<0) or (flr(vy)>=map_size and vdy>0)
-  
-  if (hx_out or hy_out) and (vx_out or vy_out) then
-   return 999,hx,hy,0,0
-  end
  end
+ 
+ -- fallback if iteration limit reached
+ return 999,hx,hy,0,0
 end
 
 -- raycast entire scene
@@ -178,31 +172,25 @@ function hitscan(x,y,dx,dy)
   for gy=flr(y0/objgrid_size),flr(y1/objgrid_size) do
    if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
     for ob in all(objgrid[gx+1][gy+1]) do
-     -- skip non-solid objects
-     if not ob.typ or not ob.typ.solid then
-      continue
-     end
-     
-     -- compute normal and tangential distances
-     local ox=ob.pos[1]-x
-     local oy=ob.pos[2]-y
-     local dn=(ox)*ca-(oy)*sa
-     local dt=(ox)*sa+(oy)*ca
-     
-     -- skip if outside normal bounds
-     if abs(dn)>ob.typ.w*0.5 then
-      continue
-     end
-     
-     -- skip if behind or beyond wall
-     if dt<=0 or dt>=d then
-      continue
-     end
-     
-     -- track closest object
-     if dt<closest_dist then
-      closest_dist=dt
-      closest_obj=ob
+     -- check if solid object
+     if ob.typ and ob.typ.solid then
+      -- compute normal and tangential distances
+      local ox=ob.pos[1]-x
+      local oy=ob.pos[2]-y
+      local dn=(ox)*ca-(oy)*sa
+      local dt=(ox)*sa+(oy)*ca
+      
+      -- check if within normal bounds
+      if abs(dn)<=ob.typ.w*0.5 then
+       -- check if not behind or beyond wall
+       if dt>0 and dt<d then
+        -- track closest object
+        if dt<closest_dist then
+         closest_dist=dt
+         closest_obj=ob
+        end
+       end
+      end
      end
     end
    end

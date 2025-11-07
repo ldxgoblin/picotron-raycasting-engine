@@ -12,11 +12,6 @@ function is_wall(val)
  return val>0 and val<door_normal
 end
 
--- helper: check if tile is a door
-function is_door(val)
- return val>=door_normal and val<=door_stay_open
-end
-
 -- helper: check if tile is an exit
 function is_exit(val)
  return val>=exit_start and val<=exit_end
@@ -147,7 +142,6 @@ function create_corridor(n1,n2)
   for x=bx1+1,bx2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
-				set_floor(x,y,1)
    end
   end
 
@@ -178,7 +172,6 @@ function create_corridor(n1,n2)
   for y=by1+1,by2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
-				set_floor(x,y,1)
    end
   end
 
@@ -213,7 +206,6 @@ function create_corridor(n1,n2)
   for x=bx1_horiz+1,bx2_horiz-1 do
    if x>=0 and x<128 and n1.midy>=0 and n1.midy<128 then
 				set_wall(x,n1.midy,0)
-				set_floor(x,n1.midy,1)
    end
   end
   
@@ -237,7 +229,6 @@ function create_corridor(n1,n2)
   for y=by1_vert+1,by2_vert-1 do
    if jx>=0 and jx<128 and y>=0 and y<128 then
 				set_wall(jx,y,0)
-				set_floor(jx,y,1)
    end
   end
 
@@ -284,38 +275,27 @@ function try_generate_room()
  return true
 end
 
+-- helper: apply wall at position with bounds and door/exit checking
+function apply_wall_at(x, y, tex)
+ if x >= 0 and x < 128 and y >= 0 and y < 128 then
+  if not (is_door(get_wall(x, y)) or is_exit(get_wall(x, y))) then
+   set_wall(x, y, tex)
+  end
+ end
+end
+
 -- helper: apply wall textures to room perimeter
 function apply_room_walls(rect,tex)
  -- ensure tex is never 0
  if tex==0 then tex=1 end
  
  for x=rect[1],rect[3] do
-  if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(x,rect[2]-1)) or is_exit(get_wall(x,rect[2]-1))) then
-			set_wall(x,rect[2]-1,tex)
-   end
-  end
-  if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(x,rect[4]+1)) or is_exit(get_wall(x,rect[4]+1))) then
-			set_wall(x,rect[4]+1,tex)
-   end
-  end
+  apply_wall_at(x, rect[2]-1, tex)
+  apply_wall_at(x, rect[4]+1, tex)
  end
  for y=rect[2],rect[4] do
-  if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(rect[1]-1,y)) or is_exit(get_wall(rect[1]-1,y))) then
-			set_wall(rect[1]-1,y,tex)
-   end
-  end
-  if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(rect[3]+1,y)) or is_exit(get_wall(rect[3]+1,y))) then
-			set_wall(rect[3]+1,y,tex)
-   end
-  end
+  apply_wall_at(rect[1]-1, y, tex)
+  apply_wall_at(rect[3]+1, y, tex)
  end
 end
 
@@ -369,7 +349,7 @@ function find_spawn_point(rect)
   if x>=0 and x<128 and y>=0 and y<128 and wallgrid[x][y]==0 then
    local valid=true
    for obj in all(gen_objects) do
-    local dx,dy=abs(obj.x-x),abs(obj.y-y)
+    local dx,dy=abs(obj.pos[1]-x),abs(obj.pos[2]-y)
     if dx<1 and dy<1 then
      valid=false
      break

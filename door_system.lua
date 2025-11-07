@@ -39,11 +39,11 @@ function update_doors()
     -- sfx(10) -- door open sound
    end
    -- animate opening
-   door.open+=0.06
+   door.open+=door_anim_speed
    if door.open>1 then
     door.open=1
     door.opening=false
-    door.timer=90
+    door.timer=door_close_delay
    end
   else
    -- not opening
@@ -51,7 +51,7 @@ function update_doors()
     door.timer-=1
    elseif not door.stayopen then
     -- close door
-    door.open=max(door.open-0.06,0)
+    door.open=max(door.open-door_anim_speed,0)
    end
   end
  end

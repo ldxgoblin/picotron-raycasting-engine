@@ -55,7 +55,11 @@ function render_sprites()
        local inserted=false
        for i=1,#sobj do
         if ob.sortorder>sobj[i].sortorder then
-         insert(sobj,i,ob)
+         -- manual array insertion
+         for j=#sobj,i,-1 do
+          sobj[j+1]=sobj[j]
+         end
+         sobj[i]=ob
          inserted=true
          break
         end

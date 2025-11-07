@@ -22,6 +22,14 @@ ai_update_rate=2 -- frames between AI updates
 interaction_range=0.5 -- proximity for triggers
 combat_trigger_range=0.3 -- distance to trigger combat
 
+-- player movement constants
+player_rotation_speed=0.02 -- radians per frame when turning
+player_move_speed=0.1 -- units per frame when moving
+
+-- door animation constants
+door_anim_speed=0.06 -- door open/close speed per frame
+door_close_delay=90 -- frames before door auto-closes
+
 -- floor/ceiling types
 planetyps={
  -- stone_tile
