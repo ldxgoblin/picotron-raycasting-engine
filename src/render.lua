@@ -105,10 +105,6 @@ function render_walls()
  -- cache LOD average colors per tile to avoid per-frame src:get() sampling
  local avg_color_cache={}
  
- -- batching variables for consecutive tline3d runs
- local batch_active=false
- local batch_src,batch_tile,batch_x0,batch_u0,batch_v0,batch_v1,batch_y0,batch_y1,batch_z
- 
  for ray_idx=0,ray_count-1 do
   -- read from every other zbuf/tbuf entry (populated by raycast)
   local z=zbuf[ray_idx*2+1]
@@ -130,12 +126,6 @@ function render_walls()
    
    -- LOD: use simplified rendering for distant walls
    if z>wall_lod_distance then
-    -- flush batch before LOD draw
-    if batch_active then
-     tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u0+(x0-batch_x0)*(32/480),batch_v1,1,1)
-     batch_active=false
-    end
-    
     -- check cached average color first
     local avg_color=avg_color_cache[tile]
     if not avg_color then
@@ -168,8 +158,8 @@ function render_walls()
     rectfill(x0,draw_y0,x0,draw_y1,avg_color)
     rectfill(x1,draw_y0,x1,draw_y1,avg_color)
    else
-    -- normal rendering with tline3d
-    -- fetch sprite for this specific wall/door tile (0-26 from gfx/0_walls.gfx)
+    -- normal rendering with tline3d (draw vertical columns per ray)
+    -- fetch sprite for this specific wall/door tile
     local cached=tex_cache[tile]
     local src,is_fallback
     if cached then
@@ -183,87 +173,46 @@ function render_walls()
     local u0=flr(tx*32)
     u0=max(0,min(31,u0))
     
-    -- compute u for x1 column with linear interpolation to next ray
+    -- compute u for x1 column with a light interpolation to next ray
     local u0_x1=u0
     if ray_idx<ray_count-1 then
      local t_next=tbuf[(ray_idx+1)*2+1]
      if t_next.tile==tile then
-      -- same tile, interpolate u coordinate
       local tx_next=t_next.tx
       local u0_next=flr(tx_next*32)
       u0_next=max(0,min(31,u0_next))
-      -- lerp halfway to next ray's u
       u0_x1=flr(u0*0.5+u0_next*0.5)
       u0_x1=max(0,min(31,u0_x1))
      end
     end
     
-    local u1=u0
-    local u1_x1=u0_x1
+    -- vertical span clamps
+    local draw_y0=ceil(y0)
+    local draw_y1=min(flr(y1),screen_height-1)
+    
+    -- adjust v0 for clipped top to maintain texture continuity
     local v0=0
     local v1=32
-    
-    -- sub-pixel adjustment with texture v adjustment
-    local yadj=ceil(y0)-y0
-    local adj_y0=y0+yadj
-    -- adjust v0 to maintain texture continuity when top is clipped
-    if y1>adj_y0 then
-     v0+=(yadj/(y1-adj_y0))*32
+    local full_h=y1-y0
+    if full_h>0 and draw_y0<y1 then
+     v0+=((draw_y0-y0)/full_h)*32
      v1=v0+32
     end
-    
-    -- clamp
-    local draw_y1=min(flr(y1),screen_height-1)
     
     -- apply fog
     set_fog(z)
     
-    -- check if we can batch this with previous
-    local can_batch=false
-    if batch_active and batch_tile==tile and batch_src==src and abs(batch_z-z)<0.1 and abs(batch_y0-adj_y0)<1 and abs(batch_y1-draw_y1)<1 then
-     can_batch=true
-    end
-    
-    if can_batch then
-     -- extend batch (x1 will be end of this ray's range)
-    else
-     -- flush previous batch if any
-     if batch_active then
-      local batch_u1=batch_u0+(batch_x0==x0-1 and 0 or (x0-batch_x0)*(32/480))
-      tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
-     end
-     
-     -- start new batch
-     batch_active=true
-     batch_src=src
-     batch_tile=tile
-     batch_x0=x0
-     batch_u0=u0
-     batch_v0=v0
-     batch_v1=v1
-     batch_y0=adj_y0
-     batch_y1=draw_y1
-     batch_z=z
-    end
+    -- draw the two upscaled vertical columns
+    tline3d(src,x0,draw_y0,x0,draw_y1,u0,v0,u0,v1,1,1)
+    tline3d(src,x1,draw_y0,x1,draw_y1,u0_x1,v0,u0_x1,v1,1,1)
    end
    
    -- populate zbuf for both columns (sprite occlusion needs pixel-accurate depth)
    zbuf[x0+1]=z
    zbuf[x1+1]=z
   else
-   -- flush batch on gap
-   if batch_active then
-    local batch_u1=batch_u0+(x0-batch_x0)*(32/480)
-    tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
-    batch_active=false
-   end
+   -- nothing to draw for this ray
   end
- end
- 
- -- flush final batch
- if batch_active then
-  local batch_u1=batch_u0+(screen_width-batch_x0)*(32/480)
-  tline3d(batch_src,batch_x0,batch_y0,screen_width-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
  end
  
  -- restore transparency mask to defaults (color 0 transparent, others opaque)

@@ -24,9 +24,12 @@ function render_sprites()
       local rx=ob.pos[1]-player.x
       local ry=ob.pos[2]-player.y
       
-      -- rotate to view-aligned coordinates
-      ob.rel[1]=-ca*rx-sa*ry
-      ob.rel[2]=ca*ry-sa*rx
+      -- rotate to view-aligned coordinates (camera space)
+      -- right = (-sin a, cos a), forward = (cos a, sin a)
+      local x_cam = -sa*rx + ca*ry
+      local z_cam =  ca*rx + sa*ry
+      ob.rel[1]=x_cam
+      ob.rel[2]=z_cam
       
       -- depth culling: skip sprites beyond max wall depth
       if ob.rel[2]>=maxz then
@@ -211,33 +214,12 @@ function drawobjs(sobj,sa,ca)
    set_fog(z*(t.lit or 1))
   end
   
-  -- draw sprite column by column with z-buffer (batched runs)
-  local run_start=-1
-  local run_u0=-1
-  
+  -- draw sprite column-by-column with z-buffer (no diagonal batching)
   for px=x0,x1 do
    if z<zbuf[px+1] then
-    -- not occluded, add to run
-    local u_offset=u0+(px-x0)*sxd
-    if run_start<0 then
-     -- start new run
-     run_start=px
-     run_u0=u_offset
-    end
-   else
-    -- occluded, flush run if any
-    if run_start>=0 then
-     local run_u1=u0+(px-1-x0)*sxd
-     tline3d(src,run_start,y0,px-1,y1,run_u0,v0,run_u1,v0+size,1,1)
-     run_start=-1
-    end
+    local u=u0+(px-x0)*sxd
+    tline3d(src,px,y0,px,y1,u,v0,u,v0+size,1,1)
    end
-  end
-  
-  -- flush final run
-  if run_start>=0 then
-   local run_u1=u0+(x1-x0)*sxd
-   tline3d(src,run_start,y0,x1,y1,run_u0,v0,run_u1,v0+size,1,1)
   end
   
   ::skip_obj::

@@ -72,7 +72,9 @@ function raycast(x,y,dx,dy,fx,fy)
  for iter=1,256 do
   if hz<vz then
    -- horizontal closer
-   local gx,gy=flr(hx),flr(hy)
+   -- crossing a vertical gridline (x changes): choose the cell we are entering
+   local gx=flr(hx)+(hdx<0 and -1 or 0)
+   local gy=flr(hy)
    if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
     local m=get_wall(gx,gy)
     if m>0 then
@@ -88,7 +90,11 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
-     return ((hx-x)*fx+(hy-y)*fy),hx,hy,m,(hy*hdx)%1
+     local z=((hx-x)*fx+(hy-y)*fy)
+     -- texture coordinate from y-fraction; flip when rayDirX > 0
+     local frac=hy-flr(hy)
+     local tx=(hdx>0) and (1-frac) or frac
+     return z,hx,hy,m,tx
      end
     end
    end
@@ -97,7 +103,9 @@ function raycast(x,y,dx,dy,fx,fy)
    hz+=hdz
   else
    -- vertical closer or equal
-   local gx,gy=flr(vx),flr(vy)
+   -- crossing a horizontal gridline (y changes): choose the cell we are entering
+   local gx=flr(vx)
+   local gy=flr(vy)+(vdy<0 and -1 or 0)
    if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
     local m=get_wall(gx,gy)
     if m>0 then
@@ -113,7 +121,11 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
-     return ((vx-x)*fx+(vy-y)*fy),vx,vy,m,(vx*-vdy)%1
+     local z=((vx-x)*fx+(vy-y)*fy)
+     -- texture coordinate from x-fraction; flip when rayDirY < 0
+     local frac=vx-flr(vx)
+     local tx=(vdy<0) and (1-frac) or frac
+     return z,vx,vy,m,tx
      end
     end
    end
