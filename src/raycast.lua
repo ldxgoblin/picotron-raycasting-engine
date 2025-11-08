@@ -23,19 +23,22 @@ function normalise(x,y)
 end
 
 -- dda raycast with z-depth tracking
-function raycast(x,y,dx,dy,sa,ca)
+-- fx,fy represent the forward/depth axis used for perpendicular distance:
+--  - In main scene: fx,fy = camera forward = (cos(a), sin(a))
+--  - In hitscan:    fx,fy = normalized ray direction
+function raycast(x,y,dx,dy,fx,fy)
  -- clamp near-zero components before normalization
  if abs(dx)<0.01 then dx=0.01 end
  if abs(dy)<0.01 then dy=0.01 end
  
- -- normalize direction if camera angles not provided
- if not sa then
-  sa,ca=normalise(dx,dy)
+ -- normalize direction if forward axis not provided
+ if not fx then
+  fx,fy=normalise(dx,dy)
  end
  
  -- horizontal ray initialization
  local hx,hy,hdx,hdy=x,y,sgn(dx),dy/abs(dx)
- local hdz,hz=hdx*sa+hdy*ca,0
+ local hdz,hz=hdx*fx+hdy*fy,0
  
  -- initial step to grid boundary
  local fracx=hx%1
@@ -51,7 +54,7 @@ function raycast(x,y,dx,dy,sa,ca)
  
  -- vertical ray initialization
  local vx,vy,vdx,vdy=x,y,dx/abs(dy),sgn(dy)
- local vdz,vz=vdx*sa+vdy*ca,0
+ local vdz,vz=vdx*fx+vdy*fy,0
  
  -- initial step to grid boundary
  local fracy=vy%1
@@ -75,7 +78,7 @@ function raycast(x,y,dx,dy,sa,ca)
     if m>0 then
      -- check if door
      if is_door(m) and doorgrid[gx][gy] then
-      local dz=((hx+hdx/2-x)*sa+(hy+hdy/2-y)*ca)
+     local dz=((hx+hdx/2-x)*fx+(hy+hdy/2-y)*fy)
       if dz<=vz then
        local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
        local dy_off=(hy+hdy/2)%1-open
@@ -85,7 +88,7 @@ function raycast(x,y,dx,dy,sa,ca)
       end
      else
       -- wall hit
-      return ((hx-x)*sa+(hy-y)*ca),hx,hy,m,(hy*hdx)%1
+     return ((hx-x)*fx+(hy-y)*fy),hx,hy,m,(hy*hdx)%1
      end
     end
    end
@@ -100,7 +103,7 @@ function raycast(x,y,dx,dy,sa,ca)
     if m>0 then
      -- check if door
      if is_door(m) and doorgrid[gx][gy] then
-      local dz=((vx+vdx/2-x)*sa+(vy+vdy/2-y)*ca)
+     local dz=((vx+vdx/2-x)*fx+(vy+vdy/2-y)*fy)
       if dz<=hz then
        local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
        local dx_off=(vx+vdx/2)%1-open
@@ -110,7 +113,7 @@ function raycast(x,y,dx,dy,sa,ca)
       end
      else
       -- wall hit
-      return ((vx-x)*sa+(vy-y)*ca),vx,vy,m,(vx*-vdy)%1
+     return ((vx-x)*fx+(vy-y)*fy),vx,vy,m,(vx*-vdy)%1
      end
     end
    end
@@ -146,12 +149,12 @@ function raycast_scene()
   local dy=sdist
   
   -- map camera-space (dx along right, dy forward) to world:
-  -- right = (fwdy, -fwdx); forward = (fwdx, fwdy)
-  local rdx=fwdy*dx+fwdx*dy
-  local rdy=(-fwdx)*dx+fwdy*dy
+  -- right = (-fwdy, fwdx); forward = (fwdx, fwdy)
+  local rdx=(-fwdy)*dx+fwdx*dy
+  local rdy=( fwdx)*dx+fwdy*dy
   
-  -- pass forward components to DDA (expects (sa, ca) = (sin, cos))
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,fwdy,fwdx)
+  -- pass forward components to DDA as (fx, fy) = (cos, sin)
+  local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,fwdx,fwdy)
   
   zbuf[i*2+1]=z
   tbuf[i*2+1].tile=tile

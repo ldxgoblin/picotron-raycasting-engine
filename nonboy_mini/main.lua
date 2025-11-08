@@ -117,6 +117,12 @@ function _init()
   tbuf[i]=tbuf[i] or {tile=0,tx=0}
  end
  
+ -- Precompute per-column base offsets for ray rotation
+ colofs={}
+ for i=0,num_rays-1 do
+  colofs[i+1]=cx-i
+ end
+ 
  -- Player
  player={x=64,y=64,a=0,spd=0.08,keys={},hp=10}
  
@@ -230,7 +236,8 @@ function raycastwalls()
  minx,miny,maxx,maxy,maxz=999,999,-999,-999,0
  for i=0,num_rays-1 do
   -- Screen x offset from center, depth projection distance
-  local dx,dy=cx-i,sdist
+  local off=colofs[i+1]
+  local dx,dy=off,sdist
   -- Rotate ray direction to world space
   dx,dy=ca*dx+sa*dy,ca*dy-sa*dx
   local z,mx,my,tile,tx=raycast(player.x,player.y,dx,dy,sa,ca)
@@ -458,8 +465,7 @@ function iscol(px,py,radius,opendoors,isplayer)
      end
     else
      if tile==exit_tile and isplayer then
-      gamestate="won"
-      printh("level complete")
+      advance_level()
      end
      return true
     end
@@ -639,6 +645,9 @@ function generate_dungeon()
   end
  end
  
+ -- Ensure connectivity across all rooms
+ ensure_connectivity()
+ 
  -- Gameplay phase: exit, erosion, locked door + key, health
  finalize_dungeon_gameplay()
  
@@ -808,6 +817,52 @@ function addroom(r,doorgen)
  return node
 end
 
+function carve_corridor_between(a,b)
+ local ax,ay=flr(a.midx),flr(a.midy)
+ local bx,by=flr(b.midx),flr(b.midy)
+ -- carve L
+ local hx0,hx1=min(ax,bx),max(ax,bx)+1
+ local hy0,hy1=min(ay,by),max(ay,by)+1
+ fillrect({hx0,ay,hx1,ay+1,false,true},0)
+ add(genrects,{hx0,ay,hx1,ay+1,false,true})
+ fillrect({bx,hy0,bx+1,hy1,true,false},0)
+ add(genrects,{bx,hy0,bx+1,hy1,true,false})
+ -- doors at endpoints
+ local door1={bx,ay}
+ local door2={bx,ay}
+ wallgrid[door1[1]][door1[2]]=0 doorgrid[door1[1]][door1[2]]=true
+ wallgrid[door2[1]][door2[2]]=0 doorgrid[door2[1]][door2[2]]=true
+ -- add edge
+ local e={nodes={a,b},doorslots={{pos=door1},{pos=door2}}}
+ add(a.edges,e) add(b.edges,e)
+end
+
+function ensure_connectivity()
+ if not genparams.startroom then return end
+ local access=findaccessiblerooms(genparams.startroom)
+ local changed=true
+ while changed do
+  changed=false
+  for n in all(gennodes) do
+   if not n.isjunction and not access[n] then
+    -- connect to nearest accessible room
+    local best,bd= nil, 1e9
+    for m in all(gennodes) do
+     if access[m] and not m.isjunction then
+      local dx,dy=n.midx-m.midx,n.midy-m.midy
+      local d=dx*dx+dy*dy
+      if d<bd then bd=d best=m end
+     end
+    end
+    if best then
+     carve_corridor_between(best,n)
+     access=findaccessiblerooms(genparams.startroom)
+     changed=true
+    end
+   end
+  end
+ end
+end
 function fillrect(r,v)
  for y=r[2],r[4]-1 do
   for x=r[1],r[3]-1 do
@@ -956,9 +1011,8 @@ function finalize_dungeon_gameplay()
   end
  end
  
- -- compute accessible rooms and lock an edge (BFS-based)
- local genaccess=findaccessiblerooms(genparams.startroom)
- trylockdoor()
+ -- compute accessible rooms and lock several edges (BFS-based)
+ generate_objectives()
  
  -- spawn health pickups
  local hct=flr(#gennodes*0.4)
@@ -1025,20 +1079,112 @@ function trylockdoor(node)
  door.keynum=genkeynum
  wallgrid[pos[1]][pos[2]]=door_locked
  edge.isblocked=true
- -- drop key in any accessible room not startroom
+ -- drop key in any room (fallback if selection fails)
  local room
  for i=1,50 do
-  room=gennodes[flr(rnd(#gennodes))+1]
-  if room and not room.isjunction and room~=genparams.startroom then break end
+  local cand=gennodes[flr(rnd(#gennodes))+1]
+  if cand and not cand.isjunction and cand~=genparams.startroom then room=cand break end
  end
- local kx,ky=findspawnpt(room)
- if kx then
-  local ob=spawnobject(otyps.key,kx,ky)
-  ob.collectable=true
-  ob.keynum=genkeynum
-  add(collect,ob)
+ if room then
+  local kx,ky=findspawnpt(room)
+  if kx then
+   local ob=spawnobject(otyps.key,kx,ky)
+   ob.collectable=true
+   ob.keynum=genkeynum
+   add(collect,ob)
+   return true
+  end
  end
- return true
+ -- fallback: revert lock if placement failed
+ edge.isblocked=false
+ door.keynum=nil
+ wallgrid[pos[1]][pos[2]]=door_normal
+ return false
+end
+
+function get_all_edges()
+ local uniq,edges={},{}
+ for n in all(gennodes) do
+  for e in all(n.edges) do
+   if not uniq[e] then uniq[e]=true add(edges,e) end
+  end
+ end
+ return edges
+end
+
+function generate_objectives()
+ local locks=max(1, min(3, #gennodes\3))
+ local attempts=0
+ while locks>0 and attempts<50 do
+  attempts+=1
+  -- pick an edge that splits the graph into two sets
+  local picked
+  for e in all(get_all_edges()) do
+   if not e.isblocked then
+    e.isblocked=true
+    local access=findaccessiblerooms(genparams.startroom)
+    e.isblocked=false
+    -- build the complement set count
+    local subsetct=0
+    for n in all(gennodes) do
+     if not access[n] and not n.isjunction then subsetct+=1 end
+    end
+    if subsetct>0 and subsetct<=4 then
+     picked=e
+     break
+    end
+   end
+  end
+  if picked then
+   -- lock it and drop key in accessible set
+   picked.isblocked=true
+   local access=findaccessiblerooms(genparams.startroom)
+   -- choose a doorslot to lock
+   local slots=picked.doorslots or {}
+   local slot=slots[#slots>0 and flr(rnd(#slots))+1 or 1]
+   if slot then
+    local pos=slot.pos
+    local door=slot.door
+    if not door then door=makedoor(pos[1],pos[2],door_normal) slot.door=door end
+    genkeynum+=1
+    door.keynum=genkeynum
+    wallgrid[pos[1]][pos[2]]=door_locked
+    -- drop key in accessible set (not startroom)
+    local room=nil
+    if access then
+     for i=1,200 do
+      local cand=gennodes[flr(rnd(#gennodes))+1]
+      if cand and not cand.isjunction and cand~=genparams.startroom and access[cand] then
+       room=cand break
+      end
+     end
+    end
+    if room then
+     local kx,ky=findspawnpt(room)
+     if kx then
+      local ob=spawnobject(otyps.key,kx,ky)
+      ob.collectable=true
+      ob.keynum=genkeynum
+      add(collect,ob)
+      locks-=1
+     else
+      picked.isblocked=false
+      door.keynum=nil
+      wallgrid[pos[1]][pos[2]]=door_normal
+     end
+    else
+    -- Without a valid room, revert
+     picked.isblocked=false
+     door.keynum=nil
+     wallgrid[pos[1]][pos[2]]=door_normal
+    end
+   else
+    picked.isblocked=false
+   end
+  else
+   break
+  end
+ end
 end
 
 function isinrect(r,x,y)
@@ -1071,21 +1217,21 @@ function draw_minimap()
  local mx,my,mw,mh=screen_w-120,10,110,110
  clip(mx,my,mw,mh)
  rectfill(mx,my,mx+mw-1,my+mh-1,0)
- local scale=1
- for x=max(0,flr(player.x-55)),min(127,flr(player.x+55)) do
-  for y=max(0,flr(player.y-55)),min(127,flr(player.y+55)) do
-   local sx,sy=mx+(x-player.x+55)*scale,my+(y-player.y+55)*scale
+ -- scale 2x tiles, viewport 55x55 around player
+ local scale=2
+ local half=flr(mw/scale/2)
+ for x=max(0,flr(player.x-half)),min(127,flr(player.x+half)) do
+  for y=max(0,flr(player.y-half)),min(127,flr(player.y+half)) do
+   local sx,sy=mx+(x-player.x+half)*scale,my+(y-player.y+half)*scale
    local m=wallgrid[x][y]
    if m==door_normal then
-    pset(sx,sy,col_door_normal)
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,col_door_normal)
    elseif m==door_locked then
-    pset(sx,sy,col_door_locked)
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,col_door_locked)
    elseif m==exit_tile then
-    pset(sx,sy,11)
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,11)
    elseif m>0 then
-    pset(sx,sy,5)
-   elseif floorgrid[x][y]>0 then
-    pset(sx,sy,6)
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,5)
    end
   end
  end
@@ -1145,6 +1291,25 @@ function update_collectables()
    end
   end
  end
+end
+
+--=======================
+-- Level Advance
+--=======================
+function advance_level()
+ levelnum=(levelnum or 1)+1
+ -- preserve hp and inventory keys; clear world state
+ local hp=player.hp
+ local keys=player.keys
+ doors,collect,enem,part,objgrid,doorgrid,wallgrid={}, {}, {}, {}, {}, {}, {}
+ -- reinit grids like at _init but without re-alloc zbuf/tbuf
+ for x=0,127 do
+  doorgrid[x],wallgrid[x]={},{}
+ end
+ generate_dungeon()
+ player.hp=hp
+ player.keys=keys
+ printh("advanced to level "..levelnum)
 end
 
 --=======================

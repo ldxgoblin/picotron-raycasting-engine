@@ -293,7 +293,7 @@ function render_floor_ceiling()
  if roof_fallback then
   roof_src=get_error_texture("ceiling")
  end
- draw_rows(roof_src,-screen_center_y,-ceil(h/2),roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,fwdy,fwdx,roof_typ.tex)
+ draw_rows(roof_src,-screen_center_y,-ceil(h/2),roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,fwdx,fwdy,roof_typ.tex)
  
  -- fetch and render floor (sprites 32-33 from gfx/1_surfaces.gfx)
  local floor_typ=floor.typ
@@ -301,7 +301,7 @@ function render_floor_ceiling()
  if floor_fallback then
   floor_src=get_error_texture("floor")
  end
- draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,fwdy,fwdx,floor_typ.tex)
+ draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,fwdx,fwdy,floor_typ.tex)
  
  pal()
 end
