@@ -1,10 +1,16 @@
 --[[pod_format="raw",created="2025-11-07 21:17:10",modified="2025-11-07 21:48:08",revision=1]]
 -- sprite rendering pipeline
 
--- render sprites with z-buffer occlusion
+-- render sprites with z-buffer occlusion (optimized culling)
 function render_sprites()
- local sa,ca=sin(player.a),cos(player.a)
+ -- use cached sin/cos from _draw() if available
+ local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
  local vvolg=screen_center_x/sdist
+ 
+ -- early exit if bounds are degenerate
+ if minx>maxx or miny>maxy then
+  return
+ end
  
  -- transform and cull objects
  local sobj={}
@@ -21,6 +27,11 @@ function render_sprites()
       -- rotate to view-aligned coordinates
       ob.rel[1]=-ca*rx-sa*ry
       ob.rel[2]=ca*ry-sa*rx
+      
+      -- depth culling: skip sprites beyond max wall depth
+      if ob.rel[2]>=maxz then
+       goto skip_sprite
+      end
       
       -- cull behind camera and outside frustum
       local t=ob.typ
@@ -65,6 +76,8 @@ function render_sprites()
         add(sobj,ob)
        end
       end
+      
+      ::skip_sprite::
      end
     end
    end
@@ -120,9 +133,9 @@ function drawobjs(sobj,sa,ca)
    end
   end
   
-  local src,is_fallback = get_texture_source(sprite_index)
+  local src,is_fallback = get_texture_source(sprite_index,"sprite")
   if is_fallback then
-   src = error_texture
+   src = get_error_texture("sprite")
   end
   
   -- get vertical offset (can be animated)
@@ -198,13 +211,33 @@ function drawobjs(sobj,sa,ca)
    set_fog(z*(t.lit or 1))
   end
   
-  -- draw sprite column by column with z-buffer
+  -- draw sprite column by column with z-buffer (batched runs)
+  local run_start=-1
+  local run_u0=-1
+  
   for px=x0,x1 do
    if z<zbuf[px+1] then
-    -- not occluded, draw column
+    -- not occluded, add to run
     local u_offset=u0+(px-x0)*sxd
-    tline3d(src,px,y0,px,y1,u_offset,v0,u_offset,v0+size,1,1)
+    if run_start<0 then
+     -- start new run
+     run_start=px
+     run_u0=u_offset
+    end
+   else
+    -- occluded, flush run if any
+    if run_start>=0 then
+     local run_u1=u0+(px-1-x0)*sxd
+     tline3d(src,run_start,y0,px-1,y1,run_u0,v0,run_u1,v0+size,1,1)
+     run_start=-1
+    end
    end
+  end
+  
+  -- flush final run
+  if run_start>=0 then
+   local run_u1=u0+(x1-x0)*sxd
+   tline3d(src,run_start,y0,x1,y1,run_u0,v0,run_u1,v0+size,1,1)
   end
   
   ::skip_obj::

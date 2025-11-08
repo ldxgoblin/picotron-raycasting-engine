@@ -10,6 +10,7 @@ error_texture_initialized=false
 -- initialize error texture on first access (defensive fallback)
 function init_error_texture()
  if not error_texture_initialized and not error_texture then
+  -- create default error texture if none exists
   error_texture = userdata("u8", 32, 32)
   for y=0,31 do
    for x=0,31 do
@@ -21,23 +22,31 @@ function init_error_texture()
  end
 end
 
+-- get appropriate error texture for object type
+function get_error_texture(obj_type)
+ if error_textures then
+  return error_textures[obj_type] or error_textures.default
+ end
+ init_error_texture()
+ return error_texture
+end
+
 -- get individual sprite userdata for tline3d by sprite index
-function get_texture_source(sprite_index)
+function get_texture_source(sprite_index, obj_type)
  -- default to sprite 0 for backward compatibility
  sprite_index=sprite_index or 0
+ obj_type=obj_type or "default"
  
  -- return sprite sheet userdata
  local src=get_spr(sprite_index)
  if not src then
   -- warn once per sprite index to avoid per-frame spam
   if not warned_sprites[sprite_index] then
-   printh("warning: sprite "..sprite_index.." not found")
+   printh("warning: sprite "..sprite_index.." not found, using "..obj_type.." error texture")
    warned_sprites[sprite_index]=true
   end
-  -- ensure error texture is initialized (defensive fallback)
-  init_error_texture()
-  -- return error texture (magenta checkerboard) for missing sprites
-  return error_texture,true
+  -- return appropriate error texture for object type
+  return get_error_texture(obj_type),true
  end
  return src,false
 end
@@ -46,12 +55,13 @@ end
 last_fog_level=-1
 prev_pal={}
 
--- apply distance-based fog (with caching for performance)
+-- apply distance-based fog (with hysteresis caching for performance)
 function set_fog(z)
  if z<=0 then
   pal()
   last_fog_level=-1
   prev_pal={}
+  -- preserve last_fog_z for hysteresis across sections
   return
  end
  
@@ -65,6 +75,12 @@ function set_fog(z)
   -- simple linear distance fallback
   level=flr(min(z/8,15))
  end
+ 
+ -- hysteresis: only update if z changed significantly (reduces palette thrashing)
+ if abs(z-last_fog_z)<fog_hysteresis and last_fog_level>=0 then
+  return
+ end
+ last_fog_z=z
  
  -- only update palette if fog level changed (reduces palette ops from 320/frame to ~10-20)
  if level~=last_fog_level then
@@ -80,16 +96,23 @@ function set_fog(z)
  end
 end
 
--- render textured walls
+-- render textured walls (with 2x upscaling and LOD)
 function render_walls()
  palt(0,false)
  
  -- cache sprite sources by tile to avoid repeated get_spr() calls
  local tex_cache={}
+ -- cache LOD average colors per tile to avoid per-frame src:get() sampling
+ local avg_color_cache={}
  
- for x=0,ray_count-1 do
-  local z=zbuf[x+1]
-  local t=tbuf[x+1]
+ -- batching variables for consecutive tline3d runs
+ local batch_active=false
+ local batch_src,batch_tile,batch_x0,batch_u0,batch_v0,batch_v1,batch_y0,batch_y1,batch_z
+ 
+ for ray_idx=0,ray_count-1 do
+  -- read from every other zbuf/tbuf entry (populated by raycast)
+  local z=zbuf[ray_idx*2+1]
+  local t=tbuf[ray_idx*2+1]
   
   if z<999 then
    -- calculate wall height
@@ -101,47 +124,146 @@ function render_walls()
    local tile=t.tile
    local tx=t.tx
    
-   -- fetch sprite for this specific wall/door tile (0-26 from gfx/0_walls.gfx)
-   -- tile ranges: walls 0-23 (brick/cobblestone/wood/stone/grass/earth), doors 24-26
-   -- use cached sprite source when available
-   local cached=tex_cache[tile]
-   local src,is_fallback
-   if cached then
-    src,is_fallback=cached.src,cached.is_fallback
+   -- calculate screen x positions for 2x upscaling (each ray draws to 2 columns)
+   local x0=ray_idx*2
+   local x1=ray_idx*2+1
+   
+   -- LOD: use simplified rendering for distant walls
+   if z>wall_lod_distance then
+    -- flush batch before LOD draw
+    if batch_active then
+     tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u0+(x0-batch_x0)*(32/480),batch_v1,1,1)
+     batch_active=false
+    end
+    
+    -- check cached average color first
+    local avg_color=avg_color_cache[tile]
+    if not avg_color then
+     -- sample average color from texture center for solid fill
+     local cached=tex_cache[tile]
+     local src,is_fallback
+     if cached then
+      src,is_fallback=cached.src,cached.is_fallback
+     else
+      src,is_fallback=get_texture_source(tile,"wall")
+      tex_cache[tile]={src=src,is_fallback=is_fallback}
+     end
+     
+     -- sample center pixel color from texture (u=16, v=16 in 32x32 sprite)
+     avg_color=5 -- default fog color if sampling fails
+     if src and src.get then
+      avg_color=src:get(16,16) or 5
+     end
+     
+     -- cache for subsequent LOD draws
+     avg_color_cache[tile]=avg_color
+    end
+    
+    -- apply fog
+    set_fog(z)
+    
+    -- draw solid color columns (much faster than tline3d)
+    local draw_y0=ceil(y0)
+    local draw_y1=min(flr(y1),screen_height-1)
+    rectfill(x0,draw_y0,x0,draw_y1,avg_color)
+    rectfill(x1,draw_y0,x1,draw_y1,avg_color)
    else
-    src,is_fallback=get_texture_source(tile)
-    tex_cache[tile]={src=src,is_fallback=is_fallback}
+    -- normal rendering with tline3d
+    -- fetch sprite for this specific wall/door tile (0-26 from gfx/0_walls.gfx)
+    local cached=tex_cache[tile]
+    local src,is_fallback
+    if cached then
+     src,is_fallback=cached.src,cached.is_fallback
+    else
+     src,is_fallback=get_texture_source(tile,"wall")
+     tex_cache[tile]={src=src,is_fallback=is_fallback}
+    end
+    
+    -- compute pixel UV in 32x32 sprite for x0 column
+    local u0=flr(tx*32)
+    u0=max(0,min(31,u0))
+    
+    -- compute u for x1 column with linear interpolation to next ray
+    local u0_x1=u0
+    if ray_idx<ray_count-1 then
+     local t_next=tbuf[(ray_idx+1)*2+1]
+     if t_next.tile==tile then
+      -- same tile, interpolate u coordinate
+      local tx_next=t_next.tx
+      local u0_next=flr(tx_next*32)
+      u0_next=max(0,min(31,u0_next))
+      -- lerp halfway to next ray's u
+      u0_x1=flr(u0*0.5+u0_next*0.5)
+      u0_x1=max(0,min(31,u0_x1))
+     end
+    end
+    
+    local u1=u0
+    local u1_x1=u0_x1
+    local v0=0
+    local v1=32
+    
+    -- sub-pixel adjustment with texture v adjustment
+    local yadj=ceil(y0)-y0
+    local adj_y0=y0+yadj
+    -- adjust v0 to maintain texture continuity when top is clipped
+    if y1>adj_y0 then
+     v0+=(yadj/(y1-adj_y0))*32
+     v1=v0+32
+    end
+    
+    -- clamp
+    local draw_y1=min(flr(y1),screen_height-1)
+    
+    -- apply fog
+    set_fog(z)
+    
+    -- check if we can batch this with previous
+    local can_batch=false
+    if batch_active and batch_tile==tile and batch_src==src and abs(batch_z-z)<0.1 and abs(batch_y0-adj_y0)<1 and abs(batch_y1-draw_y1)<1 then
+     can_batch=true
+    end
+    
+    if can_batch then
+     -- extend batch (x1 will be end of this ray's range)
+    else
+     -- flush previous batch if any
+     if batch_active then
+      local batch_u1=batch_u0+(batch_x0==x0-1 and 0 or (x0-batch_x0)*(32/480))
+      tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
+     end
+     
+     -- start new batch
+     batch_active=true
+     batch_src=src
+     batch_tile=tile
+     batch_x0=x0
+     batch_u0=u0
+     batch_v0=v0
+     batch_v1=v1
+     batch_y0=adj_y0
+     batch_y1=draw_y1
+     batch_z=z
+    end
    end
    
-   -- render wall with error texture if sprite missing (visible as magenta checkerboard)
-   -- compute pixel UV in 32x32 sprite
-   -- map fractional tx (0-1) to pixel u (0-31) in 32x32 sprite
-   local u0=flr(tx*32)
-   -- clamp u0 to [0,31] to avoid out-of-range sampling when tx is numerically 1.0
-   u0=max(0,min(31,u0))
-   local u1=u0
-   local v0=0
-   local v1=32
-   
-   -- sub-pixel adjustment with texture v adjustment
-   local yadj=ceil(y0)-y0
-   y0+=yadj
-   -- adjust v0 to maintain texture continuity when top is clipped
-   if y1>y0 then
-    v0+=(yadj/(y1-y0))*32
-    v1=v0+32
+   -- populate zbuf for both columns (sprite occlusion needs pixel-accurate depth)
+   zbuf[x0+1]=z
+   zbuf[x1+1]=z
+  else
+   -- flush batch on gap
+   if batch_active then
+    local batch_u1=batch_u0+(x0-batch_x0)*(32/480)
+    tline3d(batch_src,batch_x0,batch_y0,x0-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
+    batch_active=false
    end
-   
-   -- clamp
-   y1=min(flr(y1),screen_height-1)
-   
-   -- apply fog
-   set_fog(z)
-   
-   -- draw textured column (vertical sample u0==u1)
-   -- renders wall texture variants and door tiles with correct 32x32 textures
-   tline3d(src,x,y0,x,y1,u0,v0,u1,v1,1,1)
   end
+ end
+ 
+ -- flush final batch
+ if batch_active then
+  local batch_u1=batch_u0+(screen_width-batch_x0)*(32/480)
+  tline3d(batch_src,batch_x0,batch_y0,screen_width-1,batch_y1,batch_u0,batch_v0,batch_u1,batch_v1,1,1)
  end
  
  -- restore transparency mask to defaults (color 0 transparent, others opaque)
@@ -152,7 +274,8 @@ end
 
 -- render perspective floor/ceiling with individual 32x32 sprites
 function render_floor_ceiling()
- local sa,ca=sin(player.a),cos(player.a)
+ -- use cached sin/cos from _draw() if available
+ local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
  
  -- calculate horizon with safeguard against divide-by-zero
  local h
@@ -164,26 +287,32 @@ function render_floor_ceiling()
  
  -- fetch and render ceiling (sprites 34-36 from gfx/1_surfaces.gfx)
  local roof_typ=roof.typ
- local roof_src,roof_fallback=get_texture_source(roof_typ.tex)
+ local roof_src,roof_fallback=get_texture_source(roof_typ.tex,"ceiling")
  if roof_fallback then
-  roof_src=error_texture
+  roof_src=get_error_texture("ceiling")
  end
  draw_rows(roof_src,-screen_center_y,-ceil(h/2),roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,sa,ca,roof_typ.tex)
  
  -- fetch and render floor (sprites 32-33 from gfx/1_surfaces.gfx)
  local floor_typ=floor.typ
- local floor_src,floor_fallback=get_texture_source(floor_typ.tex)
+ local floor_src,floor_fallback=get_texture_source(floor_typ.tex,"floor")
  if floor_fallback then
-  floor_src=error_texture
+  floor_src=get_error_texture("floor")
  end
  draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,sa,ca,floor_typ.tex)
  
  pal()
 end
 
--- draw horizontal scanlines with 32x32 sprite sampling
+-- draw horizontal scanlines with 32x32 sprite sampling (optimized fog calls)
 function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
  local size=sprite_size or 32
+ 
+ -- set fog once for lit surfaces instead of per scanline
+ if lit then
+  set_fog(0)
+ end
+ 
  for y=y0,y1 do
   -- calculate ray gradient
   local g=abs(y)/sdist
@@ -204,8 +333,10 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
   mx-=screen_center_x*mdx
   my-=screen_center_x*mdy
   
-  -- apply fog
-  set_fog(lit and 0 or z)
+  -- apply fog only for non-lit surfaces (per scanline)
+  if not lit then
+   set_fog(z)
+  end
   
   -- texture coordinates (pixel UVs in 32x32 sprite)
   -- map fractional position (mx%1, my%1) to pixel offset (0-31) in 32x32 sprite

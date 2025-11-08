@@ -6,8 +6,8 @@ screen_width=480
 screen_height=270
 screen_center_x=240
 screen_center_y=135
-ray_count=480
--- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2, ray_count must equal screen_width
+ray_count=240
+-- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2, ray_count is 240 (half screen_width for performance, upscaled 2x in render_walls)
 sdist=200 -- default; computed dynamically in raycast_scene() based on fov
 map_size=128
 objgrid_size=5
@@ -21,6 +21,8 @@ sprite_size=32
 fogdist=250 -- fog distance parameter for quadratic falloff (scaled from PICO-8's 100-150)
 screenbright=1.0 -- screen brightness multiplier (1.0=normal, <1.0=darker for atmosphere)
 use_quadratic_fog=false -- flag to enable/disable quadratic fog (default to simple linear fog)
+fog_hysteresis=0.5 -- minimum z change required to update fog level (reduces palette thrashing)
+wall_lod_distance=10 -- walls beyond this z distance use simplified rendering (rectfill instead of tline3d)
 
 -- ai and interaction constants
 ai_update_rate=2 -- frames between AI updates

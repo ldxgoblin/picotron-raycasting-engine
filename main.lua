@@ -150,10 +150,13 @@ function _init()
  end
  zbuf={}
  tbuf={}
- for i=1,ray_count do
+ for i=1,screen_width do
   zbuf[i]=999
   tbuf[i]={tile=0,tx=0}
  end
+ 
+ -- fog state for hysteresis
+ last_fog_z=0
  
  -- projection constant defined in config.lua
  
@@ -173,14 +176,37 @@ function _init()
  -- test door mode
  test_door_mode=false
 
- -- create error texture for missing sprites (bright magenta checkerboard)
- error_texture = userdata("u8", 32, 32)
- for y=0,31 do
-  for x=0,31 do
-   local color = ((flr(x/4) + flr(y/4)) % 2 == 0) and 8 or 14
-   error_texture:set(x, y, color)
+ -- create tinted error textures for different object types (checkerboard pattern)
+ -- walls: magenta/pink (8/14), floor: blue/cyan (12/13), ceiling: green/dark green (11/3)
+ -- sprites: yellow/orange (10/9), props: red/brown (8/4)
+ error_textures = {
+  wall = userdata("u8", 32, 32),
+  floor = userdata("u8", 32, 32),
+  ceiling = userdata("u8", 32, 32),
+  sprite = userdata("u8", 32, 32),
+  default = userdata("u8", 32, 32)
+ }
+ 
+ -- generate tinted checkerboards for each type
+ local tints = {
+  wall = {8, 14},      -- magenta/pink
+  floor = {12, 13},    -- blue/cyan
+  ceiling = {11, 3},   -- green/dark green
+  sprite = {10, 9},    -- yellow/orange
+  default = {8, 14}    -- magenta/pink (fallback)
+ }
+ 
+ for type_name, colors in pairs(tints) do
+  for y=0,31 do
+   for x=0,31 do
+    local color = ((flr(x/4) + flr(y/4)) % 2 == 0) and colors[1] or colors[2]
+    error_textures[type_name]:set(x, y, color)
+   end
   end
  end
+ 
+ -- maintain backward compatibility with single error_texture
+ error_texture = error_textures.default
 
  -- validate all configured sprites exist (comment out for production)
  validate_sprite_configuration()
@@ -259,8 +285,8 @@ function _update()
   end
  end
  
- -- toggle view mode
- if btnp(5) then -- x key
+ -- toggle view mode (debug only)
+ if debug_mode and btnp(5) then -- x key
   view_mode=view_mode=="3d" and "2d" or "3d"
  end
  
@@ -335,6 +361,10 @@ function _draw()
  clip(0,0,screen_width,screen_height)
  cls(0)
  
+ -- cache sin/cos for entire frame to avoid recomputation
+ sa_cached=sin(player.a)
+ ca_cached=cos(player.a)
+ 
  if view_mode=="3d" then
   raycast_scene()
   render_floor_ceiling()
@@ -346,7 +376,9 @@ function _draw()
   print("ang:"..(flr(player.a*100)/100),2,10,7)
   print("fps:"..stat(7),2,18,7)
   print("hp:"..player.hp,2,26,7)
-  print("[x] toggle map",2,34,7)
+  if debug_mode then
+   print("[x] toggle map",2,34,7)
+  end
   
   -- interaction prompt
   if interaction_active and current_interact then
@@ -369,6 +401,9 @@ function _draw()
    print("floor: "..floor.typ.tex,2,74,7)
    print("roof: "..roof.typ.tex,2,82,7)
   end
+  
+  -- minimap HUD overlay
+  draw_minimap_hud()
  else
   draw_minimap()
  end
@@ -450,7 +485,115 @@ function draw_minimap()
  print("rooms: "..gen_stats.rooms,10,10,7)
  print("objects: "..gen_stats.objects,10,18,7)
  print("seed: "..gen_stats.seed,10,26,7)
- print("[x] toggle 3d",10,34,7)
+ if debug_mode then
+  print("[x] toggle 3d",10,34,7)
+ end
+end
+
+-- draw hud minimap overlay
+-- Purpose: Render scrolling viewport minimap in top-right corner during 3D view
+-- Algorithm: Player-centered camera with clipped drawing of visible tiles only
+-- Displays: Walls, floors, doors, objects, player (auto-scrolls as player moves)
+-- Notes: Fixed 120×68px viewport at top-right, scale=2, only draws visible tile range
+function draw_minimap_hud()
+ local hud_w=ceil(screen_width*0.25)
+ local hud_h=ceil(screen_height*0.25)
+ local hud_x=screen_width-hud_w-8
+ local hud_y=8
+ local scale=2
+ 
+ -- camera offset to center player in viewport
+ local cam_x=player.x*scale-hud_w/2
+ local cam_y=player.y*scale-hud_h/2
+ 
+ -- calculate visible tile range
+ local x_min=max(0,flr(cam_x/scale))
+ local x_max=min(127,flr((cam_x+hud_w)/scale))
+ local y_min=max(0,flr(cam_y/scale))
+ local y_max=min(127,flr((cam_y+hud_h)/scale))
+ 
+ -- set clip region
+ clip(hud_x,hud_y,hud_w,hud_h)
+ 
+ -- draw background
+ rectfill(hud_x,hud_y,hud_x+hud_w-1,hud_y+hud_h-1,0)
+ 
+ -- draw map tiles (only visible range)
+ for x=x_min,x_max do
+  for y=y_min,y_max do
+   local sx=hud_x+(x*scale-cam_x)
+   local sy=hud_y+(y*scale-cam_y)
+   
+   -- additional bounds check
+   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+    local wall=wallgrid[x][y]
+    local floor_val=get_floor(x,y)
+    local color
+    
+    if wall>0 then
+     color=5
+    elseif floor_val>0 then
+     color=6
+    else
+     color=1
+    end
+    
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,color)
+   end
+  end
+ end
+ 
+ -- draw doors
+ for door in all(doors) do
+  -- tile-based rejection: skip if outside visible range
+  if door.x>=x_min and door.x<=x_max and door.y>=y_min and door.y<=y_max then
+   local sx=hud_x+(door.x*scale-cam_x)
+   local sy=hud_y+(door.y*scale-cam_y)
+   
+   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+    local c=door.dtype==door_locked and 8 or 12
+    rectfill(sx,sy,sx+scale-1,sy+scale-1,c)
+   end
+  end
+ end
+ 
+ -- draw objects
+ for ob in all(objects) do
+  -- tile-based rejection: skip if outside visible range
+  local ob_tx=flr(ob.pos[1])
+  local ob_ty=flr(ob.pos[2])
+  if ob_tx>=x_min and ob_tx<=x_max and ob_ty>=y_min and ob_ty<=y_max then
+   local sx=hud_x+(ob.pos[1]*scale-cam_x)
+   local sy=hud_y+(ob.pos[2]*scale-cam_y)
+   
+   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+    local c=7
+    if ob.typ and ob.typ.kind=="hostile_npc" then c=8
+    elseif ob.typ and ob.typ.kind=="direct_pickup" then
+     if ob.typ.subtype=="heart" then c=14
+     elseif ob.typ.subtype=="key" then c=9
+     end
+    elseif ob.typ and ob.typ.kind=="interactable" then
+     if ob.typ.subtype=="exit" then c=12 end
+    elseif ob.typ and ob.typ.kind=="decorative" then c=13
+    end
+    
+    circfill(sx,sy,1,c)
+   end
+  end
+ end
+ 
+ -- draw player (always centered by camera design)
+ local px=hud_x+(player.x*scale-cam_x)
+ local py=hud_y+(player.y*scale-cam_y)
+ circfill(px,py,2,10)
+ line(px,py,px+ca_cached*6,py+sa_cached*6,10)
+ 
+ -- optional frame
+ rect(hud_x,hud_y,hud_x+hud_w-1,hud_y+hud_h-1,7)
+ 
+ -- reset clip
+ clip()
 end
 
 -- unified collision check for walls, doors, and objects

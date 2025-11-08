@@ -38,13 +38,14 @@ function raycast(x,y,dx,dy,sa,ca)
  local hdz,hz=hdx*sa+hdy*ca,0
  
  -- initial step to grid boundary
- local hstep=hx%1
+ local fracx=hx%1
+ local hstep
  if hdx>0 then
-  hstep=(1-hstep)
+  hstep=1-fracx
  else
-  hx-=1
-  hstep=(1-hstep)
+  hstep=fracx
  end
+ hx+=hdx*hstep
  hy+=hdy*hstep
  hz+=hdz*hstep
  
@@ -53,14 +54,15 @@ function raycast(x,y,dx,dy,sa,ca)
  local vdz,vz=vdx*sa+vdy*ca,0
  
  -- initial step to grid boundary
- local vstep=vy%1
+ local fracy=vy%1
+ local vstep
  if vdy>0 then
-  vstep=(1-vstep)
+  vstep=1-fracy
  else
-  vy-=1
-  vstep=(1-vstep)
+  vstep=fracy
  end
  vx+=vdx*vstep
+ vy+=vdy*vstep
  vz+=vdz*vstep
  
  -- ray marching
@@ -73,8 +75,8 @@ function raycast(x,y,dx,dy,sa,ca)
     if m>0 then
      -- check if door
      if is_door(m) and doorgrid[gx][gy] then
-      local dz=hz+hdz/2
-      if dz<vz then
+      local dz=((hx+hdx/2-x)*sa+(hy+hdy/2-y)*ca)
+      if dz<=vz then
        local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
        local dy_off=(hy+hdy/2)%1-open
        if dy_off>=0 then
@@ -83,7 +85,7 @@ function raycast(x,y,dx,dy,sa,ca)
       end
      else
       -- wall hit
-      return hz,hx,hy,m,(hy*hdx)%1
+      return ((hx-x)*sa+(hy-y)*ca),hx,hy,m,(hy*hdx)%1
      end
     end
    end
@@ -98,8 +100,8 @@ function raycast(x,y,dx,dy,sa,ca)
     if m>0 then
      -- check if door
      if is_door(m) and doorgrid[gx][gy] then
-      local dz=vz+vdz/2
-      if dz<hz then
+      local dz=((vx+vdx/2-x)*sa+(vy+vdy/2-y)*ca)
+      if dz<=hz then
        local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
        local dx_off=(vx+vdx/2)%1-open
        if dx_off>=0 then
@@ -108,7 +110,7 @@ function raycast(x,y,dx,dy,sa,ca)
       end
      else
       -- wall hit
-      return vz,vx,vy,m,(vx*-vdy)%1
+      return ((vx-x)*sa+(vy-y)*ca),vx,vy,m,(vx*-vdy)%1
      end
     end
    end
@@ -128,7 +130,8 @@ function raycast_scene()
  -- sdist = screen_center_x / tan(half_fov) ensures proper perspective mapping
  sdist=screen_center_x/math.tan(fov)
  
- local sa,ca=sin(player.a),cos(player.a)
+ -- use cached sin/cos from _draw() if available
+ local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
  minx,maxx=999,-999
  miny,maxy=999,-999
  maxz=0
@@ -143,9 +146,9 @@ function raycast_scene()
   
   local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,sa,ca)
   
-  zbuf[i+1]=z
-  tbuf[i+1].tile=tile
-  tbuf[i+1].tx=tx
+  zbuf[i*2+1]=z
+  tbuf[i*2+1].tile=tile
+  tbuf[i*2+1].tx=tx
   
   -- track bounds for object culling
   minx=min(minx,hx)
@@ -153,6 +156,25 @@ function raycast_scene()
   miny=min(miny,hy)
   maxy=max(maxy,hy)
   maxz=max(maxz,z)
+ end
+ 
+ -- validate and clamp culling bounds to map range
+ if minx>maxx or miny>maxy then
+  -- degenerate bounds (no valid hits), set to player position
+  minx,maxx=player.x,player.x
+  miny,maxy=player.y,player.y
+ else
+  -- clamp to map boundaries [0, map_size-1]
+  minx=max(0,minx)
+  maxx=min(map_size-1,maxx)
+  miny=max(0,miny)
+  maxy=min(map_size-1,maxy)
+  
+  -- add margin for sprite culling (expand by objgrid_size)
+  minx=max(0,minx-objgrid_size)
+  maxx=min(map_size-1,maxx+objgrid_size)
+  miny=max(0,miny-objgrid_size)
+  maxy=min(map_size-1,maxy+objgrid_size)
  end
 end
 

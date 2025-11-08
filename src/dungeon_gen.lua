@@ -86,13 +86,14 @@ function random_room(base_node,is_special)
 end
 
 -- helper: add room to generation state
-function add_room(rect)
+function add_room(rect,is_junction)
  add(gen_rects,rect)
  local node={
   rect=rect,
   midx=flr((rect[1]+rect[3])/2),
   midy=flr((rect[2]+rect[4])/2),
-  edges={}
+  edges={},
+  is_junction=is_junction or false
  }
  add(gen_nodes,node)
  return node
@@ -107,6 +108,21 @@ function get_corridor_type(r1,r2)
  return "l_shape"
 end
 
+-- helper: place door at exact boundary wall tile with retry
+function place_boundary_door_with_retry(bx,by,dtype,max_attempts)
+ max_attempts=max_attempts or 3
+ for attempt=1,max_attempts do
+  if bx>=0 and bx<128 and by>=0 and by<128 then
+   if is_wall(get_wall(bx,by)) then
+    set_wall(bx,by,dtype)
+    create_door(bx,by,dtype)
+    return true
+   end
+  end
+ end
+ return false
+end
+
 -- helper: place door at exact boundary wall tile
 function place_boundary_door(bx,by,dtype)
  -- bx,by = boundary wall tile (between corridor and room)
@@ -114,6 +130,21 @@ function place_boundary_door(bx,by,dtype)
 		if is_wall(get_wall(bx,by)) then
 			set_wall(bx,by,dtype)
    create_door(bx,by,dtype)
+   return true
+  end
+ end
+ return false
+end
+
+-- helper: ensure boundary passage (fallback for failed door placement)
+function ensure_boundary_passage(bx,by)
+ if bx>=0 and bx<128 and by>=0 and by<128 then
+  local tile=get_wall(bx,by)
+  -- if wall is still blocking and not a door, clear it
+  if tile>0 and not is_door(tile) and not is_exit(tile) then
+   set_wall(bx,by,0)
+   set_floor(bx,by,1)
+   printh("fallback: cleared blocking wall at ("..bx..","..by..")")
    return true
   end
  end
@@ -192,7 +223,13 @@ function create_corridor(n1,n2)
   local jw,jh=3,3
   local jrect={jx-1,jy-1,jx+jw-2,jy+jh-2}
   fill_rect(jrect,0)
-  local jnode=add_room(jrect)
+  for x=max(0,jrect[1]),min(127,jrect[3]) do
+   for y=max(0,jrect[2]),min(127,jrect[4]) do
+    set_floor(x, y, 1)
+   end
+  end
+  -- tag as junction to skip perimeter wall texturing
+  local jnode=add_room(jrect,true)
   
   -- connect n1 to junction (horizontal)
   local x0,x1=min(n1.midx,jx),max(n1.midx,jx)
@@ -206,9 +243,18 @@ function create_corridor(n1,n2)
    bx2_horiz=r1[1]-1
   end
   
-  -- place doors on horizontal segment boundaries
-  place_boundary_door(bx1_horiz,n1.midy,door_normal)
-  place_boundary_door(bx2_horiz,n1.midy,door_normal)
+  -- place doors on horizontal segment boundaries with retry and fallback
+  local door1_ok=place_boundary_door_with_retry(bx1_horiz,n1.midy,door_normal,3)
+  if not door1_ok then
+   printh("warning: failed to place junction door at ("..bx1_horiz..","..n1.midy.."), clearing as passage")
+   ensure_boundary_passage(bx1_horiz,n1.midy)
+  end
+  
+  local door2_ok=place_boundary_door_with_retry(bx2_horiz,n1.midy,door_normal,3)
+  if not door2_ok then
+   printh("warning: failed to place junction door at ("..bx2_horiz..","..n1.midy.."), clearing as passage")
+   ensure_boundary_passage(bx2_horiz,n1.midy)
+  end
   
 	-- carve horizontal segment
   for x=bx1_horiz+1,bx2_horiz-1 do
@@ -230,9 +276,18 @@ function create_corridor(n1,n2)
    by2_vert=jrect[2]-1
   end
   
-  -- place doors on vertical segment boundaries
-  place_boundary_door(jx,by1_vert,door_normal)
-  place_boundary_door(jx,by2_vert,door_normal)
+  -- place doors on vertical segment boundaries with retry and fallback
+  local door3_ok=place_boundary_door_with_retry(jx,by1_vert,door_normal,3)
+  if not door3_ok then
+   printh("warning: failed to place junction door at ("..jx..","..by1_vert.."), clearing as passage")
+   ensure_boundary_passage(jx,by1_vert)
+  end
+  
+  local door4_ok=place_boundary_door_with_retry(jx,by2_vert,door_normal,3)
+  if not door4_ok then
+   printh("warning: failed to place junction door at ("..jx..","..by2_vert.."), clearing as passage")
+   ensure_boundary_passage(jx,by2_vert)
+  end
   
 	-- carve vertical segment
   for y=by1_vert+1,by2_vert-1 do
@@ -241,6 +296,12 @@ function create_corridor(n1,n2)
 				set_floor(jx,y,1)
    end
   end
+  
+  -- validation: ensure all boundary passages are clear
+  ensure_boundary_passage(bx1_horiz,n1.midy)
+  ensure_boundary_passage(bx2_horiz,n1.midy)
+  ensure_boundary_passage(jx,by1_vert)
+  ensure_boundary_passage(jx,by2_vert)
 
 		-- store boundary tiles near rooms
 		local near_n1
@@ -281,6 +342,11 @@ function try_generate_room()
  
  local node=add_room(rect)
  fill_rect(rect,0)
+ for x=max(0,rect[1]),min(127,rect[3]) do
+  for y=max(0,rect[2]),min(127,rect[4]) do
+   set_floor(x, y, 1)
+  end
+ end
  create_corridor(base,node)
  return true
 end
@@ -846,6 +912,11 @@ function generate_dungeon()
  local first_rect=random_room(nil,false)
  local first_node=add_room(first_rect)
  fill_rect(first_rect,0)
+ for x=max(0,first_rect[1]),min(127,first_rect[3]) do
+  for y=max(0,first_rect[2]),min(127,first_rect[4]) do
+   set_floor(x, y, 1)
+  end
+ end
  
  -- generate additional rooms
  local room_count=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
@@ -887,9 +958,12 @@ function generate_dungeon()
  
  -- apply wall textures based on theme
  for node in all(gen_nodes) do
-  local texset=theme_wall_texture(selected_theme)
-  local tex=texset.variants[flr(rnd(#texset.variants))+1]
-  apply_room_walls(node.rect,tex)
+  -- skip junction rooms to avoid texturing their perimeters
+  if not node.is_junction then
+   local texset=theme_wall_texture(selected_theme)
+   local tex=texset.variants[flr(rnd(#texset.variants))+1]
+   apply_room_walls(node.rect,tex)
+  end
  end
  
  -- generate gameplay content (now aware of theme)

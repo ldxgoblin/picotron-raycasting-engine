@@ -1,11 +1,3 @@
-picotron cartridge // www.picotron.net
-version 2
-
-:: .info.pod
-b64$LS1bW3BvZCxjcmVhdGVkPSIyMDI1LTExLTA3IDIyOjE0OjIwIixtb2RpZmllZD0iMjAyNS0x
-MS0wNyAyMjoxODo1MSIscnVudGltZT0yMSx3b3Jrc3BhY2VzPXt7bG9jYXRpb249Im1haW4ubHVh
-IzgyOCIsd29ya3NwYWNlX2luZGV4PTF9fV1d
-:: main.lua
 --[[pod_format="raw",created="2025-11-08 00:00:00",modified="2025-11-08 00:00:00",revision=2]]
 -- Nonboy Raycasting Engine - v0.2
 -- raycasting, rendering, procedural generation, player movement, UI framework, minimap
@@ -1188,5 +1180,3 @@ function g_msgbox(text,buttons,callbackfn)
   if callbackfn then callbackfn(result) end
  end)
 end
-
-:: [eoc]
