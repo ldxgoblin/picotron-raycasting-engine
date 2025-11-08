@@ -130,21 +130,28 @@ function raycast_scene()
  -- sdist = screen_center_x / tan(half_fov) ensures proper perspective mapping
  sdist=screen_center_x/math.tan(fov)
  
- -- use cached sin/cos from _draw() if available
- local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
+ -- classic forward basis: forward = (cos(a), sin(a))
+ -- use cached cos/sin from _draw() if available
+ local fwdx=(ca_cached or cos(player.a))
+ local fwdy=(sa_cached or sin(player.a))
  minx,maxx=999,-999
  miny,maxy=999,-999
  maxz=0
  
  for i=0,ray_count-1 do
-  local dx=screen_center_x-i
+  -- map ray index to pixel center, then to screen-centered offset
+  -- scale automatically adapts if screen_width != ray_count*2
+  local pixel_x=(i+0.5)*(screen_width/ray_count)
+  local dx=pixel_x-screen_center_x
   local dy=sdist
   
-  -- rotate by camera angle
-  local rdx=ca*dx+sa*dy
-  local rdy=ca*dy-sa*dx
+  -- map camera-space (dx along right, dy forward) to world:
+  -- right = (fwdy, -fwdx); forward = (fwdx, fwdy)
+  local rdx=fwdy*dx+fwdx*dy
+  local rdy=(-fwdx)*dx+fwdy*dy
   
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,sa,ca)
+  -- pass forward components to DDA (expects (sa, ca) = (sin, cos))
+  local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,fwdy,fwdx)
   
   zbuf[i*2+1]=z
   tbuf[i*2+1].tile=tile

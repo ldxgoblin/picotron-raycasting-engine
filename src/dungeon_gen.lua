@@ -143,7 +143,7 @@ function ensure_boundary_passage(bx,by)
   -- if wall is still blocking and not a door, clear it
   if tile>0 and not is_door(tile) and not is_exit(tile) then
    set_wall(bx,by,0)
-   set_floor(bx,by,1)
+   set_floor(bx,by,gen_floor_id)
    printh("fallback: cleared blocking wall at ("..bx..","..by..")")
    return true
   end
@@ -171,15 +171,17 @@ function create_corridor(n1,n2)
    bx2=r1[1]-1
   end
   
-  -- place doors on boundary walls
-  place_boundary_door(bx1,y,door_normal)
-  place_boundary_door(bx2,y,door_normal)
+  -- place doors on boundary walls (robust: retry and fallback to passage)
+  local d1_ok=place_boundary_door_with_retry(bx1,y,door_normal,3)
+  if not d1_ok then ensure_boundary_passage(bx1,y) end
+  local d2_ok=place_boundary_door_with_retry(bx2,y,door_normal,3)
+  if not d2_ok then ensure_boundary_passage(bx2,y) end
   
   -- carve corridor between doors (exclusive)
   for x=bx1+1,bx2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
-				set_floor(x,y,1)
+				set_floor(x,y,gen_floor_id)
    end
   end
 
@@ -202,15 +204,17 @@ function create_corridor(n1,n2)
    by2=r1[2]-1
   end
   
-  -- place doors on boundary walls
-  place_boundary_door(x,by1,door_normal)
-  place_boundary_door(x,by2,door_normal)
+  -- place doors on boundary walls (robust: retry and fallback to passage)
+  local d1_ok=place_boundary_door_with_retry(x,by1,door_normal,3)
+  if not d1_ok then ensure_boundary_passage(x,by1) end
+  local d2_ok=place_boundary_door_with_retry(x,by2,door_normal,3)
+  if not d2_ok then ensure_boundary_passage(x,by2) end
   
   -- carve corridor between doors (exclusive)
   for y=by1+1,by2-1 do
    if x>=0 and x<128 and y>=0 and y<128 then
 				set_wall(x,y,0)
-				set_floor(x,y,1)
+				set_floor(x,y,gen_floor_id)
    end
   end
 
@@ -225,7 +229,7 @@ function create_corridor(n1,n2)
   fill_rect(jrect,0)
   for x=max(0,jrect[1]),min(127,jrect[3]) do
    for y=max(0,jrect[2]),min(127,jrect[4]) do
-    set_floor(x, y, 1)
+    set_floor(x, y, gen_floor_id)
    end
   end
   -- tag as junction to skip perimeter wall texturing
@@ -260,7 +264,7 @@ function create_corridor(n1,n2)
   for x=bx1_horiz+1,bx2_horiz-1 do
    if x>=0 and x<128 and n1.midy>=0 and n1.midy<128 then
 				set_wall(x,n1.midy,0)
-				set_floor(x,n1.midy,1)
+				set_floor(x,n1.midy,gen_floor_id)
    end
   end
   
@@ -293,7 +297,7 @@ function create_corridor(n1,n2)
   for y=by1_vert+1,by2_vert-1 do
    if jx>=0 and jx<128 and y>=0 and y<128 then
 				set_wall(jx,y,0)
-				set_floor(jx,y,1)
+				set_floor(jx,y,gen_floor_id)
    end
   end
   
@@ -344,7 +348,7 @@ function try_generate_room()
  fill_rect(rect,0)
  for x=max(0,rect[1]),min(127,rect[3]) do
   for y=max(0,rect[2]),min(127,rect[4]) do
-   set_floor(x, y, 1)
+   set_floor(x, y, gen_floor_id)
   end
  end
  create_corridor(base,node)
@@ -396,7 +400,8 @@ end
 function theme_wall_texture(theme)
  if theme=="out" then
   -- outdoor: grass or earth variants
-  local idx=rnd(1)<0.5 and 6 or 7 -- grass or earth
+  -- indices in texsets: 5=grass, 6=earth
+  local idx=rnd(1)<0.5 and 5 or 6
   return texsets[idx]
  elseif theme=="dem" then
   -- demon: stone or cobblestone
@@ -491,6 +496,8 @@ function erode_map(amount)
    end
    if neighbors>=3 then
 				set_wall(x,y,0)
+    -- ensure eroded clears become traversable floor with theme-specific type
+    set_floor(x,y,gen_floor_id)
    end
   end
  end
@@ -908,27 +915,7 @@ function generate_dungeon()
  -- fill with walls (non-zero tile)
  fill_rect({0,0,127,127},wall_fill_tile)
  
- -- generate first room
- local first_rect=random_room(nil,false)
- local first_node=add_room(first_rect)
- fill_rect(first_rect,0)
- for x=max(0,first_rect[1]),min(127,first_rect[3]) do
-  for y=max(0,first_rect[2]),min(127,first_rect[4]) do
-   set_floor(x, y, 1)
-  end
- end
- 
- -- generate additional rooms
- local room_count=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
- for i=2,room_count do
-  for attempt=1,max_room_attempts do
-   if try_generate_room() then
-    break
-   end
-  end
- end
- 
- -- assign global theme before gameplay generation
+ -- assign global theme before carving (ensures theme floor id is available)
  local theme_roll=rnd(1)
  local selected_theme="dng"
  if theme_roll<0.7 then
@@ -955,6 +942,32 @@ function generate_dungeon()
  roof.typ=planetyps[roof_idx]
  floor.x,floor.y=0,0
  roof.x,roof.y=0,0
+ -- theme-specific floor id used by generator when carving/eroding
+ gen_floor_id=floor_idx
+ 
+ -- generate first room
+ local first_rect=random_room(nil,false)
+ local first_node=add_room(first_rect)
+ fill_rect(first_rect,0)
+ for x=max(0,first_rect[1]),min(127,first_rect[3]) do
+  for y=max(0,first_rect[2]),min(127,first_rect[4]) do
+   set_floor(x, y, gen_floor_id)
+  end
+ end
+ 
+ -- generate additional rooms
+ local room_count=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
+ for i=2,room_count do
+  for attempt=1,max_room_attempts do
+   if try_generate_room() then
+    break
+   end
+  end
+ end
+ 
+ -- theme already chosen and floors configured above
+-- theme-specific floor id used by generator when carving/eroding
+gen_floor_id=floor_idx
  
  -- apply wall textures based on theme
  for node in all(gen_nodes) do

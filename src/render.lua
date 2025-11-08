@@ -114,6 +114,10 @@ function render_walls()
   local z=zbuf[ray_idx*2+1]
   local t=tbuf[ray_idx*2+1]
   
+  -- define x positions for this ray pair BEFORE the z check (needed by both branches)
+  local x0=ray_idx*2
+  local x1=ray_idx*2+1
+  
   if z<999 then
    -- calculate wall height
    local h=sdist/z
@@ -123,10 +127,6 @@ function render_walls()
    -- extract texture coordinates from table
    local tile=t.tile
    local tx=t.tx
-   
-   -- calculate screen x positions for 2x upscaling (each ray draws to 2 columns)
-   local x0=ray_idx*2
-   local x1=ray_idx*2+1
    
    -- LOD: use simplified rendering for distant walls
    if z>wall_lod_distance then
@@ -274,8 +274,10 @@ end
 
 -- render perspective floor/ceiling with individual 32x32 sprites
 function render_floor_ceiling()
- -- use cached sin/cos from _draw() if available
- local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
+ -- classic forward: forward = (cos(a), sin(a))
+ -- use cached cos/sin from _draw() if available
+ local fwdx=(ca_cached or cos(player.a))
+ local fwdy=(sa_cached or sin(player.a))
  
  -- calculate horizon with safeguard against divide-by-zero
  local h
@@ -291,7 +293,7 @@ function render_floor_ceiling()
  if roof_fallback then
   roof_src=get_error_texture("ceiling")
  end
- draw_rows(roof_src,-screen_center_y,-ceil(h/2),roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,sa,ca,roof_typ.tex)
+ draw_rows(roof_src,-screen_center_y,-ceil(h/2),roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,fwdy,fwdx,roof_typ.tex)
  
  -- fetch and render floor (sprites 32-33 from gfx/1_surfaces.gfx)
  local floor_typ=floor.typ
@@ -299,7 +301,7 @@ function render_floor_ceiling()
  if floor_fallback then
   floor_src=get_error_texture("floor")
  end
- draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,sa,ca,floor_typ.tex)
+ draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,fwdy,fwdx,floor_typ.tex)
  
  pal()
 end
