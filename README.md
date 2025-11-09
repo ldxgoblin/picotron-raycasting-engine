@@ -7,7 +7,7 @@ A high-performance 3D raycasting engine for Picotron featuring procedural dungeo
 ### Core Systems
 - **Raycasting Pipeline** (`raycast.lua`): DDA-based raycasting with 256-iteration limit, door animation support, and object hitscan
 - **Rendering** (`render.lua`, `render_sprite.lua`): Wall/floor/ceiling rendering with incremental fog palette caching, sprite z-buffering with frustum culling
-- **Floor System** (`main.lua`, `render.lua`, `dungeon_gen.lua`): Per-cell floor type data stored in `floorgrid[x][y]` table, sampled during perspective floor rendering for texture variety. Rooms use theme-appropriate floor types (stone for dungeons, dirt for outdoor), corridors use consistent stone.
+- **Floor System** (`main.lua`, `render.lua`, `dungeon_gen.lua`): Per-cell floor type data stored in `map.floors` userdata, accessed via `get_floor(x,y)` / `set_floor(x,y,val)`. The generator assigns a theme-specific floor ID early (before carving), corridors and rooms use that ID, and erosion writes floors when clearing walls. Floor rendering samples these per-cell types, and the minimap uses them to distinguish carved space from void.
 - **Door System** (`door_system.lua`): Animated sliding doors with configurable speed, auto-close delay, and lock/key mechanics
 - **Dungeon Generation** (`dungeon_gen.lua`): Procedural BSP-based room generation with corridor carving, theme-aware decoration spawning, progression gating, and content generation
 - **Enemy AI** (`main.lua`): Rate-limited patrol and follow behaviors with Euclidean pathfinding and spatial partitioning sync
@@ -63,7 +63,7 @@ See `ASSETS.md` for detailed sprite coordinate specifications.
 ## Known Limitations
 
 ### Performance
-- Maximum 320 rays per frame (480px width)
+- 240 rays per frame (480px width with 2× column upscaling)
 - Fog palette updates: ~100-200 operations/frame (optimized from ~1000)
 - Animation updates: ~10-30 objects/frame (optimized from 729 grid cells)
 - AI updates: Rate-limited to every 2 frames (configurable via `ai_update_rate`)
@@ -79,6 +79,7 @@ See `ASSETS.md` for detailed sprite coordinate specifications.
 - Floor type system: Per-cell data sampled during rendering, currently supports 2 floor types (stone, dirt) and 3 ceiling types
 
 ### Rendering Quirks
+- Pixel-centered ray offsets ensure even angular coverage with half-resolution rays and 2× upscaling
 - Floor texture layer implemented: per-cell floor types sampled during rendering for visual variety
 - Fog cache not reset on full palette clear (edge case when z≤0)
 - Sprite z-buffer uses back-to-front sorting (insertion sort per frame)
@@ -97,8 +98,8 @@ Global constants for tuning:
 - Extended `texsets`: 7 wall texture sets including grass and earth for outdoor themes
 
 ### `raycast.lua`
-- `raycast(x, y, dx, dy, sa, ca)`: Cast single ray, returns `z, hx, hy, tile, tx`
-- `raycast_scene()`: Cast all rays, populate `zbuf` and `tbuf`
+- `raycast(x, y, dx, dy, fx, fy)`: Cast a single ray. `dx,dy` are the world-space ray direction; `(fx,fy)` is the forward/depth axis used for perpendicular distance (camera forward uses `(cos(a),sin(a))`). Returns `z, hx, hy, tile, tx`.
+- `raycast_scene()`: Cast all rays, populate `zbuf` and `tbuf`. Uses pixel-centered offsets so `ray_count` rays cover the full `screen_width`. Camera mapping is classic: `Right=(-sin(a),cos(a))`, `Forward=(cos(a),sin(a))`.
 - `hitscan(x, y, dx, dy)`: Line-of-sight check for projectiles, returns `closest_obj, dist`
 
 ### `render.lua`
@@ -119,10 +120,10 @@ Global constants for tuning:
 ### `dungeon_gen.lua`
 - `generate_dungeon()`: Full procedural generation pipeline
   - Room placement with BSP spatial partitioning
-  - Theme assignment (before gameplay generation)
+  - Theme assignment occurs before carving so a theme floor ID is available consistently
   - Theme-aware wall texture application via `theme_wall_texture(theme)`
-  - Corridor carving with L-shaped junctions
-  - Map erosion for organic feel
+  - Corridor carving with L-shaped junctions; straight corridors use door retry with fallback to passage to guarantee connectivity
+  - Map erosion for organic feel; eroded clears write theme-consistent floor types
   - Door placement at boundaries (normal/locked progression gating)
   - Floor/ceiling type selection based on theme
   - Gameplay generation (NPCs, items, decorations)
@@ -137,9 +138,8 @@ Global constants for tuning:
 - `_init()`: Initialize player, map layers, objgrid, frame counter, generate first dungeon
 - `_update()`: Input, door animations, rate-limited AI updates, object animations, interactions
 - `_draw()`: Raycast scene, render pipeline, HUD, minimap
-- `set_floor(x, y, ftype)`: Set floor type at grid position (ftype=1-5, maps to planetyps)
-- `get_floor(x, y)`: Get floor type at grid position, returns index 1-5
-- `floorgrid[x][y]`: 128×128 table storing floor type indices
+- `set_floor(x, y, ftype)`: Set floor type at grid position in `map.floors` (ftype indexes into `planetyps`)
+- `get_floor(x, y)`: Get floor type index from `map.floors`
 - `update_npc_ai()`: Enemy AI update loop
   - **Patrol**: Cycles through waypoints, advances only when reached (dist < 0.1)
   - **Follow**: Moves toward player within follow_range using Euclidean distance
@@ -158,13 +158,13 @@ Global constants for tuning:
 ### Memory Layout
 - **Map Layers**: 128×128×2 bytes = 32KB per layer (walls, doors, floors = 96KB total)
 - **Objgrid**: 27×27 tables with dynamic object references (~5-10KB runtime)
-- **Z-buffer**: 320×4 bytes = 1.3KB
+ - **Z-buffer**: 480 entries (matches `screen_width`; used for sprite occlusion)
 - **Animated Objects**: Dynamic list (~1KB, scales with object count)
 
 ### Performance Bottlenecks
 1. **Sprite Sorting**: Insertion sort on visible objects (~10-50/frame)
 2. **Fog Palette**: 64 comparisons per fog level change (~10-20/frame)
-3. **Raycasting**: 320 rays × 256 max iterations = 81,920 worst-case steps/frame
+3. **Raycasting**: 240 rays × 256 max iterations = 61,440 worst-case steps/frame
 4. **AI Pathfinding**: Rate-limited to every 2 frames; uses Euclidean distance for follow behavior
 5. **Decoration Generation**: Theme filtering + per-room density cap reduces excessive spawning
 

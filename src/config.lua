@@ -30,8 +30,8 @@ interaction_range=0.5 -- proximity for triggers
 combat_trigger_range=0.3 -- distance to trigger combat
 
 -- player movement constants
-player_rotation_speed=0.02 -- radians per frame when turning
-player_move_speed=0.1 -- units per frame when moving
+player_rotation_speed=0.008 -- radians per frame when turning (slower, smoother)
+player_move_speed=0.04 -- units per frame when moving (reduced)
 
 -- door animation constants
 door_anim_speed=0.06 -- door open/close speed per frame

@@ -7,6 +7,17 @@ warned_sprites={}
 -- lazy initialization flag for error texture
 error_texture_initialized=false
 
+-- persistent caches for textures and average colors across frames
+tex_cache={}
+avg_color_cache={}
+
+-- clear caches when tiles/floor/ceiling change (e.g., on new floor)
+function clear_texture_caches()
+ tex_cache={}
+ avg_color_cache={}
+ warned_sprites={}
+end
+
 -- initialize error texture on first access (defensive fallback)
 function init_error_texture()
  if not error_texture_initialized and not error_texture then
@@ -56,6 +67,22 @@ last_fog_level=-1
 prev_pal={}
 
 -- apply distance-based fog (with hysteresis caching for performance)
+function compute_fog_level(z)
+ if z<=0 then
+  return -1
+ end
+ if use_quadratic_fog then
+  -- quadratic falloff with brightness adjustment
+  local i=min(z,100)^2/fogdist
+  i=min(1-(1-i)*screenbright,0.9999)
+  return flr(i*#pals)
+ else
+  -- simple linear distance fallback
+  return flr(min(z/8,15))
+ end
+end
+
+-- apply distance-based fog (with hysteresis caching for performance)
 function set_fog(z)
  if z<=0 then
   pal()
@@ -65,16 +92,7 @@ function set_fog(z)
   return
  end
  
- local level
- if use_quadratic_fog then
-  -- quadratic falloff with brightness adjustment
-  local i=min(z,100)^2/fogdist
-  i=min(1-(1-i)*screenbright,0.9999)
-  level=flr(i*#pals)
- else
-  -- simple linear distance fallback
-  level=flr(min(z/8,15))
- end
+ local level=compute_fog_level(z)
  
  -- hysteresis: only update if z changed significantly (reduces palette thrashing)
  if abs(z-last_fog_z)<fog_hysteresis and last_fog_level>=0 then
@@ -101,9 +119,7 @@ function render_walls()
  palt(0,false)
  
  -- cache sprite sources by tile to avoid repeated get_spr() calls
- local tex_cache={}
  -- cache LOD average colors per tile to avoid per-frame src:get() sampling
- local avg_color_cache={}
  
  for ray_idx=0,ray_count-1 do
   -- read from every other zbuf/tbuf entry (populated by raycast)
@@ -135,7 +151,9 @@ function render_walls()
      if cached then
       src,is_fallback=cached.src,cached.is_fallback
      else
-      src,is_fallback=get_texture_source(tile,"wall")
+      -- choose object type for fallback texture
+      local obj_type=is_door and is_door(tile) and "door" or "wall"
+      src,is_fallback=get_texture_source(tile,obj_type)
       tex_cache[tile]={src=src,is_fallback=is_fallback}
      end
      
@@ -165,7 +183,9 @@ function render_walls()
     if cached then
      src,is_fallback=cached.src,cached.is_fallback
     else
-     src,is_fallback=get_texture_source(tile,"wall")
+     -- choose object type for fallback texture
+     local obj_type=is_door and is_door(tile) and "door" or "wall"
+     src,is_fallback=get_texture_source(tile,obj_type)
      tex_cache[tile]={src=src,is_fallback=is_fallback}
     end
     
@@ -264,6 +284,9 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
   set_fog(0)
  end
  
+ -- track last applied fog level for this section to reduce calls
+ local last_scanline_level=-2
+ 
  for y=y0,y1 do
   -- calculate ray gradient
   local g=abs(y)/sdist
@@ -286,7 +309,12 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
   
   -- apply fog only for non-lit surfaces (per scanline)
   if not lit then
-   set_fog(z)
+   -- compute expected fog level and only update when it changes
+   local level=compute_fog_level(z)
+   if level~=last_scanline_level then
+    set_fog(z)
+    last_scanline_level=level
+   end
   end
   
   -- texture coordinates (pixel UVs in 32x32 sprite)

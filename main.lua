@@ -15,6 +15,10 @@ player_collision_radius=0.15
 function _init()
  window(screen_width,screen_height)
  
+ -- defensive defaults if config include failed to set them for any reason
+ if not objgrid_size then objgrid_size=5 end
+ if not objgrid_array_size then objgrid_array_size=26 end
+ 
  -- frame counter for ai timing
  frame_ct=0
  
@@ -121,6 +125,10 @@ function _init()
  
  -- compatibility layer: expose wallgrid as table for dungeon generator
  wallgrid={}
+ -- dual storage design:
+ -- doors array enables efficient iteration for updates/minimap;
+ -- doorgrid provides O(1) spatial lookup for collision/raycast.
+ -- Both structures must remain synchronized across floor regenerations.
  doorgrid={}
  for i=0,127 do
   wallgrid[i]={}
@@ -181,6 +189,7 @@ function _init()
  -- sprites: yellow/orange (10/9), props: red/brown (8/4)
  error_textures = {
   wall = userdata("u8", 32, 32),
+ door = userdata("u8", 32, 32),
   floor = userdata("u8", 32, 32),
   ceiling = userdata("u8", 32, 32),
   sprite = userdata("u8", 32, 32),
@@ -190,6 +199,7 @@ function _init()
  -- generate tinted checkerboards for each type
  local tints = {
   wall = {8, 14},      -- magenta/pink
+ door = {2, 6},       -- purple/blue (distinct from walls)
   floor = {12, 13},    -- blue/cyan
   ceiling = {11, 3},   -- green/dark green
   sprite = {10, 9},    -- yellow/orange
@@ -328,6 +338,7 @@ function _update()
   end
   floor.typ=planetyps[(current_idx % #planetyps)+1]
   floor.x,floor.y=0,0
+  if clear_texture_caches then clear_texture_caches() end
  end
  
  -- cycle roof type (for testing) when not in door test mode
@@ -341,6 +352,7 @@ function _update()
   end
   roof.typ=planetyps[(current_idx % #planetyps)+1]
   roof.x,roof.y=0,0
+  if clear_texture_caches then clear_texture_caches() end
  end
  
  -- debug ray casting
@@ -543,42 +555,48 @@ function draw_minimap_hud()
   end
  end
  
- -- draw doors
- for door in all(doors) do
-  -- tile-based rejection: skip if outside visible range
-  if door.x>=x_min and door.x<=x_max and door.y>=y_min and door.y<=y_max then
-   local sx=hud_x+(door.x*scale-cam_x)
-   local sy=hud_y+(door.y*scale-cam_y)
-   
-   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
-    local c=door.dtype==door_locked and 8 or 12
-    rectfill(sx,sy,sx+scale-1,sy+scale-1,c)
+ -- draw doors via spatial query over visible tiles
+ for x=x_min,x_max do
+  for y=y_min,y_max do
+   local door=doorgrid[x] and doorgrid[x][y] or nil
+   if door then
+    local sx=hud_x+(x*scale-cam_x)
+    local sy=hud_y+(y*scale-cam_y)
+    if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+     local c=door.dtype==door_locked and 8 or 12
+     rectfill(sx,sy,sx+scale-1,sy+scale-1,c)
+    end
    end
   end
  end
  
- -- draw objects
- for ob in all(objects) do
-  -- tile-based rejection: skip if outside visible range
-  local ob_tx=flr(ob.pos[1])
-  local ob_ty=flr(ob.pos[2])
-  if ob_tx>=x_min and ob_tx<=x_max and ob_ty>=y_min and ob_ty<=y_max then
-   local sx=hud_x+(ob.pos[1]*scale-cam_x)
-   local sy=hud_y+(ob.pos[2]*scale-cam_y)
-   
-   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
-    local c=7
-    if ob.typ and ob.typ.kind=="hostile_npc" then c=8
-    elseif ob.typ and ob.typ.kind=="direct_pickup" then
-     if ob.typ.subtype=="heart" then c=14
-     elseif ob.typ.subtype=="key" then c=9
+ -- draw objects via spatial query over visible objgrid cells
+ local gx_min=flr(x_min/objgrid_size)
+ local gx_max=flr(x_max/objgrid_size)
+ local gy_min=flr(y_min/objgrid_size)
+ local gy_max=flr(y_max/objgrid_size)
+ gx_min=max(0,gx_min)
+ gx_max=min(objgrid_array_size,gx_max)
+ gy_min=max(0,gy_min)
+ gy_max=min(objgrid_array_size,gy_max)
+ for gx=gx_min,gx_max do
+  for gy=gy_min,gy_max do
+   for ob in all(objgrid[gx+1][gy+1]) do
+    local sx=hud_x+(ob.pos[1]*scale-cam_x)
+    local sy=hud_y+(ob.pos[2]*scale-cam_y)
+    if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+     local c=7
+     if ob.typ and ob.typ.kind=="hostile_npc" then c=8
+     elseif ob.typ and ob.typ.kind=="direct_pickup" then
+      if ob.typ.subtype=="heart" then c=14
+      elseif ob.typ.subtype=="key" then c=9
+      end
+     elseif ob.typ and ob.typ.kind=="interactable" then
+      if ob.typ.subtype=="exit" then c=12 end
+     elseif ob.typ and ob.typ.kind=="decorative" then c=13
      end
-    elseif ob.typ and ob.typ.kind=="interactable" then
-     if ob.typ.subtype=="exit" then c=12 end
-    elseif ob.typ and ob.typ.kind=="decorative" then c=13
+     circfill(sx,sy,1,c)
     end
-    
-    circfill(sx,sy,1,c)
    end
   end
  end
@@ -613,6 +631,7 @@ function iscol(px,py,radius,opendoors,isplayer)
    -- bounds check
    if x<0 or x>=128 or y<0 or y>=128 then
     col=true
+    break
    else
     local tile=get_wall(x,y)
     
@@ -626,6 +645,7 @@ function iscol(px,py,radius,opendoors,isplayer)
       else
        -- door partially open or closed: collision detected
        col=true
+       -- handle unlocking/opening before exiting inner loop
        if opendoors then
         if door.keynum then
          -- check inventory for key
@@ -647,6 +667,8 @@ function iscol(px,py,radius,opendoors,isplayer)
          -- keep col=true, don't clear immediately
         end
        end
+       -- early exit from inner loop on collision (after opendoors handling)
+       break
       end
      end
     -- check if exit portal
@@ -655,9 +677,11 @@ function iscol(px,py,radius,opendoors,isplayer)
     -- check if wall
     elseif tile>0 then
      col=true
+     break
     end
    end
   end
+  if col then break end
  end
  
  -- check solid objects around position using objgrid spatial query
@@ -690,23 +714,6 @@ function iscol(px,py,radius,opendoors,isplayer)
    if col then break end
   end
   if col then break end
- end
- 
- -- prevent doors from closing when player is inside
- if isplayer then
-  for x=flr(px-radius),flr(px+radius) do
-   for y=flr(py-radius),flr(py+radius) do
-    if x>=0 and x<128 and y>=0 and y<128 then
-     local tile=get_wall(x,y)
-     if tile==door_normal or tile==door_locked or tile==door_stay_open then
-      local door=doorgrid[x][y]
-      if door and door.open>0 then
-       door.opening=true
-      end
-     end
-    end
-   end
-  end
  end
  
  return col
@@ -774,11 +781,11 @@ function update_input()
  local sa,ca=sin(player.a),cos(player.a)
  
  -- movement
- if btn(0) then -- left
-  player.a-=player_rotation_speed
- end
- if btn(1) then -- right
-  player.a+=player_rotation_speed
+ -- combine keys to avoid double-processing and fix direction:
+ -- positive turn = left, negative turn = right
+ local turn=(btn(0) and 1 or 0)-(btn(1) and 1 or 0)
+ if turn~=0 then
+  player.a+=turn*player_rotation_speed
  end
  if btn(2) then -- up
   local nx=player.x+ca*player.spd
@@ -987,9 +994,19 @@ function generate_new_floor()
  objects={}
  animated_objects={}
  doors={}
+ -- also clear doorgrid to prevent stale references
+ for i=0,127 do
+  if doorgrid[i] then
+   for j=0,127 do
+    doorgrid[i][j]=nil
+   end
+  end
+ end
  
  -- regenerate dungeon
  start_pos,gen_stats=generate_dungeon()
+ -- invalidate persistent render caches for new floor
+ if clear_texture_caches then clear_texture_caches() end
  
  printh("floor complete! difficulty: "..gen_params.difficulty)
 end
@@ -1006,56 +1023,60 @@ end
 
 -- update npc ai (basic patrol and follow)
 function update_npc_ai()
- for ob in all(objects) do
-  if ob.typ and ob.typ.kind=="hostile_npc" and ob.ai_type then
-   local old_x,old_y=ob.pos[1],ob.pos[2]
-   
-   if ob.ai_type=="patrol" then
-    -- patrol: cycle through patrol_points
-    if ob.patrol_points and #ob.patrol_points>0 then
-     -- initialize patrol_index if nil or 0
-     if not ob.patrol_index or ob.patrol_index==0 then
-      ob.patrol_index=1
-     end
+ for gx=0,objgrid_array_size do
+  for gy=0,objgrid_array_size do
+   for ob in all(objgrid[gx+1][gy+1]) do
+    if ob.typ and ob.typ.kind=="hostile_npc" and ob.ai_type then
+     local old_x,old_y=ob.pos[1],ob.pos[2]
      
-     local target=ob.patrol_points[ob.patrol_index]
-     if target then
-      local dx=target.x-ob.pos[1]
-      local dy=target.y-ob.pos[2]
-      local dist=sqrt(dx*dx+dy*dy)
-      
-      -- reached waypoint: advance to next
-      if dist<0.1 then
-       ob.patrol_index=(ob.patrol_index%#ob.patrol_points)+1
-      else
-       -- move toward current waypoint
-       if dist>0 then
-        local spd=ob.typ.patrol_speed or 0.03
-        local nx=ob.pos[1]+dx/dist*spd
-        local ny=ob.pos[2]+dy/dist*spd
-        trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+     if ob.ai_type=="patrol" then
+      -- patrol: cycle through patrol_points
+      if ob.patrol_points and #ob.patrol_points>0 then
+       -- initialize patrol_index if nil or 0
+       if not ob.patrol_index or ob.patrol_index==0 then
+        ob.patrol_index=1
+       end
+       
+       local target=ob.patrol_points[ob.patrol_index]
+       if target then
+        local dx=target.x-ob.pos[1]
+        local dy=target.y-ob.pos[2]
+        local dist=sqrt(dx*dx+dy*dy)
+        
+        -- reached waypoint: advance to next
+        if dist<0.1 then
+         ob.patrol_index=(ob.patrol_index%#ob.patrol_points)+1
+        else
+         -- move toward current waypoint
+         if dist>0 then
+          local spd=ob.typ.patrol_speed or 0.03
+          local nx=ob.pos[1]+dx/dist*spd
+          local ny=ob.pos[2]+dy/dist*spd
+          trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+         end
+        end
        end
       end
+      
+     elseif ob.ai_type=="follow" then
+      -- follow: move toward player if in range
+      local dx=player.x-ob.pos[1]
+      local dy=player.y-ob.pos[2]
+      local dist=sqrt(dx*dx+dy*dy)
+      local follow_range=ob.typ.follow_range or 20
+      if dist<follow_range and dist>0.1 then
+       local spd=ob.typ.follow_speed or 0.05
+       local nx=ob.pos[1]+dx/dist*spd
+       local ny=ob.pos[2]+dy/dist*spd
+       trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+      end
+     end
+     
+     -- update spatial grid after movement
+     if old_x~=ob.pos[1] or old_y~=ob.pos[2] then
+      update_object_grid(ob,old_x,old_y)
      end
     end
-    
-   elseif ob.ai_type=="follow" then
-    -- follow: move toward player if in range
-    local dx=player.x-ob.pos[1]
-    local dy=player.y-ob.pos[2]
-    local dist=sqrt(dx*dx+dy*dy)
-    local follow_range=ob.typ.follow_range or 20
-    if dist<follow_range and dist>0.1 then
-     local spd=ob.typ.follow_speed or 0.05
-     local nx=ob.pos[1]+dx/dist*spd
-     local ny=ob.pos[2]+dy/dist*spd
-     trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
-    end
-   end
-   
-   -- update spatial grid after movement
-   if old_x~=ob.pos[1] or old_y~=ob.pos[2] then
-    update_object_grid(ob,old_x,old_y)
    end
   end
  end

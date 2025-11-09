@@ -7,6 +7,8 @@ gen_nodes={}
 gen_edges={}
 gen_inventory={}
 gen_objects={}
+-- theme-specific floor id used during carving/eroding; initialized to stone_tile (1)
+local gen_floor_id=1
 
 -- helper: check if tile is a wall
 function is_wall(val)
@@ -23,8 +25,22 @@ function is_exit(val)
  return val>=exit_start and val<=exit_end
 end
 
+-- helper: boundary cell is reserved if it has a door/exit in either layer
+function is_reserved_boundary(x,y)
+ local w=get_wall(x,y)
+ if is_door(w) or is_exit(w) then return true end
+ -- defensive: should always be 0 if walls layer is authoritative
+ if get_door(x,y)>0 then return true end
+ if doorgrid[x] and doorgrid[x][y] then return true end
+ return false
+end
+
 -- helper: check if rectangles overlap
 function rect_overlaps(rect)
+ -- reject out-of-bounds rectangles upfront (map is 0..127)
+ if rect[1]<0 or rect[3]>=128 or rect[2]<0 or rect[4]>=128 then
+  return true
+ end
  for r in all(gen_rects) do
   if not (rect[3]+gen_params.spacing<r[1] or rect[1]>r[3]+gen_params.spacing or
           rect[4]+gen_params.spacing<r[2] or rect[2]>r[4]+gen_params.spacing) then
@@ -50,10 +66,13 @@ function try_place_door_with_fallback(x,y,dtype)
   {x-1,y},{x+1,y},{x,y-1},{x,y+1}
  }
  
+ -- evaluate door placement probability once per logical placement
+ local should_place_door=rnd(1)<gen_params.room_door_prob
+ 
  for attempt in all(attempts) do
   local ax,ay=attempt[1],attempt[2]
   if ax>=0 and ax<128 and ay>=0 and ay<128 then
-			if is_wall(get_wall(ax,ay)) and rnd(1)<gen_params.room_door_prob then
+			if is_wall(get_wall(ax,ay)) and should_place_door then
 				set_wall(ax,ay,dtype)
     create_door(ax,ay,dtype)
     return true
@@ -241,23 +260,29 @@ function create_corridor(n1,n2)
   local bx1_horiz,bx2_horiz
   if r1[1]<=jx then
    bx1_horiz=r1[3]+1
+   -- place door on the wall just outside the junction (left side)
    bx2_horiz=jrect[1]-1
   else
+   -- place door on the wall just outside the junction (right side)
    bx1_horiz=jrect[3]+1
    bx2_horiz=r1[1]-1
   end
   
   -- place doors on horizontal segment boundaries with retry and fallback
-  local door1_ok=place_boundary_door_with_retry(bx1_horiz,n1.midy,door_normal,3)
-  if not door1_ok then
-   printh("warning: failed to place junction door at ("..bx1_horiz..","..n1.midy.."), clearing as passage")
-   ensure_boundary_passage(bx1_horiz,n1.midy)
+  if bx1_horiz>=0 and bx1_horiz<128 then
+   local door1_ok=place_boundary_door_with_retry(bx1_horiz,n1.midy,door_normal,3)
+   if not door1_ok then
+    printh("warning: failed to place junction door at ("..bx1_horiz..","..n1.midy.."), clearing as passage")
+    ensure_boundary_passage(bx1_horiz,n1.midy)
+   end
   end
   
-  local door2_ok=place_boundary_door_with_retry(bx2_horiz,n1.midy,door_normal,3)
-  if not door2_ok then
-   printh("warning: failed to place junction door at ("..bx2_horiz..","..n1.midy.."), clearing as passage")
-   ensure_boundary_passage(bx2_horiz,n1.midy)
+  if bx2_horiz>=0 and bx2_horiz<128 then
+   local door2_ok=place_boundary_door_with_retry(bx2_horiz,n1.midy,door_normal,3)
+   if not door2_ok then
+    printh("warning: failed to place junction door at ("..bx2_horiz..","..n1.midy.."), clearing as passage")
+    ensure_boundary_passage(bx2_horiz,n1.midy)
+   end
   end
   
 	-- carve horizontal segment
@@ -273,24 +298,30 @@ function create_corridor(n1,n2)
   local r2=n2.rect
   local by1_vert,by2_vert
   if jy<=r2[2] then
+   -- place door on the wall just outside the junction (bottom side)
    by1_vert=jrect[4]+1
    by2_vert=r2[2]-1
   else
    by1_vert=r2[4]+1
+   -- place door on the wall just outside the junction (top side)
    by2_vert=jrect[2]-1
   end
   
   -- place doors on vertical segment boundaries with retry and fallback
-  local door3_ok=place_boundary_door_with_retry(jx,by1_vert,door_normal,3)
-  if not door3_ok then
-   printh("warning: failed to place junction door at ("..jx..","..by1_vert.."), clearing as passage")
-   ensure_boundary_passage(jx,by1_vert)
+  if by1_vert>=0 and by1_vert<128 then
+   local door3_ok=place_boundary_door_with_retry(jx,by1_vert,door_normal,3)
+   if not door3_ok then
+    printh("warning: failed to place junction door at ("..jx..","..by1_vert.."), clearing as passage")
+    ensure_boundary_passage(jx,by1_vert)
+   end
   end
   
-  local door4_ok=place_boundary_door_with_retry(jx,by2_vert,door_normal,3)
-  if not door4_ok then
-   printh("warning: failed to place junction door at ("..jx..","..by2_vert.."), clearing as passage")
-   ensure_boundary_passage(jx,by2_vert)
+  if by2_vert>=0 and by2_vert<128 then
+   local door4_ok=place_boundary_door_with_retry(jx,by2_vert,door_normal,3)
+   if not door4_ok then
+    printh("warning: failed to place junction door at ("..jx..","..by2_vert.."), clearing as passage")
+    ensure_boundary_passage(jx,by2_vert)
+   end
   end
   
 	-- carve vertical segment
@@ -362,30 +393,39 @@ function apply_room_walls(rect,tex)
  
  for x=rect[1],rect[3] do
   if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(x,rect[2]-1)) or is_exit(get_wall(x,rect[2]-1))) then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(x,rect[2]-1) then
 			set_wall(x,rect[2]-1,tex)
    end
   end
   if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(x,rect[4]+1)) or is_exit(get_wall(x,rect[4]+1))) then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(x,rect[4]+1) then
 			set_wall(x,rect[4]+1,tex)
    end
   end
  end
  for y=rect[2],rect[4] do
   if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(rect[1]-1,y)) or is_exit(get_wall(rect[1]-1,y))) then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(rect[1]-1,y) then
 			set_wall(rect[1]-1,y,tex)
    end
   end
   if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
-   -- skip if door or exit tile
-		if not (is_door(get_wall(rect[3]+1,y)) or is_exit(get_wall(rect[3]+1,y))) then
+   -- skip reserved cells (doors/exits in any layer)
+		if not is_reserved_boundary(rect[3]+1,y) then
 			set_wall(rect[3]+1,y,tex)
    end
+  end
+ end
+end
+
+-- repair step: ensure door tiles exist on walls layer for all logical doors
+function enforce_door_tiles()
+ for door in all(doors) do
+  if not is_door(get_wall(door.x,door.y)) then
+   set_wall(door.x,door.y,door.dtype or door_normal)
   end
  end
 end
@@ -402,18 +442,21 @@ function theme_wall_texture(theme)
   -- outdoor: grass or earth variants
   -- indices in texsets: 5=grass, 6=earth
   local idx=rnd(1)<0.5 and 5 or 6
-  return texsets[idx]
+  return texsets[idx] or texsets[1]
  elseif theme=="dem" then
   -- demon: stone or cobblestone
-  local idx=rnd(1)<0.5 and 3 or 5
-  return texsets[idx]
+  -- indices: 4=stone, 2=cobblestone
+  local idx=rnd(1)<0.5 and 4 or 2
+  return texsets[idx] or texsets[1]
  elseif theme=="house" then
   -- house: wood plank
-  return texsets[4]
+  -- index: 3=wood_plank
+  return texsets[3] or texsets[1]
  else
   -- default dungeon: brick or cobblestone
-  local idx=rnd(1)<0.5 and 2 or 3
-  return texsets[idx]
+  -- indices: 1=brick, 2=cobblestone
+  local idx=rnd(1)<0.5 and 1 or 2
+  return texsets[idx] or texsets[1]
  end
 end
 
@@ -544,6 +587,11 @@ end
 
 -- gameplay generation: enemies, items, decorations, npcs
 function generate_gameplay()
+ -- guard against empty gen_nodes to avoid nil dereference
+ if not gen_nodes or #gen_nodes==0 then
+  printh("error: generate_gameplay() called with no rooms")
+  return
+ end
  local start_node=gen_nodes[1]
  local exit_node=gen_nodes[#gen_nodes]
  
@@ -577,37 +625,52 @@ function generate_progression_loop(start_node)
  local locked_edges={}
  local key_counter=1
  
+ -- cache accessible rooms for current locked_edges; recompute only after a successful lock
+ local full_accessible=find_accessible_rooms(start_node,locked_edges)
+ 
+ -- prepare shuffled edge order to avoid duplicate selection and ensure coverage
+ local edges_shuffled={}
+ for e in all(gen_edges) do add(edges_shuffled,e) end
+ -- fisher-yates shuffle
+ for i=#edges_shuffled,2,-1 do
+  local j=flr(rnd(i))+1
+  edges_shuffled[i],edges_shuffled[j]=edges_shuffled[j],edges_shuffled[i]
+ end
+ 
  -- attempt to create progression gates
- for gate_idx=1,#gen_edges do
+ for gate_idx=1,#edges_shuffled do
   if key_counter>3 then break end
   
   -- try to lock an edge
-  local edge=gen_edges[flr(rnd(#gen_edges))+1]
+  local edge=edges_shuffled[gate_idx]
   local n1,n2=edge.n1,edge.n2
   
   -- check if this edge would gate content
-  local test_locked={edge}
-  local test_accessible=find_accessible_rooms(start_node,test_locked)
-  local full_accessible=find_accessible_rooms(start_node,locked_edges)
+  local combined_locked={}
+  for le in all(locked_edges) do add(combined_locked,le) end
+  add(combined_locked,edge)
+  local test_accessible=find_accessible_rooms(start_node,combined_locked)
   
 		-- if locking this edge hides new rooms, add it as a gate
 		if #test_accessible<#full_accessible then
 			-- choose the actual corridor boundary door tile
 			local candidates={edge.b1,edge.b2}
-			local chosen=nil
-			for c in all(candidates) do
-				if c and c.x and c.y then
-					chosen=c
-					break
-				end
-			end
+   local chosen=nil
+   for c in all(candidates) do
+    if c and c.x and c.y then
+     local wt=get_wall(c.x,c.y)
+     if is_door(wt) then
+      chosen=c
+      break
+     end
+    end
+   end
 			if chosen then
 				local x,y=chosen.x,chosen.y
 				local door=doorgrid[x] and doorgrid[x][y] or nil
 				if door then
 					-- convert existing door to locked
 					set_wall(x,y,door_locked)
-					set_door(x,y,door_locked)
 					door.dtype=door_locked
 					door.keynum=key_counter
 				else
@@ -616,16 +679,22 @@ function generate_progression_loop(start_node)
 					create_door(x,y,door_locked,key_counter)
 				end
 				add(locked_edges,edge)
+     -- update cached accessibility after modifying locked edges
+     full_accessible=find_accessible_rooms(start_node,locked_edges)
 				-- add key to inventory
 				add(gen_inventory,{type="key",keynum=key_counter})
 				key_counter+=1
+   else
+    printh("warning: no valid boundary door tile for gate; skipping")
 			end
 		end
  end
  
  -- place inventory items in accessible rooms
+ local failed_placements=0
+ -- compute accessible rooms once (does not change during item placement)
+ local accessible=find_accessible_rooms(start_node,locked_edges)
  while #gen_inventory>0 do
-  local accessible=find_accessible_rooms(start_node,locked_edges)
   
   if #accessible>0 then
    local room=accessible[flr(rnd(#accessible))+1]
@@ -634,12 +703,47 @@ function generate_progression_loop(start_node)
    
    local x,y=find_spawn_point(room.rect)
    if x then
+    failed_placements=0
    if item.type=="key" then
      local ob={pos={x,y},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
      add(gen_objects,ob)
     else
      local ob={pos={x,y},typ=obj_types[item.type],rel={0,0},frame=0,animloop=true,autoanim=true}
      add(gen_objects,ob)
+    end
+   else
+    -- handle failed placement
+    if item.type=="key" then
+     -- retry a limited number of times across different rooms
+     local attempts=0
+     local placed=false
+     while attempts<15 and not placed do
+      local rr=accessible[flr(rnd(#accessible))+1]
+      local kx,ky=find_spawn_point(rr.rect)
+      if kx then
+       local ob={pos={kx,ky},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
+       add(gen_objects,ob)
+       placed=true
+       break
+      end
+      attempts+=1
+     end
+     if not placed then
+      -- fallback: force place in start room (center if needed)
+      local sx,sy=find_spawn_point(start_node.rect)
+      if not sx then
+       sx=start_node.midx+0.5
+       sy=start_node.midy+0.5
+      end
+      local ob={pos={sx,sy},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
+      add(gen_objects,ob)
+     end
+    else
+     failed_placements+=1
+     if failed_placements>10 then
+      printh("warning: failed to place items after multiple attempts; stopping")
+      break
+     end
     end
    end
   else
@@ -966,9 +1070,6 @@ function generate_dungeon()
  end
  
  -- theme already chosen and floors configured above
--- theme-specific floor id used by generator when carving/eroding
-gen_floor_id=floor_idx
- 
  -- apply wall textures based on theme
  for node in all(gen_nodes) do
   -- skip junction rooms to avoid texturing their perimeters
@@ -979,8 +1080,13 @@ gen_floor_id=floor_idx
   end
  end
  
+ -- ensure any doors placed earlier remain doors on the walls layer
+ enforce_door_tiles()
+ 
  -- generate gameplay content (now aware of theme)
  generate_gameplay()
+ -- gameplay may lock doors; re-assert tiles
+ enforce_door_tiles()
  
  -- populate objgrid from gen_objects
  for ob in all(gen_objects) do
