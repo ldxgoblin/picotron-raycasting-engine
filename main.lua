@@ -253,6 +253,21 @@ function _init()
  -- maintain backward compatibility with single error_texture
  error_texture = error_textures.default
 
+ -- reserve sprite indexes for error textures (batching prefers sprite indexes)
+ ERROR_IDX = { wall=8000, door=8001, floor=8002, ceiling=8003, sprite=8004, default=8005 }
+ for name, ud in pairs(error_textures) do
+  local idx = ERROR_IDX[name] or ERROR_IDX.default
+  set_spr(idx, ud)
+ end
+
+ -- logging helper: console + ring buffer for optional on-screen echo
+ log_lines = {}
+ function log(str)
+  printh(str)
+  add(log_lines, str)
+  if #log_lines > 200 then deli(log_lines, 1) end
+ end
+
  -- validate all configured sprites exist (comment out for production)
  validate_sprite_configuration()
 
@@ -331,7 +346,7 @@ function _update()
  end
  
  -- toggle view mode (debug only)
- if debug_mode and btnp(5) then -- x key
+ if debug_mode and (keyp("x") or btnp(5)) then
   view_mode=view_mode=="3d" and "2d" or "3d"
  end
  
@@ -340,13 +355,10 @@ function _update()
   debug_mode=not debug_mode
  end
  
- -- toggle diagnostics overlay with G key
- if keyp("g") or btnp(13) then
-  show_diagnostics=not show_diagnostics
- end
+ -- diagnostics overlay removed; merged into debug panel (Tab)
  
- -- toggle diagnostics logging with F key
- if keyp("f") or btnp(12) then
+ -- toggle diagnostics logging (controller button 12)
+ if btnp(12) then
   enable_diagnostics_logging=not enable_diagnostics_logging
   printh("Diagnostics logging: "..tostring(enable_diagnostics_logging))
  end
@@ -357,24 +369,24 @@ function _update()
  end
  
  -- toggle test door mode (when not in 2d map view)
- if view_mode=="3d" and btnp(8) then -- v key for door test mode
+ if view_mode=="3d" and (keyp("v") or btnp(15)) then
   test_door_mode=not test_door_mode
  end
  
  -- cycle test door open value (0.0 to 1.0)
  if test_door_mode then
-  if btnp(6) then -- c key: increase
+  if keyp("c") then
    test_door_open=(test_door_open or 0)+0.1
    if test_door_open>1 then test_door_open=0 end
   end
-  if btnp(7) then -- d key: decrease
+  if keyp("d") then
    test_door_open=(test_door_open or 0)-0.1
    if test_door_open<0 then test_door_open=1 end
   end
  end
  
  -- cycle floor type (for testing) when not in door test mode
- if not test_door_mode and btnp(6) then -- c key
+ if not test_door_mode and keyp("c") then
   local current_idx=1
   for i=1,#planetyps do
    if planetyps[i].tex==floor.typ.tex then
@@ -388,7 +400,7 @@ function _update()
  end
  
  -- cycle roof type (for testing) when not in door test mode
- if not test_door_mode and btnp(7) then -- d key
+ if not test_door_mode and keyp("d") then
   local current_idx=1
   for i=1,#planetyps do
    if planetyps[i].tex==roof.typ.tex then
@@ -434,6 +446,10 @@ function _draw()
  ca_cached=cos(player.a)
  
  if view_mode=="3d" then
+  -- clear z buffer once per frame
+  for i=1,screen_width do
+   zbuf[i]=999
+  end
   raycast_scene()
   render_floor_ceiling()
   render_walls()
@@ -458,57 +474,63 @@ function _draw()
    print("trap sprung!",screen_center_x-30,screen_center_y,8)
   end
   
-  -- debug overlay
+  -- consolidated debug + diagnostics panel (Tab): sized to fit, top-left
   if debug_mode then
+   local margin=8
    local sa,ca=sin(player.a),cos(player.a)
-   local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
-   print("debug on [tab]",2,42,11)
-   print("z="..(flr(z*100)/100),2,50,7)
-   print("tile="..tile,2,58,7)
-   print("tx="..(flr(tx*100)/100),2,66,7)
-   print("floor: "..floor.typ.tex,2,74,7)
-   print("roof: "..roof.typ.tex,2,82,7)
-  end
-  
-  -- diagnostics overlay (independent of debug_mode, toggled with F1)
-  if show_diagnostics then
-   local diag_x=screen_width-120
-   local diag_y=2
-   print("=== DIAGNOSTICS ===",diag_x,diag_y,11)
-   diag_y+=8
+   local z,hx,hy,tile,txv=raycast(player.x,player.y,ca,sa,sa,ca)
    local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
-   print("DDA steps/ray: "..avg_dda,diag_x,diag_y,7)
-   diag_y+=8
-   print("Early-outs: "..diag_dda_early_outs,diag_x,diag_y,7)
-   diag_y+=8
-   print("Fog switches: "..diag_fog_switches,diag_x,diag_y,7)
-   diag_y+=8
-   print("Wall columns: "..diag_wall_columns,diag_x,diag_y,7)
-   diag_y+=8
-   print("Floor rows: "..diag_floor_rows,diag_x,diag_y,7)
-   diag_y+=8
-   print("Floor draw calls: "..diag_floor_draw_calls,diag_x,diag_y,7)
-   diag_y+=8
-   print("Sprite columns: "..diag_sprite_columns,diag_x,diag_y,7)
-   diag_y+=8
-   print("FPS: "..stat(7),diag_x,diag_y,7)
-   diag_y+=8
-   print("Frame: "..diag_frame_count,diag_x,diag_y,7)
+   local lines={
+    "=== DEBUG ===",
+    "pos: "..flr(player.x)..","..flr(player.y),
+    "ang: "..(flr(player.a*100)/100),
+    "floor: "..floor.typ.tex.."  roof: "..roof.typ.tex,
+    "z="..(flr(z*100)/100).." tile="..tile.." tx="..(flr(txv*100)/100),
+    "=== DIAGNOSTICS ===",
+    "DDA steps/ray: "..avg_dda,
+    "Early-outs: "..diag_dda_early_outs,
+    "Fog switches: "..diag_fog_switches,
+    "Wall columns: "..diag_wall_columns,
+    "Floor rows: "..diag_floor_rows,
+    "Floor draw calls: "..diag_floor_draw_calls,
+    "Sprite columns: "..diag_sprite_columns,
+    "Logging: "..(enable_diagnostics_logging and "ON" or "OFF").." (Btn12)",
+    "FPS: "..stat(7).."  Frame: "..diag_frame_count
+   }
+   -- measure max width
+   local maxw=0
+   for i=1,#lines do
+    local w=print(lines[i], 0, -1000) or 0
+    if w>maxw then maxw=w end
+   end
+   local panel_w=max(200, maxw+12)
+   local panel_h=#lines*8+8
+   local panel_x=margin
+   local panel_y=margin
+   rectfill(panel_x,panel_y,panel_x+panel_w-1,panel_y+panel_h-1,0)
+   rect(panel_x,panel_y,panel_x+panel_w-1,panel_y+panel_h-1,7)
+   local txp=panel_x+6
+   local typ=panel_y+6
+   for i=1,#lines do
+    local col=(i==1 or lines[i]=="=== DIAGNOSTICS ===") and 11 or 7
+    print(lines[i], txp, typ, col)
+    typ+=8
+   end
   end
   
   -- periodic printh summary (every 60 frames) - independent of debug_mode, controlled by enable_diagnostics_logging
   if enable_diagnostics_logging and diag_frame_count%60==0 then
    local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
-   printh("=== FRAME "..diag_frame_count.." DIAGNOSTICS ===")
-   printh("Avg DDA steps/ray: "..avg_dda)
-   printh("Early-outs: "..diag_dda_early_outs)
-   printh("Fog switches: "..diag_fog_switches)
-   printh("Wall columns: "..diag_wall_columns)
-   printh("Floor rows: "..diag_floor_rows)
-   printh("Floor draw calls: "..diag_floor_draw_calls)
-   printh("Sprite columns: "..diag_sprite_columns)
-   printh("FPS: "..stat(7))
-   printh("CPU: "..stat(1).."%")
+   log("=== FRAME "..diag_frame_count.." DIAGNOSTICS ===")
+   log("Avg DDA steps/ray: "..avg_dda)
+   log("Early-outs: "..diag_dda_early_outs)
+   log("Fog switches: "..diag_fog_switches)
+   log("Wall columns: "..diag_wall_columns)
+   log("Floor rows: "..diag_floor_rows)
+   log("Floor draw calls: "..diag_floor_draw_calls)
+   log("Sprite columns: "..diag_sprite_columns)
+   log("FPS: "..stat(7))
+   log("CPU: "..stat(1).."%")
   end
   
   -- minimap HUD overlay
@@ -521,7 +543,7 @@ function _draw()
  if in_combat then
   rectfill(0,screen_height-40,screen_width,screen_height,0)
   print("entering combat...",screen_center_x-40,screen_center_y,8)
-  print("[esc] exit (temp)",screen_center_x-40,screen_center_y+10,7)
+  print("[enter] exit (temp)",screen_center_x-40,screen_center_y+10,7)
  end
  
  -- restore palette from fog remapping (single restore per frame)
@@ -1125,7 +1147,7 @@ end
 -- update combat (placeholder)
 function update_combat()
  -- temp exit: press Q or Enter
- if keyp("q") or btnp(6) then
+ if keyp("q") or keyp("enter") then
   in_combat=false
   current_target=nil
   printh("exited combat")

@@ -105,14 +105,66 @@ function set_fog(z)
   local p=pals[level+1]
   for i=0,63 do
    -- incremental update: only apply if value changed
-   if p[i+1]~=prev_pal[i] then
-    pal(i,p[i+1])
+    if p[i+1]~=prev_pal[i] then
+     pal(i,p[i+1],1)
     prev_pal[i]=p[i+1]
    end
   end
   last_fog_level=level
  end
 end
+
+-- =========================
+-- Batched tline3d utilities
+-- =========================
+-- Each row: sprite_index, x0,y0,x1,y1, u0,v0,u1,v1, w0,w1  (12 columns)
+local TLINE_COLS=12
+local tline_buf_capacity=screen_width*2
+local tline_args=userdata("f64", TLINE_COLS, tline_buf_capacity)
+local tline_count=0
+
+local function batch_reset()
+	tline_count=0
+end
+
+local function batch_push(idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1)
+	if tline_count>=tline_buf_capacity then
+		tline3d(tline_args, 0, tline_count, TLINE_COLS)
+		tline_count=0
+	end
+	tline_args:set(0, tline_count, idx, x0, y0, x1, y1, u0, v0, u1, v1, w0 or 1, w1 or 1)
+	tline_count+=1
+end
+
+local function batch_submit()
+	if tline_count>0 then
+		tline3d(tline_args, 0, tline_count, TLINE_COLS)
+		tline_count=0
+	end
+end
+
+local function resolve_sprite_index(idx, kind)
+	if idx and get_spr(idx) then
+		return idx
+	end
+	if ERROR_IDX then
+		if kind=="floor" then return ERROR_IDX.floor
+		elseif kind=="ceiling" then return ERROR_IDX.ceiling
+		elseif kind=="sprite" then return ERROR_IDX.sprite
+		elseif kind=="door" then return ERROR_IDX.door
+		else return ERROR_IDX.wall end
+	end
+	return 0
+end
+
+-- preallocated buffers for per-cell floor runs (avoid per-frame table allocations)
+local RUN_CAP=1024
+local runs_x0=userdata("i16", RUN_CAP)
+local runs_x1=userdata("i16", RUN_CAP)
+local runs_id=userdata("i16", RUN_CAP)
+local merged_x0=userdata("i16", RUN_CAP)
+local merged_x1=userdata("i16", RUN_CAP)
+local merged_id=userdata("i16", RUN_CAP)
 
 -- render textured walls (span-based with per-pixel zbuf and LOD)
 function render_walls()
@@ -233,24 +285,22 @@ function render_walls()
     -- apply fog once per ray
     set_fog(z)
     
-    -- draw columns across the span with interpolated u
+    -- draw columns across the span with interpolated u (batched)
+    batch_reset()
+    local spr_idx=resolve_sprite_index(tile, (is_door and is_door(tile)) and "door" or "wall")
     for x=x0,x1 do
      local u_interp=u0+(u1-u0)*(x-x0)/(x1-x0+0.01)
      u_interp=max(0,min(31,u_interp))
-     tline3d(src,x,draw_y0,x,draw_y1,u_interp,v0,u_interp,v1,1,1)
+     batch_push(spr_idx, x, draw_y0, x, draw_y1, u_interp, v0, u_interp, v1, 1, 1)
      -- write zbuf per pixel
      zbuf[x+1]=z
     end
+    batch_submit()
     
     -- count wall columns for diagnostics
     if debug_mode then
      diag_wall_columns+=(x1-x0+1)
     end
-   end
-  else
-   -- miss: still write zbuf for the span to maintain occlusion
-   for x=x0,x1 do
-    zbuf[x+1]=999
    end
   end
  end
@@ -349,94 +399,91 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
   end
   
   if per_cell_floors_enabled then
-   -- per-cell floor type rendering: sample floor types along scanline and build runs
-   local runs={}
-   local sample_interval=4
-   local current_run=nil
-   
+   -- per-cell floor type rendering using preallocated buffers (no per-frame table allocs)
+   local sample_interval=12
+   local rcount=0
+   local cur_id=-1
+   local cur_x0=0
    for x=0,screen_width-1,sample_interval do
-    -- compute world coordinates at this x
     local wx=mx+x*mdx
     local wy=my+x*mdy
     local gx=flr(wx)
     local gy=flr(wy)
-    
-    -- read floor type from map (0=use global default)
-    local floor_id=get_floor(gx,gy)
-    
-    -- start new run or extend current run
-    if not current_run then
-     current_run={x0=x,x1=x,floor_id=floor_id}
-    elseif current_run.floor_id==floor_id then
-     current_run.x1=x
-    else
-     -- close current run and start new one
-     current_run.x1=x-1
-     add(runs,current_run)
-     current_run={x0=x,x1=x,floor_id=floor_id}
+    local fid=get_floor(gx,gy)
+    if cur_id<0 then
+     cur_id=fid
+     cur_x0=x
+    elseif fid~=cur_id then
+     if rcount<RUN_CAP then
+      runs_x0:set(rcount, cur_x0)
+      runs_x1:set(rcount, x-1)
+      runs_id:set(rcount, cur_id)
+      rcount+=1
+     end
+     cur_id=fid
+     cur_x0=x
     end
    end
-   
-   -- close final run
-   if current_run then
-    current_run.x1=screen_width-1
-    add(runs,current_run)
+   if rcount<RUN_CAP then
+    runs_x0:set(rcount, cur_x0)
+    runs_x1:set(rcount, screen_width-1)
+    runs_id:set(rcount, cur_id)
+    rcount+=1
    end
-   
-   -- merge short runs (width < 4 pixels) into adjacent runs to reduce draw calls
-   local merged_runs={}
-   for i=1,#runs do
-    local run=runs[i]
-    local width=run.x1-run.x0+1
-    if width<4 and #merged_runs>0 then
-     -- merge into previous run
-     merged_runs[#merged_runs].x1=run.x1
+   -- merge short runs into previous using preallocated buffers
+   local mcount=0
+   for i=0,rcount-1 do
+    local x0i=runs_x0:get(i)
+    local x1i=runs_x1:get(i)
+    local fidi=runs_id:get(i)
+    local width=x1i-x0i+1
+    if width<4 and mcount>0 then
+     local prev_x1=merged_x1:get(mcount-1)
+     if x1i>prev_x1 then merged_x1:set(mcount-1, x1i) end
     else
-     add(merged_runs,run)
-    end
-   end
-   
-   -- draw each run with appropriate texture
-   for run in all(merged_runs) do
-    local run_src=src
-    local run_fallback=false
-    
-    -- select texture from planetyps if floor_id is valid
-    if run.floor_id>0 and run.floor_id<=#planetyps then
-     local floor_type=planetyps[run.floor_id]
-     run_src,run_fallback=get_texture_source(floor_type.tex,"floor")
-     if run_fallback then
-      run_src=get_error_texture("floor")
+     if mcount<RUN_CAP then
+      merged_x0:set(mcount, x0i)
+      merged_x1:set(mcount, x1i)
+      merged_id:set(mcount, fidi)
+      mcount+=1
      end
     end
-    
-    -- compute UVs for this run segment
-    local u0=(mx+run.x0*mdx)%1*size
-    local v0=(my+run.x0*mdy)%1*size
+   end
+   -- draw all merged runs with batching
+   batch_reset()
+   for i=0,mcount-1 do
+    local rx0=merged_x0:get(i)
+    local rx1=merged_x1:get(i)
+    local fid=merged_id:get(i)
+    local run_tex=tex
+    if fid>0 and fid<=#planetyps then
+     run_tex=planetyps[fid].tex
+    end
+    local idx=resolve_sprite_index(run_tex,"floor")
+    local u0=(mx+rx0*mdx)%1*size
+    local v0=(my+rx0*mdy)%1*size
     u0=max(0,min(31,u0))
     v0=max(0,min(31,v0))
-    local u1=u0+(run.x1-run.x0)*mdx*size
-    local v1=v0+(run.x1-run.x0)*mdy*size
-    
-    -- draw run scanline
-    tline3d(run_src,run.x0,screen_center_y+y,run.x1,screen_center_y+y,u0,v0,u1,v1,1,1)
-    
-    -- count draw calls for diagnostics (per run)
+    local u1=u0+(rx1-rx0)*mdx*size
+    local v1=v0+(rx1-rx0)*mdy*size
+    batch_push(idx, rx0, screen_center_y+y, rx1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
     if debug_mode then
      diag_floor_draw_calls+=1
     end
    end
+   batch_submit()
   else
    -- simplified rendering: draw full scanline with single texture
+   batch_reset()
+   local idx=resolve_sprite_index(tex,"floor")
    local u0=(mx)%1*size
    local v0=(my)%1*size
    u0=max(0,min(31,u0))
    v0=max(0,min(31,v0))
    local u1=u0+(screen_width-1)*mdx*size
    local v1=v0+(screen_width-1)*mdy*size
-   
-   -- draw full scanline
-   tline3d(src,0,screen_center_y+y,screen_width-1,screen_center_y+y,u0,v0,u1,v1,1,1)
+   batch_push(idx, 0, screen_center_y+y, screen_width-1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
+   batch_submit()
    
    -- count draw calls for diagnostics (single draw call per scanline)
    if debug_mode then

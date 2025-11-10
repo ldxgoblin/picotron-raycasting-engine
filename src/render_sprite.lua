@@ -284,15 +284,53 @@ function drawobj_single(ob, sa, ca)
   end
   
   -- draw sprite column-by-column with z-buffer (no diagonal batching)
+  -- batched columns to reduce Lua call overhead
+  -- local batch helpers (duplicated from render.lua)
+  local TLINE_COLS=12
+  if not _sprite_batch_inited then
+   _sprite_tline_buf_capacity=screen_width
+   _sprite_tline_args=userdata("f64", TLINE_COLS, _sprite_tline_buf_capacity)
+   _sprite_tline_count=0
+   _sprite_batch_inited=true
+  end
+  local function sbatch_reset()
+   _sprite_tline_count=0
+  end
+  local function sbatch_push(idx,x0b,y0b,x1b,y1b,u0b,v0b,u1b,v1b,w0b,w1b)
+   if _sprite_tline_count>=_sprite_tline_buf_capacity then
+    tline3d(_sprite_tline_args, 0, _sprite_tline_count, TLINE_COLS)
+    _sprite_tline_count=0
+   end
+   _sprite_tline_args:set(0, _sprite_tline_count, idx, x0b, y0b, x1b, y1b, u0b, v0b, u1b, v1b, w0b or 1, w1b or 1)
+   _sprite_tline_count+=1
+  end
+  local function sbatch_submit()
+   if _sprite_tline_count>0 then
+    tline3d(_sprite_tline_args, 0, _sprite_tline_count, TLINE_COLS)
+    _sprite_tline_count=0
+   end
+  end
+  local function resolve_sprite_index(idx, kind)
+   if idx and get_spr(idx) then
+    return idx
+   end
+   if ERROR_IDX then
+    if kind=="sprite" then return ERROR_IDX.sprite else return ERROR_IDX.default end
+   end
+   return 0
+  end
+  local spr_idx=resolve_sprite_index(sprite_index,"sprite")
+  sbatch_reset()
   for px=x0,x1 do
    if z<zbuf[px+1] then
     local u=u0+(px-x0)*sxd
-    tline3d(src,px,y0,px,y1,u,v0,u,v0+size,1,1)
+    sbatch_push(spr_idx, px, y0, px, y1, u, v0, u, v0+size, 1, 1)
     if debug_mode then
      diag_sprite_columns+=1
     end
    end
   end
+  sbatch_submit()
   
   -- if a custom palette was applied, restore fog mapping for subsequent draws
   if ob.pal then

@@ -33,6 +33,9 @@ The NONBOY ダンジョンクロウラ Engine aims to be a complete 3D game engi
 - **Depth-bucket sorting** - O(n) sprite sorting with 16 depth buckets
 - **Per-cell floor rendering** - Multi-texture floors with run detection and merging
 - **Comprehensive diagnostics** - Real-time performance monitoring and logging
+- **Batched rendering** - Batch tline3d calls for floors, walls, and sprites to minimize Lua call overhead
+- **Allocation-free floor runs** - Preallocated userdata buffers for per-cell floor segmentation (no per-frame tables)
+- **Optimized fog/z-buffer** - Display palette fog updates and single-pass z-buffer clear reduce per-frame cost
 
 **Target Performance**: 50-60 FPS on typical scenes (128 rays, stride=2, LOD enabled)
 
@@ -122,6 +125,20 @@ This decouples `ray_count` (128) from `screen_width` (480), allowing arbitrary r
 **Purpose**: Transform raycast data into 3D visuals with fog, LOD, and per-pixel depth.
 
 The renderer minimizes overdraw and state churn via hysteresis-driven fog, span-based wall writes to a per-pixel z-buffer, stride rendering for floors/ceilings, and solid-color impostors for distant geometry using cached average texture colors.
+
+#### Batched Draw Submission
+
+- Floors: Per-scanline tline3d calls are batched into a single submission using an f64 userdata buffer. Per-cell floor runs (when enabled) are also batched into one submit per scanline.
+- Walls: Per-column wall draws in the “expensive path” are pushed into one batched tline3d submit per ray span.
+- Sprites: Per-column sprite draws are batched into a single submit per sprite when visible columns are present.
+— What: Collapse many draw calls into a single batched call per scanline/span/object.  
+— Why: Dramatically reduces Lua call overhead while preserving visuals.
+
+#### Allocation-Free Floor Runs
+
+- Per-cell floor run segmentation uses preallocated userdata("i16") buffers for x0/x1/floor_id and merged runs to avoid per-frame table allocation and GC churn.
+— What: Run detection without Lua table churn.  
+— Why: Stabilizes frame time independent of scene density.
 
 #### Unified Fog Manager
 
@@ -773,9 +790,8 @@ doorgrid[x][y] = {open=0.5, opening=true, close_timer=90}
 ### User Interface
 
 - **HUD**: Position, angle, FPS, HP. Interaction prompt appears when an interactable is in range. Combat overlay displays during encounters.  
-- **Diagnostics Overlay (G)**: On-screen counters (DDA steps, early-outs, fog switches, wall columns, floor rows, sprite columns, FPS, frame).  
-- **Diagnostics Logging (F)**: Periodic `printh` summary every 60 frames (includes CPU%).  
-- **Debug Mode (Tab)**: Toggles extra on-screen values and unlocks debug-only controls.  
+- **Debug & Diagnostics Panel (Tab)**: Consolidated on-screen counters (DDA steps, early-outs, fog switches, wall columns, floor rows, floor draw calls, sprite columns, FPS, frame) in a high-contrast panel with margins.  
+- **Diagnostics Logging (Button 12)**: Periodic `printh` summary every 60 frames (includes CPU%).  
 - **Minimap**:  
   - Full 2D minimap: press X (debug mode) to toggle between `3d` and `2d` views.  
   - HUD minimap: auto-scrolling clipped viewport in 3D view (walls/floors/doors/objects/player).  
@@ -783,12 +799,11 @@ doorgrid[x][y] = {open=0.5, opening=true, close_timer=90}
 
 ### Diagnostic System
 
-**Toggle Keys**:
-- **G**: Toggle on-screen diagnostics display
-- **F**: Toggle periodic printh logging
-- **Tab**: Toggle debug mode (enables counters)
+**Toggle Keys / Buttons**:
+- **Tab**: Toggle consolidated debug & diagnostics panel
+- **Button 12**: Toggle periodic printh logging
 
-**On-Screen Display** (G):
+**On-Screen Display** (Consolidated Panel):
 ```
 === DIAGNOSTICS ===
 DDA steps/ray: 8.3
@@ -801,7 +816,7 @@ FPS: 58
 Frame: 3600
 ```
 
-**Periodic Logging** (F, every 60 frames):
+**Periodic Logging** (every 60 frames, when enabled):
 ```
 === FRAME 3600 DIAGNOSTICS ===
 Avg DDA steps/ray: 8.3
