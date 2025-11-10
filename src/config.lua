@@ -4,8 +4,9 @@
 -- screen constants
 screen_width=480
 screen_height=270
-screen_center_x=240
-screen_center_y=135
+screen_center_x=screen_width/2
+screen_center_y=screen_height/2
+-- default ray budget: tuned for 480px wide viewport; adaptive governor in main.lua can lower this
 ray_count=128
 -- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2
 -- ray_count is decoupled from screen_width and can be configured independently for performance tuning
@@ -25,13 +26,16 @@ fog_hysteresis=0.5 -- minimum z change required to update fog level (reduces pal
 screenbright=1.0 -- screen brightness multiplier (1.0=normal, <1.0=darker for atmosphere)
 
 -- lod configuration (ratios of fog_far)
-wall_lod_ratio=0.7 -- ratio of fog_far for wall LOD transition
-sprite_lod_ratio=0.8 -- ratio of fog_far for sprite LOD transition
+wall_lod_ratio=0.4 -- ratio of fog_far for wall LOD transition
+sprite_lod_ratio=0.5 -- ratio of fog_far for sprite LOD transition
 wall_lod_distance=fog_far*wall_lod_ratio -- computed: walls beyond this z use simplified rendering
+wall_tiny_screen_px=6 -- walls shorter than this many pixels use LOD solid fill
 
 -- rendering configuration
-row_stride=2 -- floor/ceiling rendering stride for performance (1=full quality, 2=half rows)
-per_cell_floors_enabled=true -- enable per-cell floor type detection (false=render entire scanline with single texture)
+row_stride=1 -- floor/ceiling stride; keep at 1 for correct perspective (governor can relax if needed)
+per_cell_floors_enabled=false -- enable per-cell floor type detection (false=render entire scanline with single texture)
+-- tline quality flag (0x400) is expensive; keep off unless visual artifacts demand it
+tline_high_quality_near=false
 
 -- raycast configuration
 far_plane=25.0 -- maximum raycast distance; must be >= fog_far + 2.0 to prevent geometry popping

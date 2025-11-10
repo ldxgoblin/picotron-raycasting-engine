@@ -1,98 +1,119 @@
 --[[pod_format="raw",created="2025-11-07 21:17:10",modified="2025-11-07 21:48:08",revision=1]]
 -- sprite rendering pipeline
 
--- render sprites with z-buffer occlusion (optimized culling)
+-- global sprite tline batch (12 cols: idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1)
+local SPR_TLINE_COLS=12
+local spr_tline_capacity=screen_width*2
+local spr_tline_args=userdata("f64", SPR_TLINE_COLS, spr_tline_capacity)
+local spr_tline_count=0
+local function sbatch_reset() spr_tline_count=0 end
+local function sbatch_push(idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1)
+ if spr_tline_count>=spr_tline_capacity then
+  tline3d(spr_tline_args, 0, spr_tline_count, SPR_TLINE_COLS)
+  spr_tline_count=0
+ end
+ spr_tline_args:set(0, spr_tline_count, idx, x0, y0, x1, y1, u0, v0, u1, v1, w0 or 1, w1 or 1)
+ spr_tline_count+=1
+end
+local function sbatch_submit()
+ if spr_tline_count>0 then
+  tline3d(spr_tline_args, 0, spr_tline_count, SPR_TLINE_COLS)
+  spr_tline_count=0
+ end
+end
+
+-- persistent depth buckets (0..15) reused each frame
+sprite_buckets=sprite_buckets or {}
+for i=0,7 do sprite_buckets[i]=sprite_buckets[i] or {} end
+local function clear_buckets()
+ for i=0,7 do
+  local b=sprite_buckets[i]
+  for j=#b,1,-1 do b[j]=nil end
+ end
+end
+
+-- render sprites with z-buffer occlusion (flat array iteration with distance culling)
 function render_sprites()
  -- use cached sin/cos from _draw() if available
  local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
  
- -- early exit if frustum bounds are degenerate
- if frustum_minx>frustum_maxx or frustum_miny>frustum_maxy then
-  return
- end
+ -- frustum bounds check removed (distance-based culling in use)
  
  -- initialize depth buckets for sprite sorting
- -- 16 total buckets: 0-7 for upright sprites, 8-15 for flat sprites (offset by 8)
- -- bucket size = far_plane / 8 (e.g., 25.0 / 8 = 3.125 units per bucket)
- local bucket_size = far_plane / 8
- local sprite_buckets = {}
- for i=0,15 do
-  sprite_buckets[i] = {}
- end
+-- 8 total buckets: 0-7 for all sprites (upright and flat treated uniformly)
+-- bucket size = far_plane / 8 (e.g., 25.0 / 8 = 3.125 units per bucket)
+-- iterate all objects with distance culling (no spatial grid)
+local bucket_size = far_plane / 8
+ clear_buckets()
  
- for gx=flr(frustum_minx/objgrid_size),flr(frustum_maxx/objgrid_size) do
-  for gy=flr(frustum_miny/objgrid_size),flr(frustum_maxy/objgrid_size) do
-   if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
-    for ob in all(objgrid[gx+1][gy+1]) do
-     if ob and ob.pos and ob.typ then
-      -- transform to view space
-      local rx=ob.pos[1]-player.x
-      local ry=ob.pos[2]-player.y
-      
-      -- rotate to view-aligned coordinates (camera space)
-      -- right = (-sin a, cos a), forward = (cos a, sin a)
-      local x_cam = -sa*rx + ca*ry
-      local z_cam =  ca*rx + sa*ry
-      ob.rel[1]=x_cam
-      ob.rel[2]=z_cam
-      
-      -- far-plane culling: skip sprites beyond far_plane
-      if ob.rel[2]>far_plane then
-       goto skip_sprite
-      end
-      
-      -- depth culling: skip sprites beyond max wall depth
-      if ob.rel[2]>=maxz then
-       goto skip_sprite
-      end
-      
-      -- cull behind camera and outside frustum
-      local t=ob.typ
-      local pass_frustum=false
-      if ob.rel[2]>0.1 then
-       if t.flat then
-        -- flat sprites: require minimum distance to prevent z-division issues
-        if ob.rel[2]>=t.w/2 then
-         pass_frustum=true
-        end
-       else
-        -- upright sprites: horizontal frustum culling
-        if abs(ob.rel[1])-(t.w/2)<ob.rel[2]*(screen_center_x/sdist) then
-         pass_frustum=true
-        end
-       end
-      end
-      
-      if pass_frustum then
-       -- compute bucket index based on depth
-       -- bucket 0 = 0.0-3.125, bucket 1 = 3.125-6.25, ..., bucket 7 = 21.875-25.0+
-       local bucket_idx = min(7, flr(ob.rel[2] / bucket_size))
-       
-       -- flat sprites offset by 8 to ensure they render after upright sprites at same depth
-       if ob.typ.flat then
-        bucket_idx = bucket_idx + 8
-       end
-       
-       -- add to bucket
-       add(sprite_buckets[bucket_idx], ob)
-      end
-      
-      ::skip_sprite::
+ -- iterate all objects with simple distance culling (no spatial grid)
+ for ob in all(objects) do
+  if ob and ob.pos and ob.typ then
+   -- transform to view space
+   local rx=ob.pos[1]-player.x
+   local ry=ob.pos[2]-player.y
+   
+   -- simple distance culling using axis-aligned bound
+   if abs(rx)>=far_plane or abs(ry)>=far_plane then
+    goto skip_sprite
+   end
+   
+   -- rotate to view-aligned coordinates (camera space)
+   -- right = (-sin a, cos a), forward = (cos a, sin a)
+   local x_cam = -sa*rx + ca*ry
+   local z_cam =  ca*rx + sa*ry
+   ob.rel[1]=x_cam
+   ob.rel[2]=z_cam
+   
+   -- far-plane culling: skip sprites beyond far_plane
+   if ob.rel[2]>far_plane then
+    goto skip_sprite
+   end
+   
+   -- depth culling: skip sprites beyond max wall depth
+   if ob.rel[2]>=maxz then
+    goto skip_sprite
+   end
+   
+   -- cull behind camera and outside frustum
+   local t=ob.typ
+   local pass_frustum=false
+   if ob.rel[2]>0.1 then
+    if t.flat then
+     -- flat sprites: require minimum distance to prevent z-division issues
+     if ob.rel[2]>=t.w/2 then
+      pass_frustum=true
+     end
+    else
+     -- upright sprites: horizontal frustum culling
+     if abs(ob.rel[1])-(t.w/2)<ob.rel[2]*(screen_center_x/sdist) then
+      pass_frustum=true
      end
     end
    end
+   
+   if pass_frustum then
+    -- compute bucket index based on depth
+    -- bucket 0 = 0.0-6.25, bucket 1 = 6.25-12.5, ..., bucket 7 = 43.75-50.0+
+    local bucket_idx = min(7, flr(ob.rel[2] / bucket_size))
+    
+    -- add to bucket
+    add(sprite_buckets[bucket_idx], ob)
+   end
+   
+   ::skip_sprite::
   end
  end
  
  -- draw sprites back-to-front using bucket iteration
- -- bucket 15-0: farthest to nearest (bucket 15 = flat sprites at far distance)
+-- bucket 7-0: farthest to nearest (bucket 7 = all sprites at far distance)
  palt(0,false)
  palt(14,true)
  
- for bucket_idx=15,0,-1 do
+for bucket_idx=7,0,-1 do
   -- sort non-empty bucket by z descending (far to near) for correct sprite-sprite occlusion
   local bucket = sprite_buckets[bucket_idx]
-  if #bucket > 1 then
+ if #bucket > 4 then
    -- insertion sort by ob.rel[2] descending
    for i=2,#bucket do
     local ob = bucket[i]
@@ -178,7 +199,7 @@ function drawobj_single(ob, sa, ca)
    end
    
    -- apply fog uniformly
-   set_fog(z)
+  -- fog disabled
    
    -- project to screen space
    local f_lod=sdist/z
@@ -205,16 +226,21 @@ function drawobj_single(ob, sa, ca)
    y0_lod=max(0,ceil(y0_lod))
    y1_lod=min(screen_height-1,flr(y1_lod))
    
-   -- draw solid impostor columns with z-test
+  -- draw solid impostor columns with z-test (batched rectfill)
    if y1_lod>y0_lod and x1>=x0 then
-    for px=x0,x1 do
-     if z<zbuf[px+1] then
-      rectfill(px,y0_lod,px,y1_lod,avg_color)
-      if debug_mode then
-       diag_sprite_columns+=1
+   rbatch_reset()
+   for px=x0,x1 do
+    local zb=(zread and zread(px)) or (zbuf.get and zbuf:get(px)) or 999
+    if z<zb then
+      rbatch_push(px,y0_lod,px,y1_lod,avg_color)
+      if zwrite then
+       zwrite(px, z)
+      elseif zbuf.set then
+       zbuf:set(px, z)
       end
-     end
     end
+   end
+   rbatch_submit()
    end
    
    return
@@ -280,36 +306,10 @@ function drawobj_single(ob, sa, ca)
   if ob.pal then
    pal(ob.pal)
   else
-   set_fog(z)
+   -- fog disabled
   end
   
   -- draw sprite column-by-column with z-buffer (no diagonal batching)
-  -- batched columns to reduce Lua call overhead
-  -- local batch helpers (duplicated from render.lua)
-  local TLINE_COLS=12
-  if not _sprite_batch_inited then
-   _sprite_tline_buf_capacity=screen_width
-   _sprite_tline_args=userdata("f64", TLINE_COLS, _sprite_tline_buf_capacity)
-   _sprite_tline_count=0
-   _sprite_batch_inited=true
-  end
-  local function sbatch_reset()
-   _sprite_tline_count=0
-  end
-  local function sbatch_push(idx,x0b,y0b,x1b,y1b,u0b,v0b,u1b,v1b,w0b,w1b)
-   if _sprite_tline_count>=_sprite_tline_buf_capacity then
-    tline3d(_sprite_tline_args, 0, _sprite_tline_count, TLINE_COLS)
-    _sprite_tline_count=0
-   end
-   _sprite_tline_args:set(0, _sprite_tline_count, idx, x0b, y0b, x1b, y1b, u0b, v0b, u1b, v1b, w0b or 1, w1b or 1)
-   _sprite_tline_count+=1
-  end
-  local function sbatch_submit()
-   if _sprite_tline_count>0 then
-    tline3d(_sprite_tline_args, 0, _sprite_tline_count, TLINE_COLS)
-    _sprite_tline_count=0
-   end
-  end
   local function resolve_sprite_index(idx, kind)
    if idx and get_spr(idx) then
     return idx
@@ -322,11 +322,15 @@ function drawobj_single(ob, sa, ca)
   local spr_idx=resolve_sprite_index(sprite_index,"sprite")
   sbatch_reset()
   for px=x0,x1 do
-   if z<zbuf[px+1] then
+  local zb=(zread and zread(px)) or (zbuf.get and zbuf:get(px)) or 999
+   if z<zb then
     local u=u0+(px-x0)*sxd
     sbatch_push(spr_idx, px, y0, px, y1, u, v0, u, v0+size, 1, 1)
-    if debug_mode then
-     diag_sprite_columns+=1
+    -- diagnostics removed for production
+    if zwrite then
+     zwrite(px, z)
+    elseif zbuf.set then
+     zbuf:set(px, z)
     end
    end
   end
@@ -334,8 +338,6 @@ function drawobj_single(ob, sa, ca)
   
   -- if a custom palette was applied, restore fog mapping for subsequent draws
   if ob.pal then
-   last_fog_level=-1
-   prev_pal={}
-   set_fog(z)
+   -- fog state removed
   end
 end

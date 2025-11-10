@@ -28,14 +28,15 @@ The NONBOY ダンジョンクロウラ Engine aims to be a complete 3D game engi
 - **Decoupled ray_count architecture** - Independent ray count from screen resolution for flexible performance tuning
 - **Unified fog system** - Single linear fog model with 16 levels and hysteresis optimization
 - **Advanced LOD** - Fog-driven level-of-detail for walls and sprites
-- **Per-pixel depth buffer** - Accurate sprite occlusion at all ray counts
+- **Per-column depth buffer** - Accurate sprite occlusion with one z per screen column
 - **Frustum-based culling** - Geometric sprite culling independent of wall hits
 - **Depth-bucket sorting** - O(n) sprite sorting with 16 depth buckets
 - **Per-cell floor rendering** - Multi-texture floors with run detection and merging
 - **Comprehensive diagnostics** - Real-time performance monitoring and logging
 - **Batched rendering** - Batch tline3d calls for floors, walls, and sprites to minimize Lua call overhead
 - **Allocation-free floor runs** - Preallocated userdata buffers for per-cell floor segmentation (no per-frame tables)
-- **Optimized fog/z-buffer** - Display palette fog updates and single-pass z-buffer clear reduce per-frame cost
+- **Optimized fog/z-buffer** - Display palette fog updates with hysteresis and a frame‑stamped z-buffer (no per-frame clear)
+- **Adaptive quality governor** - `stat(1)`-driven dynamic ray budget and floor stride for steadier FPS
 
 **Target Performance**: 50-60 FPS on typical scenes (128 rays, stride=2, LOD enabled)
 
@@ -52,10 +53,10 @@ flowchart TD
   U -->|Doors| D[Door Updates]
   U -->|AI| A[AI (rate-limited)]
   U --> R[Render Loop (_draw)]
-  R --> P[Precompute\n• Cache sin/cos • Compute spans • Clear zbuf]
+  R --> P[Precompute\n• Cache sin/cos • Compute spans • z-stamp (no clear)]
   R --> RC[Raycast Phase (raycast_scene)\n• Cast rays • Fill ray_z/rbuf • Frustum AABB]
   R --> F[Floor/Ceiling\n• Stride rows • Per-cell floor runs • Unified fog]
-  R --> W[Walls\n• Span-based • Per-pixel zbuf • LOD beyond 14.0 • U-interp]
+  R --> W[Walls\n• Span-based • Per-column zbuf • LOD beyond 14.0 • U-interp]
   R --> S[Sprites\n• Frustum+objgrid cull • 16 depth buckets • Z-test • LOD]
   R --> H[HUD & Diagnostics\n• Stats • Prompts • Minimap • Single pal() restore]
   classDef box fill:#111,stroke:#666,color:#ddd;
@@ -124,12 +125,12 @@ This decouples `ray_count` (128) from `screen_width` (480), allowing arbitrary r
 
 **Purpose**: Transform raycast data into 3D visuals with fog, LOD, and per-pixel depth.
 
-The renderer minimizes overdraw and state churn via hysteresis-driven fog, span-based wall writes to a per-pixel z-buffer, stride rendering for floors/ceilings, and solid-color impostors for distant geometry using cached average texture colors.
+The renderer minimizes overdraw and state churn via hysteresis-driven fog, span-based wall writes to a per-pixel z-buffer, stride rendering for floors/ceilings, and solid-color impostors for distant geometry using cached average texture colors. Batched `tline3d` accepts per-row flags (e.g., `0x400` for near-only high-quality), and a frame‑stamped z-buffer avoids per-frame clears.
 
 #### Batched Draw Submission
 
 - Floors: Per-scanline tline3d calls are batched into a single submission using an f64 userdata buffer. Per-cell floor runs (when enabled) are also batched into one submit per scanline.
-- Walls: Per-column wall draws in the “expensive path” are pushed into one batched tline3d submit per ray span.
+- Walls: Per-column wall draws in the “expensive path” are pushed into one batched tline3d submit per ray span; batch rows include a `flags` field.
 - Sprites: Per-column sprite draws are batched into a single submit per sprite when visible columns are present.
 — What: Collapse many draw calls into a single batched call per scanline/span/object.  
 — Why: Dramatically reduces Lua call overhead while preserving visuals.
@@ -178,11 +179,14 @@ for ray_idx=0, ray_count-1 do
   local z = ray_z[ray_idx]
   local x0 = ray_x0[ray_idx]
   local x1 = ray_x1[ray_idx]
-  
+
+  local du = (u1-u0)/(x1-x0+0.01)  -- precompute
+  local u = u0
+  local flags = (z <= near_threshold) and 0x400 or 0  -- selective HQ
   for x=x0, x1 do
-    local u_interp = u0 + (u1-u0) * (x-x0) / (x1-x0+0.01)
-    tline3d(src, x, y0, x, y1, u_interp, v0, u_interp, v1, 1, 1)
-    zbuf[x+1] = z  -- Per-pixel depth write
+    tline3d(src, x, y0, x, y1, u, v0, u, v1, 1, 1, flags)
+    zwrite(x+1, z)  -- frame-stamped z write
+    u += du
   end
 end
 ```
@@ -298,7 +302,7 @@ end
 ```
 
 **Intra-Bucket Sorting**:
-- Insertion sort within each bucket (small n)
+- Insertion sort within each bucket only when size > 6 (guard)
 - Handles sprite-sprite occlusion within same depth range
 — What: Painter’s order with local sort.  
 — How: Bucket by depth; insertion sort per bucket.  
@@ -596,9 +600,9 @@ gen_params = {
 
 ## Performance Characteristics
 
-### Typical Scene (128 rays, stride=2, LOD enabled)
+### Typical Scene (adaptive rays/stride, LOD enabled)
 
-**Target**: 50–60 FPS in typical scenes (128 rays, stride=2, fog-driven LOD).
+**Target**: 50–60 FPS in typical scenes with the adaptive governor (dynamic ray budget and floor stride) and fog‑driven LOD.
 
 Use the built-in diagnostics (G overlay, F logging) to tune:
 - DDA steps/ray and early-outs (raycasting cost)
@@ -627,6 +631,15 @@ Use the built-in diagnostics (G overlay, F logging) to tune:
 
 5. **Floor run sampling/merging**
    - Increase sampling interval (code) or raise merge threshold to reduce draw calls
+
+6. **Adaptive governor (code)**
+   - Shrink budgets when `stat(1) > 0.90`, grow when `< 0.70`
+   - `active_ray_count` bounds: 48 .. `ray_count`
+   - `row_stride_dynamic` bounds: 1 .. 8
+   - Tune thresholds/steps for your device
+
+7. **tline3d 0x400 near band (code)**
+   - Keep near band small; wider band = crisper near walls but noticeably slower
 
 ---
 
@@ -745,27 +758,19 @@ end
 
 ### Depth Buffer
 
-**Per-Pixel zbuf**:
+**Frame‑Stamped per‑column zbuf (no per‑frame clear)**:
 ```lua
-zbuf[1..480]  -- 1-based indexing (Lua convention)
-```
-
-**Wall Writes**:
-```lua
-for x=x0, x1 do
-  tline3d(src, x, y0, x, y1, u, v0, u, v1, 1, 1)
-  zbuf[x+1] = z  -- Write depth per pixel
+-- Read (+inf if not written this frame). One z per screen column (x).
+function zread(x)
+  return (zstamp[x]==frame_id) and zbuf[x] or 999
+end
+-- Write + stamp (column z)
+function zwrite(x, z)
+  zbuf[x] = z
+  zstamp[x] = frame_id
 end
 ```
-
-**Sprite Z-Test**:
-```lua
-for px=x0, x1 do
-  if z < zbuf[px+1] then  -- Per-pixel occlusion test
-    tline3d(src, px, y0, px, y1, u, v0, u, v1, 1, 1)
-  end
-end
-```
+Walls call `zwrite` per pixel after drawing the column; sprites test `z < zread(px+1)` before drawing a column and then `zwrite` on success.
 
 ### Spatial Grids
 

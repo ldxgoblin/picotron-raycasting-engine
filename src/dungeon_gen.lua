@@ -51,10 +51,17 @@ function rect_overlaps(rect)
 end
 
 -- helper: fill rectangle using set_wall
+-- Note: Uses Lua loops with userdata:set() calls; potential optimization:
+-- batch userdata operations or memset() if available per Picotron guidelines
 function fill_rect(rect,val)
- for x=max(0,rect[1]),min(127,rect[3]) do
-  for y=max(0,rect[2]),min(127,rect[4]) do
-			set_wall(x,y,val)
+ local x0=max(0,rect[1])
+ local x1=min(127,rect[3])
+ local y0=max(0,rect[2])
+ local y1=min(127,rect[4])
+ local fill_val=(val or 0)
+ for x=x0,x1 do
+  for y=y0,y1 do
+			map.walls:set(x,y,fill_val)
   end
  end
 end
@@ -73,7 +80,7 @@ function try_place_door_with_fallback(x,y,dtype)
   local ax,ay=attempt[1],attempt[2]
   if ax>=0 and ax<128 and ay>=0 and ay<128 then
 			if is_wall(get_wall(ax,ay)) and should_place_door then
-				set_wall(ax,ay,dtype)
+				map.walls:set(ax,ay,(dtype or 0))
     create_door(ax,ay,dtype)
     return true
    end
@@ -133,7 +140,7 @@ function place_boundary_door_with_retry(bx,by,dtype,max_attempts)
  for attempt=1,max_attempts do
   if bx>=0 and bx<128 and by>=0 and by<128 then
    if is_wall(get_wall(bx,by)) then
-    set_wall(bx,by,dtype)
+   map.walls:set(bx,by,(dtype or 0))
     create_door(bx,by,dtype)
     return true
    end
@@ -147,7 +154,7 @@ function place_boundary_door(bx,by,dtype)
  -- bx,by = boundary wall tile (between corridor and room)
  if bx>=0 and bx<128 and by>=0 and by<128 then
 		if is_wall(get_wall(bx,by)) then
-			set_wall(bx,by,dtype)
+			map.walls:set(bx,by,(dtype or 0))
    create_door(bx,by,dtype)
    return true
   end
@@ -161,7 +168,7 @@ function ensure_boundary_passage(bx,by)
   local tile=get_wall(bx,by)
   -- if wall is still blocking and not a door, clear it
   if tile>0 and not is_door(tile) and not is_exit(tile) then
-   set_wall(bx,by,0)
+   map.walls:set(bx,by,0)
    set_floor(bx,by,gen_floor_id)
    printh("fallback: cleared blocking wall at ("..bx..","..by..")")
    return true
@@ -197,11 +204,13 @@ function create_corridor(n1,n2)
   if not d2_ok then ensure_boundary_passage(bx2,y) end
   
   -- carve corridor between doors (exclusive)
-  for x=bx1+1,bx2-1 do
-   if x>=0 and x<128 and y>=0 and y<128 then
-				set_wall(x,y,0)
-				set_floor(x,y,gen_floor_id)
-   end
+  local x_start=max(0,bx1+1)
+  local x_end=min(127,bx2-1)
+  local cy=y
+  local cfloor_id=gen_floor_id
+  for x=x_start,x_end do
+				map.walls:set(x,cy,0)
+				set_floor(x,cy,cfloor_id)
   end
 
 		-- store boundary tiles
@@ -230,11 +239,13 @@ function create_corridor(n1,n2)
   if not d2_ok then ensure_boundary_passage(x,by2) end
   
   -- carve corridor between doors (exclusive)
-  for y=by1+1,by2-1 do
-   if x>=0 and x<128 and y>=0 and y<128 then
-				set_wall(x,y,0)
-				set_floor(x,y,gen_floor_id)
-   end
+  local y_start=max(0,by1+1)
+  local y_end=min(127,by2-1)
+  local cx=x
+  local cfloor_id=gen_floor_id
+  for y=y_start,y_end do
+				map.walls:set(cx,y,0)
+				set_floor(cx,y,cfloor_id)
   end
 
 		-- store boundary tiles
@@ -286,11 +297,13 @@ function create_corridor(n1,n2)
   end
   
 	-- carve horizontal segment
-  for x=bx1_horiz+1,bx2_horiz-1 do
-   if x>=0 and x<128 and n1.midy>=0 and n1.midy<128 then
-				set_wall(x,n1.midy,0)
-				set_floor(x,n1.midy,gen_floor_id)
-   end
+  local xh_start=max(0,bx1_horiz+1)
+  local xh_end=min(127,bx2_horiz-1)
+  local hy=n1.midy
+  local hfloor_id=gen_floor_id
+  for x=xh_start,xh_end do
+				map.walls:set(x,hy,0)
+				set_floor(x,hy,hfloor_id)
   end
   
   -- connect junction to n2 (vertical)
@@ -325,11 +338,13 @@ function create_corridor(n1,n2)
   end
   
 	-- carve vertical segment
-  for y=by1_vert+1,by2_vert-1 do
-   if jx>=0 and jx<128 and y>=0 and y<128 then
-				set_wall(jx,y,0)
-				set_floor(jx,y,gen_floor_id)
-   end
+  local yv_start=max(0,by1_vert+1)
+  local yv_end=min(127,by2_vert-1)
+  local vx=jx
+  local vfloor_id=gen_floor_id
+  for y=yv_start,yv_end do
+				map.walls:set(vx,y,0)
+				set_floor(vx,y,vfloor_id)
   end
   
   -- validation: ensure all boundary passages are clear
@@ -395,13 +410,13 @@ function apply_room_walls(rect,tex)
   if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(x,rect[2]-1) then
-			set_wall(x,rect[2]-1,tex)
+			map.walls:set(x,rect[2]-1,tex)
    end
   end
   if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(x,rect[4]+1) then
-			set_wall(x,rect[4]+1,tex)
+			map.walls:set(x,rect[4]+1,tex)
    end
   end
  end
@@ -409,13 +424,13 @@ function apply_room_walls(rect,tex)
   if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(rect[1]-1,y) then
-			set_wall(rect[1]-1,y,tex)
+			map.walls:set(rect[1]-1,y,tex)
    end
   end
   if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(rect[3]+1,y) then
-			set_wall(rect[3]+1,y,tex)
+			map.walls:set(rect[3]+1,y,tex)
    end
   end
  end
@@ -454,13 +469,13 @@ function enforce_border_ring()
   -- top edge
   local top_tile=get_wall(x,0)
   if not is_door(top_tile) and not is_exit(top_tile) then
-   set_wall(x,0,wall_fill_tile)
+   map.walls:set(x,0,wall_fill_tile)
   end
   
   -- bottom edge
   local bottom_tile=get_wall(x,map_size-1)
   if not is_door(bottom_tile) and not is_exit(bottom_tile) then
-   set_wall(x,map_size-1,wall_fill_tile)
+   map.walls:set(x,map_size-1,wall_fill_tile)
   end
  end
  
@@ -469,13 +484,13 @@ function enforce_border_ring()
   -- left edge
   local left_tile=get_wall(0,y)
   if not is_door(left_tile) and not is_exit(left_tile) then
-   set_wall(0,y,wall_fill_tile)
+   map.walls:set(0,y,wall_fill_tile)
   end
   
   -- right edge
   local right_tile=get_wall(map_size-1,y)
   if not is_door(right_tile) and not is_exit(right_tile) then
-   set_wall(map_size-1,y,wall_fill_tile)
+   map.walls:set(map_size-1,y,wall_fill_tile)
   end
  end
 end
@@ -551,7 +566,7 @@ function find_spawn_point(rect)
   local x=rect[1]+1+flr(rnd(rect[3]-rect[1]-1))
   local y=rect[2]+1+flr(rnd(rect[4]-rect[2]-1))
   
-  if x>=0 and x<128 and y>=0 and y<128 and wallgrid[x][y]==0 then
+  if x>=0 and x<128 and y>=0 and y<128 and get_wall(x,y)==0 then
    local valid=true
    for obj in all(gen_objects) do
     local ox=obj.pos and obj.pos[1] or obj.x
@@ -588,7 +603,7 @@ function erode_map(amount)
     end
    end
    if neighbors>=3 then
-				set_wall(x,y,0)
+				map.walls:set(x,y,0)
     -- ensure eroded clears become traversable floor with theme-specific type
     set_floor(x,y,gen_floor_id)
    end
@@ -620,7 +635,7 @@ function generate_exit(rect,exit_type)
   local pos=walls[flr(rnd(#walls))+1]
   -- write exit tile to map
   local exit_tile=exit_type==3 and exit_start or exit_end
-  set_wall(pos[1],pos[2],exit_tile)
+  map.walls:set(pos[1],pos[2],(exit_tile or 0))
   -- also add interactable exit object
   local ob={
    pos={pos[1]+0.5,pos[2]+0.5},
@@ -720,12 +735,12 @@ function generate_progression_loop(start_node)
 				local door=doorgrid[x] and doorgrid[x][y] or nil
 				if door then
 					-- convert existing door to locked
-					set_wall(x,y,door_locked)
+					map.walls:set(x,y,door_locked)
 					door.dtype=door_locked
 					door.keynum=key_counter
 				else
 					-- fallback: create a new locked door here
-					set_wall(x,y,door_locked)
+					map.walls:set(x,y,door_locked)
 					create_door(x,y,door_locked,key_counter)
 				end
 				add(locked_edges,edge)
@@ -1144,13 +1159,16 @@ function generate_dungeon()
  enforce_door_tiles()
  printh("Border ring enforced, doors preserved")
  
- -- populate objgrid from gen_objects
- for ob in all(gen_objects) do
-  addobject(ob)
- end
- 
- -- export to global objects list
+ -- export objects to global arrays (flat iteration, no spatial grid)
  objects=gen_objects
+ 
+ -- populate animated_objects list for frame updates
+ animated_objects={}
+ for ob in all(objects) do
+  if ob.autoanim then
+   add(animated_objects, ob)
+  end
+ end
  
  -- set player start
  player.x=first_node.midx+0.5

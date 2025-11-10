@@ -15,6 +15,12 @@ player_collision_radius=0.15
 function _init()
  window(screen_width,screen_height)
  
+ -- pin masks to defaults for single colour-table fast path
+ poke(0x5508,0x3f) poke(0x5509,0x3f) poke(0x550a,0x3f) poke(0x550b,0x00)
+ 
+ -- tile 0 drawing state: verified not required; leave 0x5f36 at default (no explicit poke)
+ -- sspr() usage verified: None in production code (only in sample files)
+ -- Per Picotron guidelines: blit() is faster; HUD/minimap use direct drawing
  -- configuration guard: prevent fog popping beyond far-plane
  assert(far_plane>=fog_far+1,"config error: far_plane must be >= fog_far + 1")
  
@@ -55,29 +61,20 @@ function _init()
  map.floors=userdata("i16",128,128)
  
  -- helper: get wall tile
- -- Purpose: Retrieve wall tile ID at grid position with fallback
+-- Purpose: Retrieve wall tile ID at grid position
  -- Parameters: x, y (grid coordinates 0-127)
  -- Returns: tile ID (0=empty, >0=wall/door/exit)
- -- Notes: Checks userdata first, falls back to wallgrid table for compatibility
  function get_wall(x,y)
-  if x>=0 and x<128 and y>=0 and y<128 then
-   local val=map.walls:get(x,y)
-   if val and val>0 then return val end
-   -- defensive fallback: check wallgrid if map.walls is nil or 0
-   if wallgrid and wallgrid[x] and wallgrid[x][y]>0 then
-    return wallgrid[x][y]
-   end
-   return 0
-  end
-  return 0
+ if x>=0 and x<128 and y>=0 and y<128 then
+  return map.walls:get(x,y) or 0
+ end
+ return 0
  end
  
  -- helper: set wall tile
  function set_wall(x,y,val)
   if x>=0 and x<128 and y>=0 and y<128 then
 		map.walls:set(x,y,val or 0)
-		-- keep Lua mirror in sync for systems still reading wallgrid (e.g., minimap)
-		if wallgrid and wallgrid[x] then wallgrid[x][y]=val or 0 end
   end
  end
  
@@ -126,18 +123,10 @@ function _init()
   end
  end
  
- -- compatibility layer: expose wallgrid as table for dungeon generator
- wallgrid={}
- -- dual storage design:
- -- doors array enables efficient iteration for updates/minimap;
- -- doorgrid provides O(1) spatial lookup for collision/raycast.
- -- Both structures must remain synchronized across floor regenerations.
  doorgrid={}
  for i=0,127 do
-  wallgrid[i]={}
   doorgrid[i]={}
   for j=0,127 do
-   wallgrid[i][j]=0
    doorgrid[i][j]=nil
   end
  end
@@ -152,38 +141,45 @@ function _init()
  doors={}
  objects={}
  animated_objects={}
- objgrid={}
- for gx=0,objgrid_array_size do
-  objgrid[gx+1]={}
-  for gy=0,objgrid_array_size do
-   objgrid[gx+1][gy+1]={}
-  end
- end
- zbuf={}
- for i=1,screen_width do
-  zbuf[i]=999
+ 
+-- z-buffer and frame-stamp as typed userdata for speed
+-- zbuf: per-column depth values (one z per screen x); zstamp: frame-stamp to avoid per-frame clears
+ zbuf=userdata("f64", screen_width)
+ zstamp=userdata("i32", screen_width)
+ for i=0,screen_width-1 do
+  -- initialize stamps to 0; z values are considered invalid until stamped
+  zstamp:set(i, 0)
  end
  
- -- per-ray depth storage (decoupled from per-pixel zbuf)
- ray_z={}
+ -- dynamic budgets
+ active_ray_count=ray_count
+ row_stride_dynamic=row_stride
  
- -- per-ray span boundaries and world-space directions
- ray_x0={}
- ray_x1={}
- ray_dx={}
- ray_dy={}
+ -- Convert to userdata for 24x performance gain (Picotron optimization guideline)
+ ray_z = userdata("f64", ray_count)
+ ray_x0 = userdata("i16", ray_count)
+ ray_x1 = userdata("i16", ray_count)
+ ray_dx = userdata("f64", ray_count)
+ ray_dy = userdata("f64", ray_count)
+ 
+ -- Precomputed pixel centers for camera-space ray offsets (eliminates per-frame computation)
+ ray_px_center = userdata("f64", ray_count)
+ 
+ -- Initialize with defaults
  for i=0,ray_count-1 do
-  ray_z[i]=999
-  ray_x0[i]=0
-  ray_x1[i]=0
-  ray_dx[i]=0
-  ray_dy[i]=0
+   ray_z:set(i, 999)
+   ray_x0:set(i, 0)
+   ray_x1:set(i, 0)
+   ray_dx:set(i, 0)
+   ray_dy:set(i, 0)
  end
  
- -- per-ray hit data (0-based indexing for per-ray writes)
- rbuf={}
+ -- rbuf: use separate userdata arrays for tile and tx (avoid nested structures)
+ rbuf_tile = userdata("i16", ray_count)
+ rbuf_tx = userdata("f64", ray_count)
  for i=0,ray_count-1 do
-  rbuf[i]={tile=0,tx=0}
+   rbuf_tile:set(i, 0)
+   rbuf_tx:set(i, 0)
  end
  
  -- fog state for hysteresis
@@ -203,14 +199,22 @@ function _init()
  
  -- debug mode for ray casting
  debug_mode=false
- show_diagnostics=false
- enable_diagnostics_logging=true
+show_diagnostics=false
+enable_diagnostics_logging=false  -- Permanently disabled for production performance
+-- Optional: re-enable a non-render CPU governor (samples CPU outside _draw())
+enable_nonrender_governor=false
+recent_cpu=0
+ 
+ -- performance validation mode: disables CPU governor to stabilize measurements
+ perf_validation=false
  
  -- diagnostic counters for performance tracking
  diag_dda_steps_total=0
  diag_dda_early_outs=0
  diag_fog_switches=0
- diag_wall_columns=0
+ diag_wall_tline_submits=0
+ diag_wall_samples=0
+ diag_wall_pixels=0
  diag_floor_rows=0
  diag_floor_draw_calls=0
  diag_sprite_columns=0
@@ -259,7 +263,22 @@ function _init()
   local idx = ERROR_IDX[name] or ERROR_IDX.default
   set_spr(idx, ud)
  end
-
+ 
+ -- Preload texture cache for commonly-used sprites (0-200)
+ -- Populate tex_cache directly using get_spr() to avoid warnings
+ printh("preloading texture cache...")
+ local preload_start = time()
+ for i=0,200 do
+  local src=get_spr and get_spr(i)
+  if src and cache_tex then
+   cache_tex(i, src, false)
+  end
+ end
+ local preload_time = (time() - preload_start) * 1000
+ printh("texture cache preloaded: "..preload_time.."ms")
+ -- Trigger GC after preloading (Picotron guideline: stat(0) during pauses only)
+ stat(0)
+ 
  -- logging helper: console + ring buffer for optional on-screen echo
  log_lines = {}
  function log(str)
@@ -310,6 +329,11 @@ end
 function _update()
  -- increment frame counter
  frame_ct+=1
+ 
+ -- optional: sample CPU outside render frame (every 30 frames) for non-render governor
+ if enable_nonrender_governor and (frame_ct%30==0) then
+  recent_cpu=stat(1) or 0
+ end
  
  -- combat gating: skip normal updates when in combat
  if in_combat then
@@ -396,6 +420,7 @@ function _update()
   end
   floor.typ=planetyps[(current_idx % #planetyps)+1]
   floor.x,floor.y=0,0
+  -- Test mode: clear cache when cycling floor types (can be disabled in production)
   if clear_texture_caches then clear_texture_caches() end
  end
  
@@ -410,6 +435,7 @@ function _update()
   end
   roof.typ=planetyps[(current_idx % #planetyps)+1]
   roof.x,roof.y=0,0
+  -- Test mode: clear cache when cycling roof types (can be disabled in production)
   if clear_texture_caches then clear_texture_caches() end
  end
  
@@ -431,36 +457,81 @@ function _draw()
  clip(0,0,screen_width,screen_height)
  cls(0)
  
- -- reset diagnostic counters at frame start
- diag_dda_steps_total=0
- diag_dda_early_outs=0
- diag_fog_switches=0
- diag_wall_columns=0
- diag_floor_rows=0
- diag_floor_draw_calls=0
- diag_sprite_columns=0
+ local frame_start=time()
+ 
  diag_frame_count+=1
+ 
+-- Ensure adaptive controls are initialized once
+if not active_ray_count then active_ray_count=ray_count end
+if not row_stride_dynamic then row_stride_dynamic=row_stride end
+
+local function adjust_ray_budget(cpu_sample)
+ local min_rays=max(48, flr(ray_count*0.25))
+ if cpu_sample>0.90 then
+  active_ray_count=max(min_rays, active_ray_count-16)
+ elseif cpu_sample<0.70 then
+  active_ray_count=min(ray_count, active_ray_count+8)
+ end
+end
+
+-- Lightweight CPU sampler in _draw() (every 60 frames) for adaptive quality
+if not perf_validation and (diag_frame_count % 60 == 0) then
+ local cpu = stat(1) or 0
+ if not enable_nonrender_governor then
+  adjust_ray_budget(cpu)
+ end
+end
+
+-- Optional non-render governor: uses CPU sampled in _update(), never calls stat(1) here
+if enable_nonrender_governor then
+ adjust_ray_budget(recent_cpu or 0)
+end
+ 
+ -- z-buffer helpers (use frame-stamp, defined once)
+ if not zread then
+  function zread(x)
+   -- x is 0-based; return 999 unless stamped this frame
+   local stamp=zstamp:get(x) or 0
+   if stamp==diag_frame_count then
+    local z=zbuf:get(x)
+    return z or 999
+   end
+   return 999
+  end
+  function zwrite(x,z)
+   zbuf:set(x,z)
+   zstamp:set(x,diag_frame_count)
+  end
+ end
  
  -- cache sin/cos for entire frame to avoid recomputation
  sa_cached=sin(player.a)
  ca_cached=cos(player.a)
  
  if view_mode=="3d" then
-  -- clear z buffer once per frame
-  for i=1,screen_width do
-   zbuf[i]=999
-  end
   raycast_scene()
-  render_floor_ceiling()
-  render_walls()
+  local t_raycast=time()
+  render_floor_ceiling()  -- Now includes wall rendering
+  local t_floor_walls=time()
   render_sprites()
+  local t_sprites=time()
+  
+  local ms_raycast=(t_raycast-frame_start)*1000
+  local ms_floor_walls=(t_floor_walls-t_raycast)*1000
+  local ms_sprites=(t_sprites-t_floor_walls)*1000
+  local frame_ms=(t_sprites-frame_start)*1000
   
   -- hud
   print("pos:"..flr(player.x)..","..flr(player.y),2,2,7)
   print("ang:"..(flr(player.a*100)/100),2,10,7)
   print("fps:"..stat(7),2,18,7)
   print("hp:"..player.hp,2,26,7)
+  local frame_ms_col=(frame_ms<32 and 11) or (frame_ms<40 and 10) or 8
+  print("frame_ms:"..(flr(frame_ms*10)/10).."ms",2,42,frame_ms_col)
   if debug_mode then
+   print("raycast:"..(flr(ms_raycast*10)/10).."ms",2,50,7)
+   print("floor+walls:"..(flr(ms_floor_walls*10)/10).."ms",2,58,7)
+   print("sprites:"..(flr(ms_sprites*10)/10).."ms",2,66,7)
    print("[x] toggle map",2,34,7)
   end
   
@@ -474,64 +545,17 @@ function _draw()
    print("trap sprung!",screen_center_x-30,screen_center_y,8)
   end
   
-  -- consolidated debug + diagnostics panel (Tab): sized to fit, top-left
-  if debug_mode then
-   local margin=8
-   local sa,ca=sin(player.a),cos(player.a)
-   local z,hx,hy,tile,txv=raycast(player.x,player.y,ca,sa,sa,ca)
-   local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
-   local lines={
-    "=== DEBUG ===",
-    "pos: "..flr(player.x)..","..flr(player.y),
-    "ang: "..(flr(player.a*100)/100),
-    "floor: "..floor.typ.tex.."  roof: "..roof.typ.tex,
-    "z="..(flr(z*100)/100).." tile="..tile.." tx="..(flr(txv*100)/100),
-    "=== DIAGNOSTICS ===",
-    "DDA steps/ray: "..avg_dda,
-    "Early-outs: "..diag_dda_early_outs,
-    "Fog switches: "..diag_fog_switches,
-    "Wall columns: "..diag_wall_columns,
-    "Floor rows: "..diag_floor_rows,
-    "Floor draw calls: "..diag_floor_draw_calls,
-    "Sprite columns: "..diag_sprite_columns,
-    "Logging: "..(enable_diagnostics_logging and "ON" or "OFF").." (Btn12)",
-    "FPS: "..stat(7).."  Frame: "..diag_frame_count
-   }
-   -- measure max width
-   local maxw=0
-   for i=1,#lines do
-    local w=print(lines[i], 0, -1000) or 0
-    if w>maxw then maxw=w end
-   end
-   local panel_w=max(200, maxw+12)
-   local panel_h=#lines*8+8
-   local panel_x=margin
-   local panel_y=margin
-   rectfill(panel_x,panel_y,panel_x+panel_w-1,panel_y+panel_h-1,0)
-   rect(panel_x,panel_y,panel_x+panel_w-1,panel_y+panel_h-1,7)
-   local txp=panel_x+6
-   local typ=panel_y+6
-   for i=1,#lines do
-    local col=(i==1 or lines[i]=="=== DIAGNOSTICS ===") and 11 or 7
-    print(lines[i], txp, typ, col)
-    typ+=8
-   end
-  end
+ --[[ DEBUG PANEL REMOVED FOR PRODUCTION PERFORMANCE
+ if debug_mode then
+  -- removed
+ end
+ ]]
   
-  -- periodic printh summary (every 60 frames) - independent of debug_mode, controlled by enable_diagnostics_logging
-  if enable_diagnostics_logging and diag_frame_count%60==0 then
-   local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
-   log("=== FRAME "..diag_frame_count.." DIAGNOSTICS ===")
-   log("Avg DDA steps/ray: "..avg_dda)
-   log("Early-outs: "..diag_dda_early_outs)
-   log("Fog switches: "..diag_fog_switches)
-   log("Wall columns: "..diag_wall_columns)
-   log("Floor rows: "..diag_floor_rows)
-   log("Floor draw calls: "..diag_floor_draw_calls)
-   log("Sprite columns: "..diag_sprite_columns)
-   log("FPS: "..stat(7))
-   log("CPU: "..stat(1).."%")
-  end
+ --[[ PERIODIC LOGGING REMOVED FOR PRODUCTION PERFORMANCE
+ if enable_diagnostics_logging and diag_frame_count%60==0 then
+  -- removed
+ end
+ ]]
   
   -- minimap HUD overlay
   draw_minimap_hud()
@@ -562,10 +586,13 @@ function draw_minimap()
  local scale=2
  local ox,oy=10,10
  
- -- draw wallgrid with floor data to distinguish corridors from void
+ -- batch all tile drawing to reduce draw call count
+ rbatch_reset()
+ 
+ -- draw walls from map.walls userdata with floor data to distinguish corridors from void
  for x=0,127 do
   for y=0,127 do
-   local wall=wallgrid[x][y]
+   local wall=get_wall(x,y)
    local floor_val=get_floor(x,y)
    local color
    if wall>0 then
@@ -578,9 +605,11 @@ function draw_minimap()
     -- uncarved void (wall=0, floor=0)
     color=1
    end
-   rectfill(ox+x*scale,oy+y*scale,ox+x*scale+scale-1,oy+y*scale+scale-1,color)
+   rbatch_push(ox+x*scale,oy+y*scale,ox+x*scale+scale-1,oy+y*scale+scale-1,color)
   end
  end
+ 
+ rbatch_submit()
  
  -- draw rooms
  for node in all(gen_nodes) do
@@ -588,11 +617,13 @@ function draw_minimap()
   rect(ox+r[1]*scale,oy+r[2]*scale,ox+r[3]*scale,oy+r[4]*scale,11)
  end
  
- -- draw doors
+ -- batch door drawing
+ rbatch_reset()
  for door in all(doors) do
   local c=door.dtype==door_locked and 8 or 12
-  rectfill(ox+door.x*scale,oy+door.y*scale,ox+door.x*scale+scale-1,oy+door.y*scale+scale-1,c)
+  rbatch_push(ox+door.x*scale,oy+door.y*scale,ox+door.x*scale+scale-1,oy+door.y*scale+scale-1,c)
  end
+ rbatch_submit()
  
  -- draw objects
  for ob in all(objects) do
@@ -655,7 +686,8 @@ function draw_minimap_hud()
  -- draw background
  rectfill(hud_x,hud_y,hud_x+hud_w-1,hud_y+hud_h-1,0)
  
- -- draw map tiles (only visible range)
+ -- batch map tiles (only visible range)
+ rbatch_reset()
  for x=x_min,x_max do
   for y=y_min,y_max do
    local sx=hud_x+(x*scale-cam_x)
@@ -663,7 +695,7 @@ function draw_minimap_hud()
    
    -- additional bounds check
    if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
-    local wall=wallgrid[x][y]
+    local wall=get_wall(x,y)
     local floor_val=get_floor(x,y)
     local color
     
@@ -675,12 +707,14 @@ function draw_minimap_hud()
      color=1
     end
     
-    rectfill(sx,sy,sx+scale-1,sy+scale-1,color)
+    rbatch_push(sx,sy,sx+scale-1,sy+scale-1,color)
    end
   end
  end
+ rbatch_submit()
  
- -- draw doors via spatial query over visible tiles
+ -- batch door drawing via spatial query over visible tiles
+ rbatch_reset()
  for x=x_min,x_max do
   for y=y_min,y_max do
    local door=doorgrid[x] and doorgrid[x][y] or nil
@@ -689,39 +723,30 @@ function draw_minimap_hud()
     local sy=hud_y+(y*scale-cam_y)
     if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
      local c=door.dtype==door_locked and 8 or 12
-     rectfill(sx,sy,sx+scale-1,sy+scale-1,c)
+     rbatch_push(sx,sy,sx+scale-1,sy+scale-1,c)
     end
    end
   end
  end
+ rbatch_submit()
  
- -- draw objects via spatial query over visible objgrid cells
- local gx_min=flr(x_min/objgrid_size)
- local gx_max=flr(x_max/objgrid_size)
- local gy_min=flr(y_min/objgrid_size)
- local gy_max=flr(y_max/objgrid_size)
- gx_min=max(0,gx_min)
- gx_max=min(objgrid_array_size,gx_max)
- gy_min=max(0,gy_min)
- gy_max=min(objgrid_array_size,gy_max)
- for gx=gx_min,gx_max do
-  for gy=gy_min,gy_max do
-   for ob in all(objgrid[gx+1][gy+1]) do
-    local sx=hud_x+(ob.pos[1]*scale-cam_x)
-    local sy=hud_y+(ob.pos[2]*scale-cam_y)
-    if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
-     local c=7
-     if ob.typ and ob.typ.kind=="hostile_npc" then c=8
-     elseif ob.typ and ob.typ.kind=="direct_pickup" then
-      if ob.typ.subtype=="heart" then c=14
-      elseif ob.typ.subtype=="key" then c=9
-      end
-     elseif ob.typ and ob.typ.kind=="interactable" then
-      if ob.typ.subtype=="exit" then c=12 end
-     elseif ob.typ and ob.typ.kind=="decorative" then c=13
+ -- draw objects via flat array iteration within viewport bounds
+ for ob in all(objects) do
+  if ob.pos then
+   local sx=hud_x+(ob.pos[1]*scale-cam_x)
+   local sy=hud_y+(ob.pos[2]*scale-cam_y)
+   if sx>=hud_x and sx<hud_x+hud_w and sy>=hud_y and sy<hud_y+hud_h then
+    local c=7
+    if ob.typ and ob.typ.kind=="hostile_npc" then c=8
+    elseif ob.typ and ob.typ.kind=="direct_pickup" then
+     if ob.typ.subtype=="heart" then c=14
+     elseif ob.typ.subtype=="key" then c=9
      end
-     circfill(sx,sy,1,c)
+    elseif ob.typ and ob.typ.kind=="interactable" then
+     if ob.typ.subtype=="exit" then c=12 end
+    elseif ob.typ and ob.typ.kind=="decorative" then c=13
     end
+    circfill(sx,sy,1,c)
    end
   end
  end
@@ -809,36 +834,23 @@ function iscol(px,py,radius,opendoors,isplayer)
   if col then break end
  end
  
- -- check solid objects around position using objgrid spatial query
- local gx_min=flr((px-radius)/objgrid_size)
- local gx_max=flr((px+radius)/objgrid_size)
- local gy_min=flr((py-radius)/objgrid_size)
- local gy_max=flr((py+radius)/objgrid_size)
- 
- gx_min=max(0,gx_min)
- gx_max=min(objgrid_array_size,gx_max)
- gy_min=max(0,gy_min)
- gy_max=min(objgrid_array_size,gy_max)
- 
- for gx=gx_min,gx_max do
-  for gy=gy_min,gy_max do
-   for ob in all(objgrid[gx+1][gy+1]) do
-    if ob.typ and ob.typ.solid then
-     local ox=ob.pos[1]-px
-     local oy=ob.pos[2]-py
-     if max(abs(ox),abs(oy))<ob.typ.w then
-      col=true
-      -- trigger interaction on solid contact if player
-      if isplayer then
-       check_interactions_at(px,py)
-      end
-      break
+ -- check solid objects around position via flat array with early distance cull
+ for ob in all(objects) do
+  if ob.typ and ob.typ.solid and ob.pos then
+   local ox=ob.pos[1]-px
+   local oy=ob.pos[2]-py
+   -- early axis-aligned cull
+   if abs(ox)<(radius+(ob.typ.w or 0)) and abs(oy)<(radius+(ob.typ.w or 0)) then
+    if max(abs(ox),abs(oy))<(ob.typ.w or 0) then
+     col=true
+     -- trigger interaction on solid contact if player
+     if isplayer then
+      check_interactions_at(px,py)
      end
+     break
     end
    end
-   if col then break end
   end
-  if col then break end
  end
  
  return col
@@ -932,54 +944,7 @@ function update_input()
  end
 end
 
--- add object to objgrid
--- Purpose: Add object to spatial partitioning grid
--- Parameters: ob (object with pos array)
--- Side effects: Adds to objgrid cell based on position, adds to animated_objects if autoanim=true
--- Notes: Used during dungeon generation and object spawning
-function addobject(ob)
- if not ob.pos then return end
- local gx=flr(ob.pos[1]/objgrid_size)
- local gy=flr(ob.pos[2]/objgrid_size)
- if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
-  add(objgrid[gx+1][gy+1],ob)
-  -- add to animated list if autoanim is true
-  if ob.autoanim then
-   add(animated_objects,ob)
-  end
- end
-end
-
--- remove object from objgrid
-function removeobject(ob)
- if not ob.pos then return end
- local gx=flr(ob.pos[1]/objgrid_size)
- local gy=flr(ob.pos[2]/objgrid_size)
- if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
-  deli(objgrid[gx+1][gy+1],ob)
-  -- also remove from animated list
-  if ob.autoanim then
-   deli(animated_objects,ob)
-  end
- end
-end
-
--- update object grid after position change
-function update_object_grid(ob,old_x,old_y)
- if not ob.pos then return end
- local old_gx=flr(old_x/objgrid_size)
- local old_gy=flr(old_y/objgrid_size)
- local new_gx=flr(ob.pos[1]/objgrid_size)
- local new_gy=flr(ob.pos[2]/objgrid_size)
- if old_gx~=new_gx or old_gy~=new_gy then
-  if old_gx>=0 and old_gx<=objgrid_array_size and old_gy>=0 and old_gy<=objgrid_array_size then
-   deli(objgrid[old_gx+1][old_gy+1],ob)
-  end
-  if new_gx>=0 and new_gx<=objgrid_array_size and new_gy>=0 and new_gy<=objgrid_array_size then
-   add(objgrid[new_gx+1][new_gy+1],ob)
-  end
- end
-end
+ 
 
 -- check interactions around player position
 -- Purpose: Scan nearby objects for proximity-based interactions
@@ -992,47 +957,38 @@ end
 
 -- check interactions at specific position (avoids recursion)
 function check_interactions_at(px,py)
- local gx_center=flr(px/objgrid_size)
- local gy_center=flr(py/objgrid_size)
- 
- -- scan 3x3 block around player
+ -- scan all objects with distance culling
  local closest_interact=nil
  local closest_dist=999
  
- for gx=gx_center-1,gx_center+1 do
-  for gy=gy_center-1,gy_center+1 do
-   if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
-    for ob in all(objgrid[gx+1][gy+1]) do
-     if ob.pos and ob.typ then
-      local dx=ob.pos[1]-px
-      local dy=ob.pos[2]-py
-      local dist=abs(dx)+abs(dy)
-      
-      -- direct pickup: auto-collect
-      if ob.typ.kind=="direct_pickup" and dist<interaction_range then
-       collect_item(ob)
-       removeobject(ob)
-       deli(objects,ob)
-      
-      -- hostile npc: trigger combat
-      elseif ob.typ.kind=="hostile_npc" and dist<combat_trigger_range then
-       in_combat=true
-       current_target=ob
-      
-      -- interactable: set flag for closest
-      elseif ob.typ.kind=="interactable" and dist<interaction_range then
-       -- trap: immediate effect
-       if ob.typ.subtype=="trap" then
-        player.hp=max(0,player.hp-10)
-        trap_msg_timer=60
-        removeobject(ob)
-        deli(objects,ob)
-       elseif dist<closest_dist then
-        closest_interact=ob
-        closest_dist=dist
-       end
-      end
-     end
+ for ob in all(objects) do
+  if ob.pos and ob.typ then
+   local dx=ob.pos[1]-px
+   local dy=ob.pos[2]-py
+   local dist=abs(dx)+abs(dy)
+   
+   -- direct pickup: auto-collect
+   if ob.typ.kind=="direct_pickup" and dist<interaction_range then
+    collect_item(ob)
+    del(objects,ob)
+    if ob.autoanim then del(animated_objects,ob) end
+   
+   -- hostile npc: trigger combat
+   elseif ob.typ.kind=="hostile_npc" and dist<combat_trigger_range then
+    in_combat=true
+    current_target=ob
+   
+   -- interactable: set flag for closest
+   elseif ob.typ.kind=="interactable" and dist<interaction_range then
+    -- trap: immediate effect
+    if ob.typ.subtype=="trap" then
+     player.hp=max(0,player.hp-10)
+     trap_msg_timer=60
+     del(objects,ob)
+     if ob.autoanim then del(animated_objects,ob) end
+    elseif dist<closest_dist then
+     closest_interact=ob
+     closest_dist=dist
     end
    end
   end
@@ -1079,8 +1035,8 @@ function handle_interact()
   -- open chest (placeholder)
   player.hp=min(100,player.hp+10)
   printh("opened chest")
-  removeobject(current_interact)
-  deli(objects,current_interact)
+  del(objects,current_interact)
+  if current_interact.autoanim then del(animated_objects,current_interact) end
   
  elseif subtype=="shrine" then
   -- activate shrine (placeholder)
@@ -1090,8 +1046,8 @@ function handle_interact()
  elseif subtype=="note" then
   -- read note (placeholder)
   printh("read note")
-  removeobject(current_interact)
-  deli(objects,current_interact)
+  del(objects,current_interact)
+  if current_interact.autoanim then del(animated_objects,current_interact) end
   
  elseif subtype=="exit" then
   -- trigger next floor
@@ -1111,11 +1067,6 @@ function generate_new_floor()
  gen_params.difficulty=min(gen_params.max_difficulty,gen_params.difficulty+1)
  
  -- clear existing objects
- for gx=1,objgrid_array_size+1 do
-  for gy=1,objgrid_array_size+1 do
-   objgrid[gx][gy]={}
-  end
- end
  objects={}
  animated_objects={}
  doors={}
@@ -1130,8 +1081,11 @@ function generate_new_floor()
  
  -- regenerate dungeon
  start_pos,gen_stats=generate_dungeon()
+-- Trigger GC after dungeon generation (Picotron guideline: avoid mid-gameplay stutter)
+stat(0)
  -- invalidate persistent render caches for new floor
- if clear_texture_caches then clear_texture_caches() end
+-- Production: clear cache on level load to prevent stale texture references
+if clear_texture_caches then clear_texture_caches() end
  
  printh("floor complete! difficulty: "..gen_params.difficulty)
  
@@ -1156,59 +1110,50 @@ end
 
 -- update npc ai (basic patrol and follow)
 function update_npc_ai()
- for gx=0,objgrid_array_size do
-  for gy=0,objgrid_array_size do
-   for ob in all(objgrid[gx+1][gy+1]) do
-    if ob.typ and ob.typ.kind=="hostile_npc" and ob.ai_type then
-     local old_x,old_y=ob.pos[1],ob.pos[2]
+ for ob in all(objects) do
+  if ob.typ and ob.typ.kind=="hostile_npc" and ob.ai_type then
+   local old_x,old_y=ob.pos[1],ob.pos[2]
+   
+   if ob.ai_type=="patrol" then
+    -- patrol: cycle through patrol_points
+    if ob.patrol_points and #ob.patrol_points>0 then
+     -- initialize patrol_index if nil or 0
+     if not ob.patrol_index or ob.patrol_index==0 then
+      ob.patrol_index=1
+     end
      
-     if ob.ai_type=="patrol" then
-      -- patrol: cycle through patrol_points
-      if ob.patrol_points and #ob.patrol_points>0 then
-       -- initialize patrol_index if nil or 0
-       if not ob.patrol_index or ob.patrol_index==0 then
-        ob.patrol_index=1
-       end
-       
-       local target=ob.patrol_points[ob.patrol_index]
-       if target then
-        local dx=target.x-ob.pos[1]
-        local dy=target.y-ob.pos[2]
-        local dist=sqrt(dx*dx+dy*dy)
-        
-        -- reached waypoint: advance to next
-        if dist<0.1 then
-         ob.patrol_index=(ob.patrol_index%#ob.patrol_points)+1
-        else
-         -- move toward current waypoint
-         if dist>0 then
-          local spd=ob.typ.patrol_speed or 0.03
-          local nx=ob.pos[1]+dx/dist*spd
-          local ny=ob.pos[2]+dy/dist*spd
-          trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
-         end
-        end
-       end
-      end
-      
-     elseif ob.ai_type=="follow" then
-      -- follow: move toward player if in range
-      local dx=player.x-ob.pos[1]
-      local dy=player.y-ob.pos[2]
+     local target=ob.patrol_points[ob.patrol_index]
+     if target then
+      local dx=target.x-ob.pos[1]
+      local dy=target.y-ob.pos[2]
       local dist=sqrt(dx*dx+dy*dy)
-      local follow_range=ob.typ.follow_range or 20
-      if dist<follow_range and dist>0.1 then
-       local spd=ob.typ.follow_speed or 0.05
-       local nx=ob.pos[1]+dx/dist*spd
-       local ny=ob.pos[2]+dy/dist*spd
-       trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+      
+      -- reached waypoint: advance to next
+      if dist<0.1 then
+       ob.patrol_index=(ob.patrol_index%#ob.patrol_points)+1
+      else
+       -- move toward current waypoint
+       if dist>0 then
+        local spd=ob.typ.patrol_speed or 0.03
+        local nx=ob.pos[1]+dx/dist*spd
+        local ny=ob.pos[2]+dy/dist*spd
+        trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
+       end
       end
      end
-     
-     -- update spatial grid after movement
-     if old_x~=ob.pos[1] or old_y~=ob.pos[2] then
-      update_object_grid(ob,old_x,old_y)
-     end
+    end
+    
+   elseif ob.ai_type=="follow" then
+    -- follow: move toward player if in range
+    local dx=player.x-ob.pos[1]
+    local dy=player.y-ob.pos[2]
+    local dist=sqrt(dx*dx+dy*dy)
+    local follow_range=ob.typ.follow_range or 20
+    if dist<follow_range and dist>0.1 then
+     local spd=ob.typ.follow_speed or 0.05
+     local nx=ob.pos[1]+dx/dist*spd
+     local ny=ob.pos[2]+dy/dist*spd
+     trymoveto_pos(ob.pos,nx,ny,ob.typ.w or 0.4,false,false)
     end
    end
   end

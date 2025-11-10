@@ -96,10 +96,10 @@ function raycast(x,y,dx,dy,fx,fy)
   
   -- far-plane check: early-out if both candidates exceed far_plane
   if min(hz, vz) > far_plane then
-   if debug_mode then
-    diag_dda_steps_total+=dda_steps
-    diag_dda_early_outs+=1
-   end
+   -- if debug_mode then
+   --  diag_dda_steps_total+=dda_steps
+   --  diag_dda_early_outs+=1
+   -- end
    return 999,hx,hy,0,0
   end
   
@@ -111,10 +111,10 @@ function raycast(x,y,dx,dy,fx,fy)
    
    -- irreversible OOB check for horizontal candidate
    if (gx<0 and hdx<0) or (gx>=map_size and hdx>0) or (gy<0 and hdy<0) or (gy>=map_size and hdy>0) then
-    if debug_mode then
-     diag_dda_steps_total+=dda_steps
-     diag_dda_early_outs+=1
-    end
+    -- if debug_mode then
+    --  diag_dda_steps_total+=dda_steps
+    --  diag_dda_early_outs+=1
+    -- end
     return 999,hx,hy,0,0
    end
    
@@ -133,9 +133,9 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
-     if debug_mode then
-      diag_dda_steps_total+=dda_steps
-     end
+     -- if debug_mode then
+     --  diag_dda_steps_total+=dda_steps
+     -- end
      local z=((hx-x)*fx+(hy-y)*fy)
      -- texture coordinate from y-fraction; flip when rayDirX > 0
      local frac=hy-flr(hy)
@@ -155,10 +155,10 @@ function raycast(x,y,dx,dy,fx,fy)
    
    -- irreversible OOB check for vertical candidate
    if (gx<0 and vdx<0) or (gx>=map_size and vdx>0) or (gy<0 and vdy<0) or (gy>=map_size and vdy>0) then
-    if debug_mode then
-     diag_dda_steps_total+=dda_steps
-     diag_dda_early_outs+=1
-    end
+    -- if debug_mode then
+    --  diag_dda_steps_total+=dda_steps
+    --  diag_dda_early_outs+=1
+    -- end
     return 999,vx,vy,0,0
    end
    
@@ -177,9 +177,9 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
-     if debug_mode then
-      diag_dda_steps_total+=dda_steps
-     end
+     -- if debug_mode then
+     --  diag_dda_steps_total+=dda_steps
+     -- end
      local z=((vx-x)*fx+(vy-y)*fy)
      -- texture coordinate from x-fraction; flip when rayDirY < 0
      local frac=vx-flr(vx)
@@ -195,14 +195,16 @@ function raycast(x,y,dx,dy,fx,fy)
  end
  
  -- fallback if iteration limit reached
- if debug_mode then
-  diag_dda_steps_total+=dda_steps
-  diag_dda_early_outs+=1
- end
+-- if debug_mode then
+--  diag_dda_steps_total+=dda_steps
+--  diag_dda_early_outs+=1
+-- end
  return 999,hx,hy,0,0
 end
 
 -- raycast entire scene
+-- Note: ray arrays (ray_z, ray_x0, ray_x1, ray_dx, ray_dy, rbuf_tile, rbuf_tx)
+-- use userdata for 24x performance gain per Picotron optimization guidelines
 function raycast_scene()
  -- compute projection distance from FOV (fov is half-angle in radians)
  -- sdist = screen_center_x / tan(half_fov) ensures proper perspective mapping
@@ -212,137 +214,46 @@ function raycast_scene()
  -- use cached cos/sin from _draw() if available
  local fwdx=(ca_cached or cos(player.a))
  local fwdy=(sa_cached or sin(player.a))
- minx,maxx=999,-999
- miny,maxy=999,-999
  maxz=0
  
- -- precompute per-ray screen spans (decouples ray_count from screen_width)
- for i=0,ray_count-1 do
-  ray_x0[i]=flr(i*screen_width/ray_count)
-  ray_x1[i]=max(ray_x0[i], flr((i+1)*screen_width/ray_count)-1)
- end
+  -- precompute per-ray screen spans (decouples ray_count from screen_width)
+  -- only when active_ray_count changes
+  local span_count = active_ray_count or ray_count
+  if _last_span_count ~= span_count then
+    for i=0,span_count-1 do
+      ray_x0:set(i, flr(i*screen_width/span_count))
+      ray_x1:set(i, max(ray_x0:get(i), flr((i+1)*screen_width/span_count)-1))
+      -- precompute pixel center for camera-space offset (eliminates per-frame computation)
+      local pixel_x=(ray_x0:get(i)+ray_x1:get(i))/2+0.5
+      ray_px_center:set(i, pixel_x)
+    end
+    _last_span_count = span_count
+  end
  
- for i=0,ray_count-1 do
-  -- compute pixel center for this ray's span
-  local pixel_x=(ray_x0[i]+ray_x1[i])/2+0.5
-  local dx=pixel_x-screen_center_x
+ for i=0,span_count-1 do
+  -- use precomputed pixel center for camera-space offset
+  local dx=ray_px_center:get(i)-screen_center_x
   local dy=sdist
   
   -- map camera-space to world-space and cache direction
-  ray_dx[i]=(-fwdy)*dx+fwdx*dy
-  ray_dy[i]=( fwdx)*dx+fwdy*dy
+  ray_dx:set(i, (-fwdy)*dx+fwdx*dy)
+  ray_dy:set(i, ( fwdx)*dx+fwdy*dy)
   
   -- cast ray using cached direction
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,ray_dx[i],ray_dy[i],fwdx,fwdy)
+  local z,hx,hy,tile,tx=raycast(player.x,player.y,ray_dx:get(i),ray_dy:get(i),fwdx,fwdy)
   
   -- store hit data in dedicated per-ray arrays
-  ray_z[i]=z
-  rbuf[i].tile=tile
-  rbuf[i].tx=tx
+  ray_z:set(i, z)
+  rbuf_tile:set(i, tile)
+  rbuf_tx:set(i, tx)
   
-  -- track bounds for object culling (only update on valid hits)
-  if z<999 then
-   minx=min(minx,hx)
-   maxx=max(maxx,hx)
-   miny=min(miny,hy)
-   maxy=max(maxy,hy)
-  end
   maxz=max(maxz,z)
  end
  
- -- validate and clamp culling bounds to map range
- if minx>maxx or miny>maxy then
-  -- degenerate bounds (no valid hits), set to player position
-  minx,maxx=player.x,player.x
-  miny,maxy=player.y,player.y
- else
-  -- clamp to map boundaries [0, map_size-1]
-  minx=max(0,minx)
-  maxx=min(map_size-1,maxx)
-  miny=max(0,miny)
-  maxy=min(map_size-1,maxy)
-  
-  -- add margin for sprite culling (expand by objgrid_size)
-  minx=max(0,minx-objgrid_size)
-  maxx=min(map_size-1,maxx+objgrid_size)
-  miny=max(0,miny-objgrid_size)
-  maxy=min(map_size-1,maxy+objgrid_size)
- end
- 
- -- compute frustum AABB for sprite culling (independent of wall hits)
- compute_frustum_aabb()
+ -- frustum AABB computation removed; sprite culling now uses distance checks
 end
 
--- compute camera-space frustum AABB for sprite culling (independent of wall hits)
--- returns world-space bounding box covering the view frustum out to far_plane
-function compute_frustum_aabb()
-  -- use cached camera basis
-  local fwdx = ca_cached or cos(player.a)
-  local fwdy = sa_cached or sin(player.a)
-  local rightx = -fwdy  -- right vector perpendicular to forward
-  local righty = fwdx
-  
-  -- compute horizontal extent at far_plane using FOV
-  -- half_width = far_plane * tan(fov) = far_plane * (screen_center_x / sdist)
-  local half_width = far_plane * (screen_center_x / sdist)
-  
-  -- compute four frustum corners in camera space:
-  -- near-left, near-right, far-left, far-right
-  -- (we use a small near distance to avoid player position issues)
-  local near_dist = 0.1
-  local near_half = near_dist * (screen_center_x / sdist)
-  
-  -- transform corners to world space and track min/max
-  local wx_min = 999
-  local wx_max = -999
-  local wy_min = 999
-  local wy_max = -999
-  
-  -- near-left corner
-  local cx = -near_half
-  local cz = near_dist
-  local wx = player.x + fwdx * cz + rightx * cx
-  local wy = player.y + fwdy * cz + righty * cx
-  wx_min = min(wx_min, wx)
-  wx_max = max(wx_max, wx)
-  wy_min = min(wy_min, wy)
-  wy_max = max(wy_max, wy)
-  
-  -- near-right corner
-  cx = near_half
-  wx = player.x + fwdx * cz + rightx * cx
-  wy = player.y + fwdy * cz + righty * cx
-  wx_min = min(wx_min, wx)
-  wx_max = max(wx_max, wx)
-  wy_min = min(wy_min, wy)
-  wy_max = max(wy_max, wy)
-  
-  -- far-left corner
-  cx = -half_width
-  cz = far_plane
-  wx = player.x + fwdx * cz + rightx * cx
-  wy = player.y + fwdy * cz + righty * cx
-  wx_min = min(wx_min, wx)
-  wx_max = max(wx_max, wx)
-  wy_min = min(wy_min, wy)
-  wy_max = max(wy_max, wy)
-  
-  -- far-right corner
-  cx = half_width
-  wx = player.x + fwdx * cz + rightx * cx
-  wy = player.y + fwdy * cz + righty * cx
-  wx_min = min(wx_min, wx)
-  wx_max = max(wx_max, wx)
-  wy_min = min(wy_min, wy)
-  wy_max = max(wy_max, wy)
-  
-  -- clamp to map boundaries and add small margin for sprite width
-  local margin = objgrid_size
-  frustum_minx = max(0, wx_min - margin)
-  frustum_maxx = min(map_size - 1, wx_max + margin)
-  frustum_miny = max(0, wy_min - margin)
-  frustum_maxy = min(map_size - 1, wy_max + margin)
-end
+-- compute_frustum_aabb removed (distance-based culling is used instead)
 
 -- hitscan for projectiles/line-of-sight
 function hitscan(x,y,dx,dy)
@@ -350,38 +261,20 @@ function hitscan(x,y,dx,dy)
  local sa,ca=normalise(dx,dy)
  local d,hx,hy,tile,tx=raycast(x,y,dx,dy,sa,ca)
  
- -- determine aabb
- local x0,y0=min(x,hx),min(y,hy)
- local x1,y1=max(x,hx),max(y,hy)
- 
  local closest_obj=nil
  local closest_dist=d
  
- -- iterate relevant objgrid cells
- for gx=flr(x0/objgrid_size),flr(x1/objgrid_size) do
-  for gy=flr(y0/objgrid_size),flr(y1/objgrid_size) do
-   if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
-    for ob in all(objgrid[gx+1][gy+1]) do
-     -- check if solid object
-     if ob.typ and ob.typ.solid then
-      -- compute normal and tangential distances
-      local ox=ob.pos[1]-x
-      local oy=ob.pos[2]-y
-      local dn=(ox)*ca-(oy)*sa
-      local dt=(ox)*sa+(oy)*ca
-      
-      -- check if within normal bounds
-      if abs(dn)<=ob.typ.w*0.5 then
-       -- check if not behind or beyond wall
-       if dt>0 and dt<d then
-        -- track closest object
-        if dt<closest_dist then
-         closest_dist=dt
-         closest_obj=ob
-        end
-       end
-      end
-     end
+ -- iterate all objects; check solid intersections before wall hit
+ for ob in all(objects) do
+  if ob and ob.pos and ob.typ and ob.typ.solid then
+   local ox=ob.pos[1]-x
+   local oy=ob.pos[2]-y
+   local dn=ox*ca-oy*sa
+   local dt=ox*sa+oy*ca
+   if abs(dn)<= (ob.typ.w or 0)*0.5 and dt>0 and dt<d then
+    if dt<closest_dist then
+     closest_dist=dt
+     closest_obj=ob
     end
    end
   end
