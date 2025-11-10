@@ -583,7 +583,7 @@ gen_params = {
 
 **Target**: 50–60 FPS in typical scenes (128 rays, stride=2, fog-driven LOD).
 
-Use the built-in diagnostics (F1 overlay, F2 logging) to tune:
+Use the built-in diagnostics (G overlay, F logging) to tune:
 - DDA steps/ray and early-outs (raycasting cost)
 - Wall columns vs LOD solid fills (wall cost)
 - Floor rows rendered (stride impact)
@@ -773,8 +773,8 @@ doorgrid[x][y] = {open=0.5, opening=true, close_timer=90}
 ### User Interface
 
 - **HUD**: Position, angle, FPS, HP. Interaction prompt appears when an interactable is in range. Combat overlay displays during encounters.  
-- **Diagnostics Overlay (F1)**: On-screen counters (DDA steps, early-outs, fog switches, wall columns, floor rows, sprite columns, FPS, frame).  
-- **Diagnostics Logging (F2)**: Periodic `printh` summary every 60 frames (includes CPU%).  
+- **Diagnostics Overlay (G)**: On-screen counters (DDA steps, early-outs, fog switches, wall columns, floor rows, sprite columns, FPS, frame).  
+- **Diagnostics Logging (F)**: Periodic `printh` summary every 60 frames (includes CPU%).  
 - **Debug Mode (Tab)**: Toggles extra on-screen values and unlocks debug-only controls.  
 - **Minimap**:  
   - Full 2D minimap: press X (debug mode) to toggle between `3d` and `2d` views.  
@@ -784,11 +784,11 @@ doorgrid[x][y] = {open=0.5, opening=true, close_timer=90}
 ### Diagnostic System
 
 **Toggle Keys**:
-- **F1**: Toggle on-screen diagnostics display
-- **F2**: Toggle periodic printh logging
+- **G**: Toggle on-screen diagnostics display
+- **F**: Toggle periodic printh logging
 - **Tab**: Toggle debug mode (enables counters)
 
-**On-Screen Display** (F1):
+**On-Screen Display** (G):
 ```
 === DIAGNOSTICS ===
 DDA steps/ray: 8.3
@@ -801,7 +801,7 @@ FPS: 58
 Frame: 3600
 ```
 
-**Periodic Logging** (F2, every 60 frames):
+**Periodic Logging** (F, every 60 frames):
 ```
 === FRAME 3600 DIAGNOSTICS ===
 Avg DDA steps/ray: 8.3
@@ -844,7 +844,7 @@ test_door_y = 15      -- Only affect door at (x, 15)
 ### Performance Profiling
 
 **Identify Bottlenecks**:
-1. Enable diagnostics (F1)
+1. Enable diagnostics (G)
 2. Monitor counters across different scenes:
    - Corridors: High wall columns, low sprite columns
    - Rooms: Low wall columns, high sprite columns

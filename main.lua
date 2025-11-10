@@ -340,13 +340,13 @@ function _update()
   debug_mode=not debug_mode
  end
  
- -- toggle diagnostics overlay with F1 key
- if keyp("f1") then
+ -- toggle diagnostics overlay with G key
+ if keyp("g") or btnp(13) then
   show_diagnostics=not show_diagnostics
  end
  
- -- toggle diagnostics logging with F2 key
- if keyp("f2") then
+ -- toggle diagnostics logging with F key
+ if keyp("f") or btnp(12) then
   enable_diagnostics_logging=not enable_diagnostics_logging
   printh("Diagnostics logging: "..tostring(enable_diagnostics_logging))
  end
@@ -1124,8 +1124,8 @@ end
 
 -- update combat (placeholder)
 function update_combat()
- -- temp exit: press escape or menu button
- if keyp("escape") or btnp(6) then
+ -- temp exit: press Q or Enter
+ if keyp("q") or btnp(6) then
   in_combat=false
   current_target=nil
   printh("exited combat")
