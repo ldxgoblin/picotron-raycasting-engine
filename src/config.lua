@@ -6,8 +6,9 @@ screen_width=480
 screen_height=270
 screen_center_x=240
 screen_center_y=135
-ray_count=240
--- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2, ray_count is 240 (half screen_width for performance, upscaled 2x in render_walls)
+ray_count=128
+-- CRITICAL: screen_center_x must equal screen_width/2, screen_center_y must equal screen_height/2
+-- ray_count is decoupled from screen_width and can be configured independently for performance tuning
 sdist=200 -- default; computed dynamically in raycast_scene() based on fov
 map_size=128
 objgrid_size=5
@@ -17,12 +18,23 @@ fov=0.5
 -- sprite configuration
 sprite_size=32
 
--- fog configuration (optional enhancements)
-fogdist=250 -- fog distance parameter for quadratic falloff (scaled from PICO-8's 100-150)
-screenbright=1.0 -- screen brightness multiplier (1.0=normal, <1.0=darker for atmosphere)
-use_quadratic_fog=false -- flag to enable/disable quadratic fog (default to simple linear fog)
+-- fog configuration (unified linear fog system)
+fog_near=5.0 -- near fog distance where fog begins
+fog_far=20.0 -- far fog distance where fog is maximum
 fog_hysteresis=0.5 -- minimum z change required to update fog level (reduces palette thrashing)
-wall_lod_distance=10 -- walls beyond this z distance use simplified rendering (rectfill instead of tline3d)
+screenbright=1.0 -- screen brightness multiplier (1.0=normal, <1.0=darker for atmosphere)
+
+-- lod configuration (ratios of fog_far)
+wall_lod_ratio=0.7 -- ratio of fog_far for wall LOD transition
+sprite_lod_ratio=0.8 -- ratio of fog_far for sprite LOD transition
+wall_lod_distance=fog_far*wall_lod_ratio -- computed: walls beyond this z use simplified rendering
+
+-- rendering configuration
+row_stride=2 -- floor/ceiling rendering stride for performance (1=full quality, 2=half rows)
+per_cell_floors_enabled=true -- enable per-cell floor type detection (false=render entire scanline with single texture)
+
+-- raycast configuration
+far_plane=25.0 -- maximum raycast distance; must be >= fog_far + 2.0 to prevent geometry popping
 
 -- ai and interaction constants
 ai_update_rate=2 -- frames between AI updates

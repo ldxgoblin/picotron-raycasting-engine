@@ -68,13 +68,56 @@ function raycast(x,y,dx,dy,fx,fy)
  vy+=vdy*vstep
  vz+=vdz*vstep
  
+ -- compute iteration limit from remaining grid crossings to map edges
+ -- compute remaining crossings to nearest boundary per axis based on current positions
+ local horizontal_crossings
+ if hdx>0 then
+  horizontal_crossings=map_size-flr(hx)
+ else
+  horizontal_crossings=flr(hx)+1
+ end
+ 
+ local vertical_crossings
+ if vdy>0 then
+  vertical_crossings=map_size-flr(vy)
+ else
+  vertical_crossings=flr(vy)+1
+ end
+ 
+ local iteration_limit=min(256,horizontal_crossings+vertical_crossings+10)
+ 
+ -- track DDA steps for diagnostics
+ local dda_steps=0
+ 
  -- ray marching
- for iter=1,256 do
+ for iter=1,iteration_limit do
+  -- increment step counter
+  dda_steps+=1
+  
+  -- far-plane check: early-out if both candidates exceed far_plane
+  if min(hz, vz) > far_plane then
+   if debug_mode then
+    diag_dda_steps_total+=dda_steps
+    diag_dda_early_outs+=1
+   end
+   return 999,hx,hy,0,0
+  end
+  
   if hz<vz then
    -- horizontal closer
    -- crossing a vertical gridline (x changes): choose the cell we are entering
    local gx=flr(hx)+(hdx<0 and -1 or 0)
    local gy=flr(hy)
+   
+   -- irreversible OOB check for horizontal candidate
+   if (gx<0 and hdx<0) or (gx>=map_size and hdx>0) or (gy<0 and hdy<0) or (gy>=map_size and hdy>0) then
+    if debug_mode then
+     diag_dda_steps_total+=dda_steps
+     diag_dda_early_outs+=1
+    end
+    return 999,hx,hy,0,0
+   end
+   
    if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
     local m=get_wall(gx,gy)
     if m>0 then
@@ -82,7 +125,7 @@ function raycast(x,y,dx,dy,fx,fy)
      if is_door(m) and doorgrid[gx][gy] then
      local dz=((hx+hdx/2-x)*fx+(hy+hdy/2-y)*fy)
       if dz<=vz then
-       local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
+       local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
        local dy_off=(hy+hdy/2)%1-open
        if dy_off>=0 then
         return dz,hx,hy,m,dy_off
@@ -90,6 +133,9 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
+     if debug_mode then
+      diag_dda_steps_total+=dda_steps
+     end
      local z=((hx-x)*fx+(hy-y)*fy)
      -- texture coordinate from y-fraction; flip when rayDirX > 0
      local frac=hy-flr(hy)
@@ -106,6 +152,16 @@ function raycast(x,y,dx,dy,fx,fy)
    -- crossing a horizontal gridline (y changes): choose the cell we are entering
    local gx=flr(vx)
    local gy=flr(vy)+(vdy<0 and -1 or 0)
+   
+   -- irreversible OOB check for vertical candidate
+   if (gx<0 and vdx<0) or (gx>=map_size and vdx>0) or (gy<0 and vdy<0) or (gy>=map_size and vdy>0) then
+    if debug_mode then
+     diag_dda_steps_total+=dda_steps
+     diag_dda_early_outs+=1
+    end
+    return 999,vx,vy,0,0
+   end
+   
    if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
     local m=get_wall(gx,gy)
     if m>0 then
@@ -113,7 +169,7 @@ function raycast(x,y,dx,dy,fx,fy)
      if is_door(m) and doorgrid[gx][gy] then
      local dz=((vx+vdx/2-x)*fx+(vy+vdy/2-y)*fy)
       if dz<=hz then
-       local open=test_door_mode and test_door_open or doorgrid[gx][gy].open
+       local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
        local dx_off=(vx+vdx/2)%1-open
        if dx_off>=0 then
         return dz,vx,vy,m,dx_off
@@ -121,6 +177,9 @@ function raycast(x,y,dx,dy,fx,fy)
       end
      else
       -- wall hit
+     if debug_mode then
+      diag_dda_steps_total+=dda_steps
+     end
      local z=((vx-x)*fx+(vy-y)*fy)
      -- texture coordinate from x-fraction; flip when rayDirY < 0
      local frac=vx-flr(vx)
@@ -136,6 +195,10 @@ function raycast(x,y,dx,dy,fx,fy)
  end
  
  -- fallback if iteration limit reached
+ if debug_mode then
+  diag_dda_steps_total+=dda_steps
+  diag_dda_early_outs+=1
+ end
  return 999,hx,hy,0,0
 end
 
@@ -153,30 +216,37 @@ function raycast_scene()
  miny,maxy=999,-999
  maxz=0
  
+ -- precompute per-ray screen spans (decouples ray_count from screen_width)
  for i=0,ray_count-1 do
-  -- map ray index to pixel center, then to screen-centered offset
-  -- scale automatically adapts if screen_width != ray_count*2
-  local pixel_x=(i+0.5)*(screen_width/ray_count)
+  ray_x0[i]=flr(i*screen_width/ray_count)
+  ray_x1[i]=max(ray_x0[i], flr((i+1)*screen_width/ray_count)-1)
+ end
+ 
+ for i=0,ray_count-1 do
+  -- compute pixel center for this ray's span
+  local pixel_x=(ray_x0[i]+ray_x1[i])/2+0.5
   local dx=pixel_x-screen_center_x
   local dy=sdist
   
-  -- map camera-space (dx along right, dy forward) to world:
-  -- right = (-fwdy, fwdx); forward = (fwdx, fwdy)
-  local rdx=(-fwdy)*dx+fwdx*dy
-  local rdy=( fwdx)*dx+fwdy*dy
+  -- map camera-space to world-space and cache direction
+  ray_dx[i]=(-fwdy)*dx+fwdx*dy
+  ray_dy[i]=( fwdx)*dx+fwdy*dy
   
-  -- pass forward components to DDA as (fx, fy) = (cos, sin)
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,rdx,rdy,fwdx,fwdy)
+  -- cast ray using cached direction
+  local z,hx,hy,tile,tx=raycast(player.x,player.y,ray_dx[i],ray_dy[i],fwdx,fwdy)
   
-  zbuf[i*2+1]=z
-  tbuf[i*2+1].tile=tile
-  tbuf[i*2+1].tx=tx
+  -- store hit data in dedicated per-ray arrays
+  ray_z[i]=z
+  rbuf[i].tile=tile
+  rbuf[i].tx=tx
   
-  -- track bounds for object culling
-  minx=min(minx,hx)
-  maxx=max(maxx,hx)
-  miny=min(miny,hy)
-  maxy=max(maxy,hy)
+  -- track bounds for object culling (only update on valid hits)
+  if z<999 then
+   minx=min(minx,hx)
+   maxx=max(maxx,hx)
+   miny=min(miny,hy)
+   maxy=max(maxy,hy)
+  end
   maxz=max(maxz,z)
  end
  
@@ -198,6 +268,80 @@ function raycast_scene()
   miny=max(0,miny-objgrid_size)
   maxy=min(map_size-1,maxy+objgrid_size)
  end
+ 
+ -- compute frustum AABB for sprite culling (independent of wall hits)
+ compute_frustum_aabb()
+end
+
+-- compute camera-space frustum AABB for sprite culling (independent of wall hits)
+-- returns world-space bounding box covering the view frustum out to far_plane
+function compute_frustum_aabb()
+  -- use cached camera basis
+  local fwdx = ca_cached or cos(player.a)
+  local fwdy = sa_cached or sin(player.a)
+  local rightx = -fwdy  -- right vector perpendicular to forward
+  local righty = fwdx
+  
+  -- compute horizontal extent at far_plane using FOV
+  -- half_width = far_plane * tan(fov) = far_plane * (screen_center_x / sdist)
+  local half_width = far_plane * (screen_center_x / sdist)
+  
+  -- compute four frustum corners in camera space:
+  -- near-left, near-right, far-left, far-right
+  -- (we use a small near distance to avoid player position issues)
+  local near_dist = 0.1
+  local near_half = near_dist * (screen_center_x / sdist)
+  
+  -- transform corners to world space and track min/max
+  local wx_min = 999
+  local wx_max = -999
+  local wy_min = 999
+  local wy_max = -999
+  
+  -- near-left corner
+  local cx = -near_half
+  local cz = near_dist
+  local wx = player.x + fwdx * cz + rightx * cx
+  local wy = player.y + fwdy * cz + righty * cx
+  wx_min = min(wx_min, wx)
+  wx_max = max(wx_max, wx)
+  wy_min = min(wy_min, wy)
+  wy_max = max(wy_max, wy)
+  
+  -- near-right corner
+  cx = near_half
+  wx = player.x + fwdx * cz + rightx * cx
+  wy = player.y + fwdy * cz + righty * cx
+  wx_min = min(wx_min, wx)
+  wx_max = max(wx_max, wx)
+  wy_min = min(wy_min, wy)
+  wy_max = max(wy_max, wy)
+  
+  -- far-left corner
+  cx = -half_width
+  cz = far_plane
+  wx = player.x + fwdx * cz + rightx * cx
+  wy = player.y + fwdy * cz + righty * cx
+  wx_min = min(wx_min, wx)
+  wx_max = max(wx_max, wx)
+  wy_min = min(wy_min, wy)
+  wy_max = max(wy_max, wy)
+  
+  -- far-right corner
+  cx = half_width
+  wx = player.x + fwdx * cz + rightx * cx
+  wy = player.y + fwdy * cz + righty * cx
+  wx_min = min(wx_min, wx)
+  wx_max = max(wx_max, wx)
+  wy_min = min(wy_min, wy)
+  wy_max = max(wy_max, wy)
+  
+  -- clamp to map boundaries and add small margin for sprite width
+  local margin = objgrid_size
+  frustum_minx = max(0, wx_min - margin)
+  frustum_maxx = min(map_size - 1, wx_max + margin)
+  frustum_miny = max(0, wy_min - margin)
+  frustum_maxy = min(map_size - 1, wy_max + margin)
 end
 
 -- hitscan for projectiles/line-of-sight

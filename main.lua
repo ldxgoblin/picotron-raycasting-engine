@@ -15,6 +15,9 @@ player_collision_radius=0.15
 function _init()
  window(screen_width,screen_height)
  
+ -- configuration guard: prevent fog popping beyond far-plane
+ assert(far_plane>=fog_far+1,"config error: far_plane must be >= fog_far + 1")
+ 
  -- defensive defaults if config include failed to set them for any reason
  if not objgrid_size then objgrid_size=5 end
  if not objgrid_array_size then objgrid_array_size=26 end
@@ -157,10 +160,30 @@ function _init()
   end
  end
  zbuf={}
- tbuf={}
  for i=1,screen_width do
   zbuf[i]=999
-  tbuf[i]={tile=0,tx=0}
+ end
+ 
+ -- per-ray depth storage (decoupled from per-pixel zbuf)
+ ray_z={}
+ 
+ -- per-ray span boundaries and world-space directions
+ ray_x0={}
+ ray_x1={}
+ ray_dx={}
+ ray_dy={}
+ for i=0,ray_count-1 do
+  ray_z[i]=999
+  ray_x0[i]=0
+  ray_x1[i]=0
+  ray_dx[i]=0
+  ray_dy[i]=0
+ end
+ 
+ -- per-ray hit data (0-based indexing for per-ray writes)
+ rbuf={}
+ for i=0,ray_count-1 do
+  rbuf[i]={tile=0,tx=0}
  end
  
  -- fog state for hysteresis
@@ -180,6 +203,18 @@ function _init()
  
  -- debug mode for ray casting
  debug_mode=false
+ show_diagnostics=false
+ enable_diagnostics_logging=true
+ 
+ -- diagnostic counters for performance tracking
+ diag_dda_steps_total=0
+ diag_dda_early_outs=0
+ diag_fog_switches=0
+ diag_wall_columns=0
+ diag_floor_rows=0
+ diag_floor_draw_calls=0
+ diag_sprite_columns=0
+ diag_frame_count=0
  
  -- test door mode
  test_door_mode=false
@@ -305,6 +340,17 @@ function _update()
   debug_mode=not debug_mode
  end
  
+ -- toggle diagnostics overlay with F1 key
+ if keyp("f1") then
+  show_diagnostics=not show_diagnostics
+ end
+ 
+ -- toggle diagnostics logging with F2 key
+ if keyp("f2") then
+  enable_diagnostics_logging=not enable_diagnostics_logging
+  printh("Diagnostics logging: "..tostring(enable_diagnostics_logging))
+ end
+ 
  -- decrement trap message timer
  if trap_msg_timer>0 then
   trap_msg_timer-=1
@@ -373,6 +419,16 @@ function _draw()
  clip(0,0,screen_width,screen_height)
  cls(0)
  
+ -- reset diagnostic counters at frame start
+ diag_dda_steps_total=0
+ diag_dda_early_outs=0
+ diag_fog_switches=0
+ diag_wall_columns=0
+ diag_floor_rows=0
+ diag_floor_draw_calls=0
+ diag_sprite_columns=0
+ diag_frame_count+=1
+ 
  -- cache sin/cos for entire frame to avoid recomputation
  sa_cached=sin(player.a)
  ca_cached=cos(player.a)
@@ -414,6 +470,47 @@ function _draw()
    print("roof: "..roof.typ.tex,2,82,7)
   end
   
+  -- diagnostics overlay (independent of debug_mode, toggled with F1)
+  if show_diagnostics then
+   local diag_x=screen_width-120
+   local diag_y=2
+   print("=== DIAGNOSTICS ===",diag_x,diag_y,11)
+   diag_y+=8
+   local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
+   print("DDA steps/ray: "..avg_dda,diag_x,diag_y,7)
+   diag_y+=8
+   print("Early-outs: "..diag_dda_early_outs,diag_x,diag_y,7)
+   diag_y+=8
+   print("Fog switches: "..diag_fog_switches,diag_x,diag_y,7)
+   diag_y+=8
+   print("Wall columns: "..diag_wall_columns,diag_x,diag_y,7)
+   diag_y+=8
+   print("Floor rows: "..diag_floor_rows,diag_x,diag_y,7)
+   diag_y+=8
+   print("Floor draw calls: "..diag_floor_draw_calls,diag_x,diag_y,7)
+   diag_y+=8
+   print("Sprite columns: "..diag_sprite_columns,diag_x,diag_y,7)
+   diag_y+=8
+   print("FPS: "..stat(7),diag_x,diag_y,7)
+   diag_y+=8
+   print("Frame: "..diag_frame_count,diag_x,diag_y,7)
+  end
+  
+  -- periodic printh summary (every 60 frames) - independent of debug_mode, controlled by enable_diagnostics_logging
+  if enable_diagnostics_logging and diag_frame_count%60==0 then
+   local avg_dda=ray_count>0 and flr(diag_dda_steps_total/ray_count*10)/10 or 0
+   printh("=== FRAME "..diag_frame_count.." DIAGNOSTICS ===")
+   printh("Avg DDA steps/ray: "..avg_dda)
+   printh("Early-outs: "..diag_dda_early_outs)
+   printh("Fog switches: "..diag_fog_switches)
+   printh("Wall columns: "..diag_wall_columns)
+   printh("Floor rows: "..diag_floor_rows)
+   printh("Floor draw calls: "..diag_floor_draw_calls)
+   printh("Sprite columns: "..diag_sprite_columns)
+   printh("FPS: "..stat(7))
+   printh("CPU: "..stat(1).."%")
+  end
+  
   -- minimap HUD overlay
   draw_minimap_hud()
  else
@@ -426,6 +523,12 @@ function _draw()
   print("entering combat...",screen_center_x-40,screen_center_y,8)
   print("[esc] exit (temp)",screen_center_x-40,screen_center_y+10,7)
  end
+ 
+ -- restore palette from fog remapping (single restore per frame)
+ pal()
+ -- reset fog state so first set_fog applies mapping next frame
+ last_fog_level=-1
+ prev_pal={}
 end
 
 -- draw 2d minimap for testing
@@ -1009,6 +1112,14 @@ function generate_new_floor()
  if clear_texture_caches then clear_texture_caches() end
  
  printh("floor complete! difficulty: "..gen_params.difficulty)
+ 
+ -- level load diagnostic summary
+ printh("=== LEVEL LOAD DIAGNOSTICS ===")
+ printh("Floor: "..(current_floor or "unknown"))
+ printh("Difficulty: "..gen_params.difficulty)
+ printh("Rooms: "..gen_stats.rooms)
+ printh("Objects: "..gen_stats.objects)
+ printh("Seed: "..gen_stats.seed)
 end
 
 -- update combat (placeholder)

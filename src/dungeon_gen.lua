@@ -428,6 +428,56 @@ function enforce_door_tiles()
    set_wall(door.x,door.y,door.dtype or door_normal)
   end
  end
+ 
+ -- also check doorgrid consistency
+ for x=0,map_size-1 do
+  if doorgrid[x] then
+   for y=0,map_size-1 do
+    if doorgrid[x][y] then
+     local tile=get_wall(x,y)
+     if not is_door(tile) then
+      -- restore door tile from doorgrid or use default
+      local correct_tile=doorgrid[x][y].tile or door_normal
+      set_wall(x,y,correct_tile)
+      printh("warning: restored door tile at ("..x..","..y..")")
+     end
+    end
+   end
+  end
+ end
+end
+
+-- border ring enforcement: set outermost ring to walls while preserving doors/exits
+function enforce_border_ring()
+ -- top and bottom edges (y=0 and y=map_size-1)
+ for x=0,map_size-1 do
+  -- top edge
+  local top_tile=get_wall(x,0)
+  if not is_door(top_tile) and not is_exit(top_tile) then
+   set_wall(x,0,wall_fill_tile)
+  end
+  
+  -- bottom edge
+  local bottom_tile=get_wall(x,map_size-1)
+  if not is_door(bottom_tile) and not is_exit(bottom_tile) then
+   set_wall(x,map_size-1,wall_fill_tile)
+  end
+ end
+ 
+ -- left and right edges (x=0 and x=map_size-1)
+ for y=0,map_size-1 do
+  -- left edge
+  local left_tile=get_wall(0,y)
+  if not is_door(left_tile) and not is_exit(left_tile) then
+   set_wall(0,y,wall_fill_tile)
+  end
+  
+  -- right edge
+  local right_tile=get_wall(map_size-1,y)
+  if not is_door(right_tile) and not is_exit(right_tile) then
+   set_wall(map_size-1,y,wall_fill_tile)
+  end
+ end
 end
 
 -- helper: random wall texture (never returns 0)
@@ -1087,6 +1137,12 @@ function generate_dungeon()
  generate_gameplay()
  -- gameplay may lock doors; re-assert tiles
  enforce_door_tiles()
+ 
+ -- enforce border ring while preserving doors/exits
+ enforce_border_ring()
+ -- re-assert door tiles after border enforcement
+ enforce_door_tiles()
+ printh("Border ring enforced, doors preserved")
  
  -- populate objgrid from gen_objects
  for ob in all(gen_objects) do

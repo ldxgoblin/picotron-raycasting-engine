@@ -71,25 +71,22 @@ function compute_fog_level(z)
  if z<=0 then
   return -1
  end
- if use_quadratic_fog then
-  -- quadratic falloff with brightness adjustment
-  local i=min(z,100)^2/fogdist
-  i=min(1-(1-i)*screenbright,0.9999)
-  return flr(i*#pals)
- else
-  -- simple linear distance fallback
-  return flr(min(z/8,15))
+ -- guard against degenerate config (prevent division by zero)
+ if fog_far<=fog_near+0.000001 then
+  return z>fog_far and 15 or 0
  end
+ -- unified linear fog: 0 at fog_near, 15 at fog_far
+ local t=(z-fog_near)/(fog_far-fog_near)
+ -- clamp to [0,1]
+ t=max(0,min(1,t))
+ -- 16 levels (0..15)
+ return flr(t*15)
 end
 
 -- apply distance-based fog (with hysteresis caching for performance)
 function set_fog(z)
  if z<=0 then
-  pal()
-  last_fog_level=-1
-  prev_pal={}
-  -- preserve last_fog_z for hysteresis across sections
-  return
+  return  -- invalid depth, skip fog application
  end
  
  local level=compute_fog_level(z)
@@ -102,6 +99,9 @@ function set_fog(z)
  
  -- only update palette if fog level changed (reduces palette ops from 320/frame to ~10-20)
  if level~=last_fog_level then
+  if debug_mode then
+   diag_fog_switches+=1
+  end
   local p=pals[level+1]
   for i=0,63 do
    -- incremental update: only apply if value changed
@@ -114,7 +114,7 @@ function set_fog(z)
  end
 end
 
--- render textured walls (with 2x upscaling and LOD)
+-- render textured walls (span-based with per-pixel zbuf and LOD)
 function render_walls()
  palt(0,false)
  
@@ -122,15 +122,18 @@ function render_walls()
  -- cache LOD average colors per tile to avoid per-frame src:get() sampling
  
  for ray_idx=0,ray_count-1 do
-  -- read from every other zbuf/tbuf entry (populated by raycast)
-  local z=zbuf[ray_idx*2+1]
-  local t=tbuf[ray_idx*2+1]
+  -- read hit data from dedicated per-ray arrays
+  local z=ray_z[ray_idx]
+  local t=rbuf[ray_idx]
   
-  -- define x positions for this ray pair BEFORE the z check (needed by both branches)
-  local x0=ray_idx*2
-  local x1=ray_idx*2+1
+  -- get screen span for this ray
+  local x0=ray_x0[ray_idx]
+  local x1=ray_x1[ray_idx]
   
-  if z<999 then
+  -- skip zero-width or degenerate spans
+  if x0>x1 then
+   -- degenerate span, skip
+  elseif z<999 then
    -- calculate wall height
    local h=sdist/z
    local y0=screen_center_y-h/2
@@ -170,13 +173,22 @@ function render_walls()
     -- apply fog
     set_fog(z)
     
-    -- draw solid color columns (much faster than tline3d)
+    -- draw solid color across span
     local draw_y0=ceil(y0)
     local draw_y1=min(flr(y1),screen_height-1)
-    rectfill(x0,draw_y0,x0,draw_y1,avg_color)
-    rectfill(x1,draw_y0,x1,draw_y1,avg_color)
+    rectfill(x0,draw_y0,x1,draw_y1,avg_color)
+    
+    -- count wall columns for diagnostics
+    if debug_mode then
+     diag_wall_columns+=(x1-x0+1)
+    end
+    
+    -- write zbuf for entire span
+    for x=x0,x1 do
+     zbuf[x+1]=z
+    end
    else
-    -- normal rendering with tline3d (draw vertical columns per ray)
+    -- normal rendering with tline3d
     -- fetch sprite for this specific wall/door tile
     local cached=tex_cache[tile]
     local src,is_fallback
@@ -189,20 +201,19 @@ function render_walls()
      tex_cache[tile]={src=src,is_fallback=is_fallback}
     end
     
-    -- compute pixel UV in 32x32 sprite for x0 column
+    -- compute base u coordinate
     local u0=flr(tx*32)
     u0=max(0,min(31,u0))
     
-    -- compute u for x1 column with a light interpolation to next ray
-    local u0_x1=u0
+    -- interpolate u with next ray if same tile
+    local u1=u0
     if ray_idx<ray_count-1 then
-     local t_next=tbuf[(ray_idx+1)*2+1]
+     local t_next=rbuf[ray_idx+1]
      if t_next.tile==tile then
       local tx_next=t_next.tx
-      local u0_next=flr(tx_next*32)
-      u0_next=max(0,min(31,u0_next))
-      u0_x1=flr(u0*0.5+u0_next*0.5)
-      u0_x1=max(0,min(31,u0_x1))
+      local u1_next=flr(tx_next*32)
+      u1_next=max(0,min(31,u1_next))
+      u1=u1_next
      end
     end
     
@@ -219,26 +230,33 @@ function render_walls()
      v1=v0+32
     end
     
-    -- apply fog
+    -- apply fog once per ray
     set_fog(z)
     
-    -- draw the two upscaled vertical columns
-    tline3d(src,x0,draw_y0,x0,draw_y1,u0,v0,u0,v1,1,1)
-    tline3d(src,x1,draw_y0,x1,draw_y1,u0_x1,v0,u0_x1,v1,1,1)
+    -- draw columns across the span with interpolated u
+    for x=x0,x1 do
+     local u_interp=u0+(u1-u0)*(x-x0)/(x1-x0+0.01)
+     u_interp=max(0,min(31,u_interp))
+     tline3d(src,x,draw_y0,x,draw_y1,u_interp,v0,u_interp,v1,1,1)
+     -- write zbuf per pixel
+     zbuf[x+1]=z
+    end
+    
+    -- count wall columns for diagnostics
+    if debug_mode then
+     diag_wall_columns+=(x1-x0+1)
+    end
    end
-   
-   -- populate zbuf for both columns (sprite occlusion needs pixel-accurate depth)
-   zbuf[x0+1]=z
-   zbuf[x1+1]=z
   else
-   -- nothing to draw for this ray
+   -- miss: still write zbuf for the span to maintain occlusion
+   for x=x0,x1 do
+    zbuf[x+1]=999
+   end
   end
  end
  
  -- restore transparency mask to defaults (color 0 transparent, others opaque)
  palt()
- -- restore palette from fog remapping
- pal()
 end
 
 -- render perspective floor/ceiling with individual 32x32 sprites
@@ -271,23 +289,33 @@ function render_floor_ceiling()
   floor_src=get_error_texture("floor")
  end
  draw_rows(floor_src,ceil(h/2),screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,fwdx,fwdy,floor_typ.tex)
- 
- pal()
 end
 
 -- draw horizontal scanlines with 32x32 sprite sampling (optimized fog calls)
 function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
  local size=sprite_size or 32
  
- -- set fog once for lit surfaces instead of per scanline
- if lit then
-  set_fog(0)
- end
+ -- normalize row_stride to prevent invalid config (guard against 0 or negative)
+ local stride=max(1, row_stride or 1)
  
  -- track last applied fog level for this section to reduce calls
  local last_scanline_level=-2
  
- for y=y0,y1 do
+ -- cache texture average color for duplication (avoid per-row src:get calls)
+ local cached_fill_color=nil
+ if stride > 1 and tex then
+  cached_fill_color=avg_color_cache[tex]
+  if not cached_fill_color then
+   -- compute once and cache
+   cached_fill_color=5  -- default fog color
+   if src and src.get then
+    cached_fill_color=src:get(16, 16) or 5
+   end
+   avg_color_cache[tex]=cached_fill_color
+  end
+ end
+ 
+ for y=y0,y1,stride do
   -- calculate ray gradient
   local g=abs(y)/sdist
   
@@ -307,29 +335,124 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex)
   mx-=screen_center_x*mdx
   my-=screen_center_x*mdy
   
-  -- apply fog only for non-lit surfaces (per scanline)
-  if not lit then
-   -- compute expected fog level and only update when it changes
-   local level=compute_fog_level(z)
-   if level~=last_scanline_level then
-    set_fog(z)
-    last_scanline_level=level
+  -- apply fog uniformly (per scanline)
+  -- compute expected fog level and only update when it changes
+  local level=compute_fog_level(z)
+  if level~=last_scanline_level then
+   set_fog(z)
+   last_scanline_level=level
+  end
+  
+  -- count scanline for diagnostics (once per y iteration, consistent across modes)
+  if debug_mode then
+   diag_floor_rows+=1
+  end
+  
+  if per_cell_floors_enabled then
+   -- per-cell floor type rendering: sample floor types along scanline and build runs
+   local runs={}
+   local sample_interval=4
+   local current_run=nil
+   
+   for x=0,screen_width-1,sample_interval do
+    -- compute world coordinates at this x
+    local wx=mx+x*mdx
+    local wy=my+x*mdy
+    local gx=flr(wx)
+    local gy=flr(wy)
+    
+    -- read floor type from map (0=use global default)
+    local floor_id=get_floor(gx,gy)
+    
+    -- start new run or extend current run
+    if not current_run then
+     current_run={x0=x,x1=x,floor_id=floor_id}
+    elseif current_run.floor_id==floor_id then
+     current_run.x1=x
+    else
+     -- close current run and start new one
+     current_run.x1=x-1
+     add(runs,current_run)
+     current_run={x0=x,x1=x,floor_id=floor_id}
+    end
+   end
+   
+   -- close final run
+   if current_run then
+    current_run.x1=screen_width-1
+    add(runs,current_run)
+   end
+   
+   -- merge short runs (width < 4 pixels) into adjacent runs to reduce draw calls
+   local merged_runs={}
+   for i=1,#runs do
+    local run=runs[i]
+    local width=run.x1-run.x0+1
+    if width<4 and #merged_runs>0 then
+     -- merge into previous run
+     merged_runs[#merged_runs].x1=run.x1
+    else
+     add(merged_runs,run)
+    end
+   end
+   
+   -- draw each run with appropriate texture
+   for run in all(merged_runs) do
+    local run_src=src
+    local run_fallback=false
+    
+    -- select texture from planetyps if floor_id is valid
+    if run.floor_id>0 and run.floor_id<=#planetyps then
+     local floor_type=planetyps[run.floor_id]
+     run_src,run_fallback=get_texture_source(floor_type.tex,"floor")
+     if run_fallback then
+      run_src=get_error_texture("floor")
+     end
+    end
+    
+    -- compute UVs for this run segment
+    local u0=(mx+run.x0*mdx)%1*size
+    local v0=(my+run.x0*mdy)%1*size
+    u0=max(0,min(31,u0))
+    v0=max(0,min(31,v0))
+    local u1=u0+(run.x1-run.x0)*mdx*size
+    local v1=v0+(run.x1-run.x0)*mdy*size
+    
+    -- draw run scanline
+    tline3d(run_src,run.x0,screen_center_y+y,run.x1,screen_center_y+y,u0,v0,u1,v1,1,1)
+    
+    -- count draw calls for diagnostics (per run)
+    if debug_mode then
+     diag_floor_draw_calls+=1
+    end
+   end
+  else
+   -- simplified rendering: draw full scanline with single texture
+   local u0=(mx)%1*size
+   local v0=(my)%1*size
+   u0=max(0,min(31,u0))
+   v0=max(0,min(31,v0))
+   local u1=u0+(screen_width-1)*mdx*size
+   local v1=v0+(screen_width-1)*mdy*size
+   
+   -- draw full scanline
+   tline3d(src,0,screen_center_y+y,screen_width-1,screen_center_y+y,u0,v0,u1,v1,1,1)
+   
+   -- count draw calls for diagnostics (single draw call per scanline)
+   if debug_mode then
+    diag_floor_draw_calls+=1
    end
   end
   
-  -- texture coordinates (pixel UVs in 32x32 sprite)
-  -- map fractional position (mx%1, my%1) to pixel offset (0-31) in 32x32 sprite
-  local u0=(mx%1)*size
-  local v0=(my%1)*size
-  -- clamp starting UVs to [0,31] to guard against floating-point edge cases
-  u0=max(0,min(31,u0))
-  v0=max(0,min(31,v0))
-  -- calculate end UVs based on texture delta across scanline (32px sprite width)
-  local u1=u0+screen_width*mdx*size
-  local v1=v0+screen_width*mdy*size
-  
-  -- draw scanline
-  tline3d(src,0,screen_center_y+y,screen_width-1,screen_center_y+y,u0,v0,u1,v1,1,1)
+  -- duplicate into skipped rows with solid fill for performance
+  if stride > 1 and cached_fill_color then
+   for dy=1,stride-1 do
+    local next_y = y + dy
+    if next_y <= y1 then
+     rectfill(0, screen_center_y+next_y, screen_width-1, screen_center_y+next_y, cached_fill_color)
+    end
+   end
+  end
  end
 end
 

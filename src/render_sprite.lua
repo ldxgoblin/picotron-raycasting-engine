@@ -5,18 +5,23 @@
 function render_sprites()
  -- use cached sin/cos from _draw() if available
  local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
- local vvolg=screen_center_x/sdist
  
- -- early exit if bounds are degenerate
- if minx>maxx or miny>maxy then
+ -- early exit if frustum bounds are degenerate
+ if frustum_minx>frustum_maxx or frustum_miny>frustum_maxy then
   return
  end
  
- -- transform and cull objects
- local sobj={}
+ -- initialize depth buckets for sprite sorting
+ -- 16 total buckets: 0-7 for upright sprites, 8-15 for flat sprites (offset by 8)
+ -- bucket size = far_plane / 8 (e.g., 25.0 / 8 = 3.125 units per bucket)
+ local bucket_size = far_plane / 8
+ local sprite_buckets = {}
+ for i=0,15 do
+  sprite_buckets[i] = {}
+ end
  
- for gx=flr(minx/objgrid_size),flr(maxx/objgrid_size) do
-  for gy=flr(miny/objgrid_size),flr(maxy/objgrid_size) do
+ for gx=flr(frustum_minx/objgrid_size),flr(frustum_maxx/objgrid_size) do
+  for gy=flr(frustum_miny/objgrid_size),flr(frustum_maxy/objgrid_size) do
    if gx>=0 and gx<=objgrid_array_size and gy>=0 and gy<=objgrid_array_size then
     for ob in all(objgrid[gx+1][gy+1]) do
      if ob and ob.pos and ob.typ then
@@ -30,6 +35,11 @@ function render_sprites()
       local z_cam =  ca*rx + sa*ry
       ob.rel[1]=x_cam
       ob.rel[2]=z_cam
+      
+      -- far-plane culling: skip sprites beyond far_plane
+      if ob.rel[2]>far_plane then
+       goto skip_sprite
+      end
       
       -- depth culling: skip sprites beyond max wall depth
       if ob.rel[2]>=maxz then
@@ -47,37 +57,24 @@ function render_sprites()
         end
        else
         -- upright sprites: horizontal frustum culling
-        if abs(ob.rel[1])-t.w<ob.rel[2]*(screen_center_x/sdist) then
+        if abs(ob.rel[1])-(t.w/2)<ob.rel[2]*(screen_center_x/sdist) then
          pass_frustum=true
         end
        end
       end
       
       if pass_frustum then
-       -- compute sort order (depth)
-       ob.sortorder=ob.rel[2]
+       -- compute bucket index based on depth
+       -- bucket 0 = 0.0-3.125, bucket 1 = 3.125-6.25, ..., bucket 7 = 21.875-25.0+
+       local bucket_idx = min(7, flr(ob.rel[2] / bucket_size))
        
-       -- flat sprites sort differently (on ground plane)
+       -- flat sprites offset by 8 to ensure they render after upright sprites at same depth
        if ob.typ.flat then
-        ob.sortorder+=1000
+        bucket_idx = bucket_idx + 8
        end
        
-       -- insertion sort into sobj (back-to-front)
-       local inserted=false
-       for i=1,#sobj do
-        if ob.sortorder>sobj[i].sortorder then
-         -- manual array insertion
-         for j=#sobj,i,-1 do
-          sobj[j+1]=sobj[j]
-         end
-         sobj[i]=ob
-         inserted=true
-         break
-        end
-       end
-       if not inserted then
-        add(sobj,ob)
-       end
+       -- add to bucket
+       add(sprite_buckets[bucket_idx], ob)
       end
       
       ::skip_sprite::
@@ -87,22 +84,42 @@ function render_sprites()
   end
  end
  
- -- draw sprites back-to-front
- drawobjs(sobj,sa,ca)
- 
- clip()
- pal()
-end
-
--- draw objects from sorted list with individual 32x32 sprites (color 0=opaque, color 14=transparent)
-function drawobjs(sobj,sa,ca)
+ -- draw sprites back-to-front using bucket iteration
+ -- bucket 15-0: farthest to nearest (bucket 15 = flat sprites at far distance)
  palt(0,false)
  palt(14,true)
  
- for ob in all(sobj) do
-  if not ob or not ob.typ or not ob.rel then
-   goto skip_obj
+ for bucket_idx=15,0,-1 do
+  -- sort non-empty bucket by z descending (far to near) for correct sprite-sprite occlusion
+  local bucket = sprite_buckets[bucket_idx]
+  if #bucket > 1 then
+   -- insertion sort by ob.rel[2] descending
+   for i=2,#bucket do
+    local ob = bucket[i]
+    local z = ob.rel[2]
+    local j = i - 1
+    while j >= 1 and bucket[j].rel[2] < z do
+     bucket[j+1] = bucket[j]
+     j = j - 1
+    end
+    bucket[j+1] = ob
+   end
   end
+  
+  for ob in all(bucket) do
+   drawobj_single(ob, sa, ca)
+  end
+ end
+ 
+ palt()
+ clip()
+end
+
+-- draw single sprite object with z-buffer occlusion (color 0=opaque, color 14=transparent)
+function drawobj_single(ob, sa, ca)
+ if not ob or not ob.typ or not ob.rel then
+  return
+ end
   
   local t=ob.typ
   local x=ob.rel[1]
@@ -149,6 +166,58 @@ function drawobjs(sobj,sa,ca)
    if frame_idx>0 and frame_idx<=#t.yoffs then
     y+=t.yoffs[frame_idx]
    end
+  end
+  
+  -- LOD: impostor rendering for distant sprites
+  local sprite_lod_distance=fog_far*sprite_lod_ratio
+  if z>sprite_lod_distance then
+   -- sample average color from sprite center (defaults to fog color 5)
+   local avg_color=5
+   if src and src.get then
+    avg_color=src:get(16,16) or 5
+   end
+   
+   -- apply fog uniformly
+   set_fog(z)
+   
+   -- project to screen space
+   local f_lod=sdist/z
+   local sx_lod=x*f_lod+screen_center_x
+   local w_lod=t.w*f_lod
+   
+   -- compute vertical span
+   local y0_lod,y1_lod
+   if t.flat then
+    local z0=z+t.w/2
+    local z1=z-t.w/2
+    y0_lod=y*sdist/z0+screen_center_y
+    y1_lod=y*sdist/z1+screen_center_y
+   else
+    local sy_lod=y*f_lod+screen_center_y
+    local h_lod=t.h*f_lod
+    y0_lod=sy_lod-h_lod/2
+    y1_lod=sy_lod+h_lod/2
+   end
+   
+   -- clamp to screen bounds
+   local x0=max(0,ceil(sx_lod-w_lod/2))
+   local x1=min(screen_width-1,flr(sx_lod+w_lod/2))
+   y0_lod=max(0,ceil(y0_lod))
+   y1_lod=min(screen_height-1,flr(y1_lod))
+   
+   -- draw solid impostor columns with z-test
+   if y1_lod>y0_lod and x1>=x0 then
+    for px=x0,x1 do
+     if z<zbuf[px+1] then
+      rectfill(px,y0_lod,px,y1_lod,avg_color)
+      if debug_mode then
+       diag_sprite_columns+=1
+      end
+     end
+    end
+   end
+   
+   return
   end
   
   -- calculate scale factor (perspective)
@@ -204,14 +273,14 @@ function drawobjs(sobj,sa,ca)
   
   -- guard against degenerate vertical or horizontal span
   if y1<=y0 or x1<x0 then
-   goto skip_obj
+   return
   end
   
   -- set fog and palette
   if ob.pal then
    pal(ob.pal)
   else
-   set_fog(z*(t.lit or 1))
+   set_fog(z)
   end
   
   -- draw sprite column-by-column with z-buffer (no diagonal batching)
@@ -219,12 +288,16 @@ function drawobjs(sobj,sa,ca)
    if z<zbuf[px+1] then
     local u=u0+(px-x0)*sxd
     tline3d(src,px,y0,px,y1,u,v0,u,v0+size,1,1)
+    if debug_mode then
+     diag_sprite_columns+=1
+    end
    end
   end
   
-  ::skip_obj::
- end
- 
- -- restore transparency mask to defaults
- palt()
+  -- if a custom palette was applied, restore fog mapping for subsequent draws
+  if ob.pal then
+   last_fog_level=-1
+   prev_pal={}
+   set_fog(z)
+  end
 end
