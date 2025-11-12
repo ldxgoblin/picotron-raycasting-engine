@@ -1,3 +1,13 @@
+ local function clamped_blit(src_row,dst_row)
+  if dst_row>y1 then return end
+  local dst_y=screen_center_y+dst_row
+  if dst_y<0 or dst_y>=screen_height then return end
+  local src_y=screen_center_y+src_row
+  if src_y<0 or src_y>=screen_height then return end
+  blit(get_draw_target(),get_draw_target(),0,src_y,0,dst_y,screen_width,1)
+  diag_floor_rows+=1
+  diag_floor_batches+=1
+ end
 --[[pod_format="raw",created="2025-11-07 21:17:11",modified="2025-11-07 21:48:08",revision=1]]
 -- rendering pipeline
 
@@ -189,20 +199,6 @@ local merged_x1=userdata("i16", RUN_CAP)
 local merged_id=userdata("i16", RUN_CAP)
 
 -- Precomputed wall y-ranges for merged rendering (avoid per-scanline recalculation)
-local wall_y0 = {}   -- Top y-coordinate for each ray's wall
-local wall_y1 = {}   -- Bottom y-coordinate for each ray's wall
-local wall_valid = {} -- Boolean: true if ray hit a wall (z<999)
--- Cached per-ray wall draw data to minimize inner-loop work
-local wall_tile = {}
-local wall_tx = {}
-local wall_u0 = {}
-local wall_u1 = {}
-local wall_spr_idx = {}
-local wall_tdy0 = {}
-local wall_tdy1 = {}
-local wall_tiny = {}
-local wall_z = {}
-
 -- render perspective floor/ceiling and walls (flat shading, fog removed)
 function render_floor_ceiling()
  palt(0,false)
@@ -210,53 +206,7 @@ function render_floor_ceiling()
  local fwdx=(ca_cached or cos(player.a))
  local fwdy=(sa_cached or sin(player.a))
  local tex_size=sprite_size or 32
- 
- -- Precompute wall y-ranges for all rays (used during scanline iteration)
  local _rc = active_ray_count or ray_count
- for ray_idx=0,_rc-1 do
-  local z=ray_z:get(ray_idx)
-  if z<999 then
-   -- Calculate wall height and y-range
-   local h=sdist/z
-   local y0 = screen_center_y-h/2
-   local y1 = screen_center_y+h/2
-   wall_y0[ray_idx]=y0
-   wall_y1[ray_idx]=y1
-   wall_z[ray_idx]=z
-   -- screen-space tiny wall threshold (use LOD when very short)
-   local tdy0=ceil(y0)
-   local tdy1=min(flr(y1),screen_height-1)
-   wall_tdy0[ray_idx]=tdy0
-   wall_tdy1[ray_idx]=tdy1
-   wall_tiny[ray_idx]=(tdy1 - tdy0) < (wall_tiny_screen_px or 4)
-   -- cache texture info
-   local tile=rbuf_tile:get(ray_idx)
-   local tx=rbuf_tx:get(ray_idx)
-   wall_tile[ray_idx]=tile
-   wall_tx[ray_idx]=tx
-  -- compute base u coordinate and possible interpolation with next ray
-  local u0=tx*tex_size
-  u0=max(0,min(tex_size-0.001,u0))
-   local u1=u0
-   if ray_idx<_rc-1 then
-    local tile_next=rbuf_tile:get(ray_idx+1)
-    if tile_next==tile then
-     local tx_next=rbuf_tx:get(ray_idx+1)
-    local u1_next=tx_next*tex_size
-    u1_next=max(0,min(tex_size-0.001,u1_next))
-     u1=u1_next
-    end
-   end
-   wall_u0[ray_idx]=u0
-   wall_u1[ray_idx]=u1
-   -- resolve sprite once
-   local spr_idx=resolve_sprite_index(tile, (is_door and is_door(tile)) and "door" or "wall")
-   wall_spr_idx[ray_idx]=spr_idx
-   wall_valid[ray_idx]=true
-  else
-   wall_valid[ray_idx]=false
-  end
- end
  
  -- Draw ceiling and floor first so walls overlay them
  batch_reset()
@@ -274,83 +224,165 @@ function render_floor_ceiling()
  -- Render walls per-ray in a single vertical pass (drawn after floors)
  rbatch_reset()
  batch_reset()
- local any_rect=false
- for ray_idx=0,_rc-1 do
-  if wall_valid[ray_idx] then
-   -- read cached values
-   local z=wall_z[ray_idx]
-   local x0=ray_x0:get(ray_idx)
-   local x1=ray_x1:get(ray_idx)
-   if x0<=x1 then
-    local tdy0=wall_tdy0[ray_idx]
-    local tdy1=wall_tdy1[ray_idx]
-    local tile=wall_tile[ray_idx]
-    -- LOD or tiny: solid fill via rect batch
-    if z>wall_lod_distance or wall_tiny[ray_idx] then
-     local avg_color=avg_color_cache[tile]
-     if not avg_color then
-      local cached=tex_cache[tile]
-      local src,is_fallback
-      if cached then
-       src,is_fallback=cached.src,cached.is_fallback
-      else
-       local obj_type=is_door and is_door(tile) and "door" or "wall"
-       src,is_fallback=get_texture_source(tile,obj_type)
-       cache_tex(tile, src, is_fallback)
-      end
-      avg_color=5
-      if src and src.get then
-       avg_color=src:get(16,16) or 5
-      end
-      cache_avg(tile, avg_color)
-     end
-     rbatch_push(x0, tdy0, x1, tdy1, avg_color)
-     any_rect=true
-     -- write zbuf for span
-     for x=x0,x1 do
-      if zwrite then zwrite(x,z) else zbuf:set(x,z) end
-     end
+ local span_start=nil
+ local span_tile=nil
+ local span_spr=nil
+ local span_avg=nil
+ local span_tx0=nil
+ local span_tx1=nil
+ local span_hitx0=nil
+ local span_hity0=nil
+ local span_hitx1=nil
+ local span_hity1=nil
+ local function flush_span(span_end)
+  if not span_start then return end
+  local x0=ray_x0:get(span_start)
+  local x1=ray_x1:get(span_end)
+  if x0>x1 then span_start=nil return end
+  local spr_idx=span_spr
+  local avg_color=span_avg
+  local hx0=span_hitx0
+  local hy0=span_hity0
+  local hx1=span_hitx1
+  local hy1=span_hity1
+  local tx0=span_tx0
+  local tx1=span_tx1
+  local span_width=x1-x0
+  local base_z=nil
+  local base_tdy0=nil
+  local base_tdy1=nil
+  local first_wall=false
+  if span_width<=0 then
+   span_width=0
+   local rel_x=hx0-player.x
+   local rel_y=hy0-player.y
+   base_z=rel_x*fwdx+rel_y*fwdy
+   if base_z<=0.0001 then base_z=0.0001 end
+   local h=sdist/base_z
+   local y0=screen_center_y-h/2
+   local y1=screen_center_y+h/2
+   base_tdy0=ceil(y0)
+   base_tdy1=min(flr(y1),screen_height-1)
+   if base_tdy0<=base_tdy1 then
+    local wall_height=base_tdy1-base_tdy0
+    if base_z>wall_lod_distance or wall_height<wall_tiny_screen_px then
+     rbatch_push(x0, base_tdy0, x1, base_tdy1, avg_color)
+     diag_wall_lod_columns+=x1-x0+1
     else
-     -- textured vertical columns
-     local u0=wall_u0[ray_idx]
-     local u1=wall_u1[ray_idx]
-     local spr_idx=wall_spr_idx[ray_idx]
-     local y0=wall_y0[ray_idx]
-     local y1=wall_y1[ray_idx]
-     -- compute v0/v1 mapped across clipped span
-     local full_h=y1-y0
+     local u0=tx0*tex_size
      local v0=0
-     local v1=tex_size
-     if full_h>0 and tdy0<y1 then
-      v0+=((tdy0-y0)/full_h)*tex_size
-      v1=v0+tex_size
+     local full_h=y1-y0
+     if full_h>0 and base_tdy0<y1 then
+      v0=((base_tdy0-y0)/full_h)*tex_size
      end
-     local span_w=max(1,(x1-x0))
-     local delta_u=u1-u0
-     if delta_u>tex_size*0.5 or delta_u < -tex_size*0.5 then
-      delta_u=0
-      u1=u0
-     end
-     local du=delta_u/span_w
-     local u_interp=u0
-     -- Hardcode flags=0 for consistent fast path (Picotron guideline: minimize tline3d overhead)
-     local flags=0
-     for x=x0,x1 do
-      u_interp=max(0,min(tex_size-0.001,u_interp))
-      batch_push(spr_idx, x, tdy0, x, tdy1, u_interp, v0, u_interp, v1, 1, 1, flags)
-      if zwrite then zwrite(x, z) else zbuf:set(x,z) end
-      u_interp+=du
-     end
+     local w0=1/base_z
+     batch_push(spr_idx,x0,base_tdy0,x1,base_tdy1,u0,v0,u0,v0+tex_size,w0,w0,0)
+     diag_wall_columns+=x1-x0+1
     end
+    if zwrite then zwrite(x0,base_z) else zbuf:set(x0,base_z) end
    end
+   span_start=nil
+   return
+  end
+  local rel_x0=hx0-player.x
+  local rel_y0=hy0-player.y
+  local z0=rel_x0*fwdx+rel_y0*fwdy
+  if z0<=0.0001 then z0=0.0001 end
+  local h0=sdist/z0
+  local base_y0=screen_center_y-h0/2
+  local base_y1=screen_center_y+h0/2
+  local tdy0=ceil(base_y0)
+  local tdy1=min(flr(base_y1),screen_height-1)
+  if tdy0>tdy1 then
+   span_start=nil
+   return
+  end
+  local rel_x1=hx1-player.x
+  local rel_y1=hy1-player.y
+  local z1=rel_x1*fwdx+rel_y1*fwdy
+  if z1<=0.0001 then z1=0.0001 end
+  local h1=sdist/z1
+  local y1_top=screen_center_y-h1/2
+  local y1_bot=screen_center_y+h1/2
+  local tdy1_alt=ceil(y1_top)
+  local tdy1_bot=min(flr(y1_bot),screen_height-1)
+  tdy0=min(tdy0,tdy1_alt)
+  tdy1=max(tdy1,tdy1_bot)
+  tdy0=max(tdy0,0)
+  tdy1=min(tdy1,screen_height-1)
+  if tdy0>tdy1 then
+   span_start=nil
+   return
+  end
+  local wall_height=tdy1-tdy0
+  local column_count=x1-x0+1
+  if z0>wall_lod_distance and z1>wall_lod_distance then
+   rbatch_push(x0, tdy0, x1, tdy1, avg_color)
+   diag_wall_lod_columns+=column_count
+  else
+   local u0=tx0*tex_size
+   local u1=tx1*tex_size
+   local v0=((tdy0-base_y0)/(base_y1-base_y0))*tex_size
+   if base_y1-base_y0<=0 then v0=0 end
+   if v0<0 then v0=0 elseif v0>tex_size then v0=tex_size end
+   local v1=v0+tex_size
+   batch_push(spr_idx, x0, tdy0, x1, tdy1, u0, v0, u1, v1, 1/z0, 1/z1, 0)
+   diag_wall_columns+=column_count
+  end
+  for col=x0,x1 do
+   local t=(span_width>0) and ((col-x0)/span_width) or 0
+   local world_x=hx0+(hx1-hx0)*t
+   local world_y=hy0+(hy1-hy0)*t
+   local rel_x=world_x-player.x
+   local rel_y=world_y-player.y
+   local z=rel_x*fwdx+rel_y*fwdy
+   if z<=0.0001 then z=0.0001 end
+   if zwrite then zwrite(col,z) else zbuf:set(col,z) end
+  end
+  span_start=nil
+ end
+ for ray_idx=0,_rc-1 do
+  local tile=rbuf_tile:get(ray_idx)
+  if tile and tile>0 then
+   if span_start and tile==span_tile then
+    span_tx1=rbuf_tx:get(ray_idx)
+    span_hitx1=ray_hitx:get(ray_idx)
+    span_hity1=ray_hity:get(ray_idx)
+   else
+    if span_start then flush_span(ray_idx-1) end
+    span_start=ray_idx
+    span_tile=tile
+    span_spr=resolve_sprite_index(tile,(is_door and is_door(tile)) and "door" or "wall")
+    local avg=avg_color_cache[tile]
+    if not avg then
+     local cached=tex_cache[tile]
+     local src,is_fallback
+     if cached then
+      src,is_fallback=cached.src,cached.is_fallback
+     else
+      local obj_type=is_door and is_door(tile) and "door" or "wall"
+      src,is_fallback=get_texture_source(tile,obj_type)
+      cache_tex(tile, src, is_fallback)
+     end
+     avg=5
+     if src and src.get then
+      avg=src:get(16,16) or 5
+     end
+     cache_avg(tile, avg)
+    end
+    span_avg=avg
+    span_tx0=rbuf_tx:get(ray_idx)
+    span_tx1=span_tx0
+    span_hitx0=ray_hitx:get(ray_idx)
+    span_hity0=ray_hity:get(ray_idx)
+    span_hitx1=span_hitx0
+    span_hity1=span_hity0
+   end
+  else
+   if span_start then flush_span(ray_idx-1) end
   end
  end
- if any_rect then
-  -- apply dithering pattern and submit
-  fillp(0x55aa55aa)
-  rbatch_submit()
-  fillp()
- end
+ if span_start then flush_span(_rc-1) end
  batch_submit()
  
  palt()
@@ -359,38 +391,21 @@ end
 -- draw horizontal scanlines with 32x32 sprite sampling and optional wall rendering (flat shading)
 function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
  local size=sprite_size or 32
- 
- for y=y0,y1 do
-  -- calculate ray gradient using half-pixel offset (avoid horizon singularity)
-  local y_offset
-  if y>=0 then
-   y_offset=y+0.5
-  else
-   y_offset=abs(y-0.5)
-  end
+ local function draw_single_row(row)
+  diag_floor_rows+=1
+  local y=row
+  local y_offset=y>=0 and (y+0.5) or abs(y-0.5)
   local g=y_offset/sdist
   if g<0.0001 then g=0.0001 end
-  
-  -- calculate z distance
   local z=(height or 0.5)/g
-  
-  -- calculate map coordinates
   local mx=(cx+z*sa)/tilesize
   local my=(cy+z*ca)/tilesize
-  
-  -- calculate texture deltas
   local s=sdist/z*tilesize
   local mdx=-ca/s
   local mdy=sa/s
-  
-  -- offset to left edge
   mx-=screen_center_x*mdx
   my-=screen_center_x*mdy
-  
- -- diagnostics removed for production
-  
   if per_cell_floors_enabled then
-   -- per-cell floor type rendering using preallocated buffers (no per-frame table allocs)
    local sample_interval=12
    local rcount=0
    local cur_id=-1
@@ -421,7 +436,6 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
     runs_id:set(rcount, cur_id)
     rcount+=1
    end
-   -- merge short runs into previous using preallocated buffers
    local mcount=0
    for i=0,rcount-1 do
     local x0i=runs_x0:get(i)
@@ -440,7 +454,6 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
      end
     end
    end
-   -- draw all merged runs with batching
    for i=0,mcount-1 do
     local rx0=merged_x0:get(i)
     local rx1=merged_x1:get(i)
@@ -457,18 +470,55 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
     local u1=u0+(rx1-rx0)*mdx*size
     local v1=v0+(rx1-rx0)*mdy*size
     batch_push(idx, rx0, screen_center_y+y, rx1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
+    diag_floor_batches+=1
    end
   else
-   -- simplified rendering: draw full scanline with single texture
    local idx=resolve_sprite_index(tex,"floor")
    local u0=(mx)%1*size
    local v0=(my)%1*size
-  u0=max(0,min(size-0.001,u0))
-  v0=max(0,min(size-0.001,v0))
+   u0=max(0,min(size-0.001,u0))
+   v0=max(0,min(size-0.001,v0))
    local u1=u0+(screen_width-1)*mdx*size
    local v1=v0+(screen_width-1)*mdy*size
    batch_push(idx, 0, screen_center_y+y, screen_width-1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
+   diag_floor_batches+=1
   end
+ end
+ local function duplicate_rows(src_row, count)
+  if count<=0 then return end
+  local y0=screen_center_y+src_row+1
+  local y1=y0+count-1
+  if y0>screen_center_y+y1 then return end
+  y1=min(y1,screen_center_y+y1)
+  if y0>screen_height-1 then return end
+ end
+ local function blit_rows(src_row,rep_count)
+  if rep_count<=0 then return end
+  for k=1,rep_count do
+   local row=src_row+k
+  if row>y1 then break end
+   diag_floor_rows+=1
+   diag_floor_batches+=1
+   blit(get_draw_target(),get_draw_target(),0,screen_center_y+src_row,0,screen_center_y+row,screen_width,1)
+  end
+ end
+ local near_end = min(y1, -16)
+ local mid_end = min(y1, 32)
+ for y=y0, near_end do
+  draw_single_row(y)
+ end
+ local y=near_end+1
+ while y<=mid_end do
+  draw_single_row(y)
+ clamped_blit(y,y+1)
+  y+=2
+ end
+ while y<=y1 do
+  draw_single_row(y)
+ clamped_blit(y,y+1)
+ clamped_blit(y,y+2)
+ clamped_blit(y,y+3)
+  y+=4
  end
 end
 

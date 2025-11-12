@@ -241,6 +241,7 @@ function drawobj_single(ob, sa, ca)
     end
    end
    rbatch_submit()
+   diag_sprite_impostor_columns+=max(0,x1-x0+1)
    end
    
    return
@@ -332,6 +333,7 @@ function drawobj_single(ob, sa, ca)
     elseif zbuf.set then
      zbuf:set(px, z)
     end
+   diag_sprite_columns+=1
    end
   end
   sbatch_submit()

@@ -37,8 +37,9 @@ The NONBOY ダンジョンクロウラ Engine aims to be a complete 3D game engi
 - **Allocation-free floor runs** - Preallocated userdata buffers for per-cell floor segmentation (no per-frame tables)
 - **Optimized fog/z-buffer** - Display palette fog updates with hysteresis and a frame‑stamped z-buffer (no per-frame clear)
 - **Adaptive quality governor** - `stat(1)`-driven dynamic ray budget and floor stride for steadier FPS
+- **Integrated dungeon lab** - Main menu route to inspect dungeon graphs, review generation logs, and run deterministic harness checks
 
-**Target Performance**: 50-60 FPS on typical scenes (128 rays, stride=2, LOD enabled)
+**Target Performance**: 50-60 FPS in typical scenes (128 rays, stride=1, LOD enabled)
 
 ---
 
@@ -199,8 +200,8 @@ end
 — How: Interpolate only across same-tile rays; clamp UVs when clipped.  
 — Why: Avoids shimmering and seams with minimal math.
 
-**LOD System**:
-- **Threshold**: `wall_lod_distance = fog_far * 0.7 = 14.0` units
+-**LOD System**:
+- **Threshold**: `wall_lod_distance = fog_far * 0.4 = 8.0` units
 - **Beyond LOD**: Draw solid average color (sampled from texture center)
 - **Benefit**: Significant reduction in `tline3d` calls for distant walls
 — What: Solid impostors for distant walls.  
@@ -209,23 +210,18 @@ end
 
 #### Floor/Ceiling Rendering
 
-**Stride Rendering**:
+**Full-Quality Scanlines**:
 ```lua
-for y=y0, y1, row_stride do  -- row_stride=2
-  -- Draw scanline
+for y=y0, y1 do
+  -- Draw every scanline with accurate UVs
   tline3d(src, 0, screen_center_y+y, screen_width-1, screen_center_y+y, ...)
-  
-  -- Duplicate into skipped rows
-  for dy=1, row_stride-1 do
-    rectfill(0, screen_center_y+y+dy, screen_width-1, screen_center_y+y+dy, cached_fill_color)
-  end
 end
 ```
-- **Performance**: 50% fewer `tline3d` calls (135 vs 270)
-- **Quality**: Duplication maintains visual density
-— What: Draw fewer scanlines; duplicate into gaps.  
-— How: Controlled by `row_stride`; uses cached fill color.  
-— Why: Big savings with modest quality cost.
+- **Performance**: Highest quality; rely on adaptive ray budget for throttling
+- **Quality**: No banding or duplicated rows
+— What: Always draw every floor/ceiling row.  
+— How: Keep `row_stride` at 1; governor only adjusts ray count.  
+— Why: Preserves perspective correctness while other subsystems optimize cost.
 
 **Per-Cell Floor Types**:
 1. **Sample** `map.floors` every 4 pixels along scanline
@@ -318,7 +314,7 @@ if z > sprite_lod_distance then
   local avg_color = src:get(16, 16) or 5  -- Sample center pixel
   set_fog(z)
   for px=x0, x1 do
-    if z < zbuf[px+1] then
+    if z < zread(px) then
       rectfill(px, y0, px, y1, avg_color)
     end
   end
@@ -328,7 +324,7 @@ end
 **Per-Column Z-Test**:
 ```lua
 for px=x0, x1 do
-  if z < zbuf[px+1] then
+  if z < zread(px) then
     tline3d(src, px, y0, px, y1, u, v0, u, v1, 1, 1)
   end
 end
@@ -357,6 +353,12 @@ The generator builds a graph of rooms connected by corridors with boundary doors
 8. **Erosion** - Smooth walls, add variety
 9. **Border Ring** - Enforce 1-tile wall ring
 10. **Door Tiles** - Re-assert door consistency
+
+**Heuristics & Observability**:
+- Adaptive spacing relax/restore (tuned by `gen_adaptive_settings`) keeps high room success rates while logging failures for review.
+- Theme-specific `rules` bias room proportions, corridor jogs, and erosion intensity without sacrificing rectangular invariants.
+- Corridor metadata (`edge.shape`, junction nodes, boundary preservation) supports progression analytics and future minimap rendering.
+- All critical actions (door repairs, locks, spacing relaxations) flow into `gen_observability.history`, surfaced in the Dungeon Lab sidebar.
 
 **Border Ring Enforcement**:
 ```lua
@@ -518,7 +520,7 @@ screen_width = 480
 screen_height = 270
 screen_center_x = 240
 screen_center_y = 135
-ray_count = 128          -- Independent of screen_width
+ray_count = 128          -- Independent of screen_width; adaptive governor can lower this
 fov = 0.5                -- Half-angle in radians (~28.6°)
 far_plane = 25.0         -- Maximum raycast distance
 ```
@@ -534,15 +536,15 @@ fog_hysteresis = 0.5     -- Minimum z change to update fog
 ### LOD System
 
 ```lua
-wall_lod_ratio = 0.7     -- Wall LOD at fog_far * 0.7 = 14.0
-sprite_lod_ratio = 0.8   -- Sprite LOD at fog_far * 0.8 = 16.0
+wall_lod_ratio = 0.4     -- Wall LOD at fog_far * 0.4 = 8.0
+sprite_lod_ratio = 0.5   -- Sprite LOD at fog_far * 0.5 = 10.0
 wall_lod_distance = fog_far * wall_lod_ratio  -- Computed
 ```
 
 ### Rendering
 
 ```lua
-row_stride = 2           -- Floor/ceiling stride (1=full, 2=half)
+row_stride = 1           -- Floor/ceiling stride (kept at 1 for full quality)
 ```
 
 ### Map & Spatial
@@ -596,30 +598,63 @@ gen_params = {
 }
 ```
 
+### Generation Observability
+
+```lua
+gen_observability = {
+  enable_console = false,
+  capture_history = true,
+  history_limit = 400,
+  log_seed = true,
+  log_room_attempts = true,
+  log_corridors = true,
+  log_progression = true,
+  log_repairs = true
+}
+```
+
+### Adaptive Generation Settings
+
+```lua
+gen_adaptive_settings = {
+  spacing_relax_threshold = 4,
+  spacing_relax_step = 1,
+  spacing_max_relax = 4,
+  spacing_restore_delay = 2,
+  spacing_restore_step = 1,
+  max_room_failures = 24,
+  offcenter_bias = 0.65,
+  bias_radius = 12,
+  junction_retry_limit = 6,
+  corridor_jog_chance = 0.25
+}
+```
+
+Each theme in `config.lua` may specify a `rules` table (shape weights, spacing bias, corridor jog chance, erosion intensity). These rules drive the adaptive heuristics described in the Dungeon Generation section.
+
 ---
 
 ## Performance Characteristics
 
 ### Typical Scene (adaptive rays/stride, LOD enabled)
 
-**Target**: 50–60 FPS in typical scenes with the adaptive governor (dynamic ray budget and floor stride) and fog‑driven LOD.
+**Target**: Stable 50–60 FPS in typical scenes with the adaptive governor (dynamic ray budget) and fog‑driven LOD.
 
 Use the built-in diagnostics (G overlay, F logging) to tune:
 - DDA steps/ray and early-outs (raycasting cost)
 - Wall columns vs LOD solid fills (wall cost)
-- Floor rows rendered (stride impact)
+- Active ray budget (governor impact)
 - Sprite columns drawn (culling/buckets/LOD impact)
 - Fog switches (palette work)
 
 ### Performance Tuning Knobs
 
-1. **ray_count** (64/128/256)
+1. **ray_count** (64/128/192)
    - Lower = faster raycasting, blockier walls
    - Higher = slower raycasting, smoother walls
 
-2. **row_stride** (1/2/4)
-   - Higher = faster floors, more visible scanlines
-   - Lower = slower floors, smoother floors
+2. **row_stride** (locked at 1 for correct perspective)
+   - Raising this trades correctness for speed; leave at 1 for production
 
 3. **wall_lod_ratio** (0.5-0.9)
    - Lower = more LOD, faster but less detail
@@ -634,8 +669,7 @@ Use the built-in diagnostics (G overlay, F logging) to tune:
 
 6. **Adaptive governor (code)**
    - Shrink budgets when `stat(1) > 0.90`, grow when `< 0.70`
-   - `active_ray_count` bounds: 48 .. `ray_count`
-   - `row_stride_dynamic` bounds: 1 .. 8
+   - `active_ray_count` bounds: 64 .. `ray_count`
    - Tune thresholds/steps for your device
 
 7. **tline3d 0x400 near band (code)**
@@ -770,7 +804,7 @@ function zwrite(x, z)
   zstamp[x] = frame_id
 end
 ```
-Walls call `zwrite` per pixel after drawing the column; sprites test `z < zread(px+1)` before drawing a column and then `zwrite` on success.
+Walls call `zwrite` per pixel after drawing the column; sprites test `z < zread(px)` before drawing a column and then `zwrite` on success.
 
 ### Spatial Grids
 
@@ -801,6 +835,13 @@ doorgrid[x][y] = {open=0.5, opening=true, close_timer=90}
   - Full 2D minimap: press X (debug mode) to toggle between `3d` and `2d` views.  
   - HUD minimap: auto-scrolling clipped viewport in 3D view (walls/floors/doors/objects/player).  
 - **Door Test Mode**: Press V to toggle. While active, C/D adjust forced open amount. When not in test mode, C cycles floor type; D cycles roof type.
+
+### Dungeon Lab & Test Harness
+
+- The startup flow now opens a main menu. Choose **Dungeon Lab** to enter a dedicated generation sandbox with an overhead 2D visualization.
+- Controls: `Z` new random seed, `X` replay current seed, `←/→` tweak seed numerically, `H` run the deterministic harness, `J/K` scroll generation logs, `M` return to the menu.
+- The harness (`tests/dungeon_harness.lua`) regenerates a seeded suite, validating room counts, locked door tiles, and key distribution; the summary is shown in the lab sidebar.
+- Recent generation history (door placements, spacing relaxations, progression events) is surfaced via `gen_observability` and rendered in the sidebar to aid regression hunting.
 
 ### Diagnostic System
 
@@ -872,15 +913,13 @@ test_door_y = 15      -- Only affect door at (x, 15)
 
 **Tune Configuration**:
 1. If FPS < 50:
-   - Reduce `ray_count` (128 → 64)
-   - Increase `row_stride` (2 → 4)
-   - Lower `wall_lod_ratio` (0.7 → 0.5)
+   - Reduce `ray_count` (128 → 96 → 80)
+   - Lower `wall_lod_ratio` (0.4 → 0.3)
    - Disable `per_cell_floors_enabled`
 
 2. If FPS > 60:
-   - Increase `ray_count` (128 → 256)
-   - Decrease `row_stride` (2 → 1)
-   - Raise `wall_lod_ratio` (0.7 → 0.9)
+   - Increase `ray_count` (128 → 160 → 192)
+   - Raise `wall_lod_ratio` (0.4 → 0.6)
 
 **Watch for Regressions**:
 - Fog switches > 20/frame: Increase `fog_hysteresis`
@@ -947,7 +986,7 @@ test_door_y = 15      -- Only affect door at (x, 15)
 - `texsets`, `planetyps`: wall/floor/ceiling texture indices and properties.  
 - `enemy_types`, `decoration_types`, `obj_types`: sprite indices and behavior for spawned content.  
 - `pals`, `fog_near`, `fog_far`, `fog_hysteresis`: fog behavior and palette tables.  
-- `wall_lod_ratio`, `sprite_lod_ratio`, `row_stride`, `per_cell_floors_enabled`: performance/quality controls.
+- `wall_lod_ratio`, `sprite_lod_ratio`, `row_stride` (kept at 1), `per_cell_floors_enabled`: performance/quality controls.
 
 ---
 

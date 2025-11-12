@@ -2,6 +2,7 @@ picotron cartridge // www.picotron.net
 version 2
 
 :: src/
+:: tests/
 :: src/config.lua
 --[[pod_format="raw",created="2025-11-07 21:17:14",modified="2025-11-07 21:48:05",revision=1]]
 -- engine configuration
@@ -125,6 +126,30 @@ gen_params={
  pickup_density=0.1
 }
 
+gen_observability={
+ enable_console=false,
+ capture_history=true,
+ history_limit=400,
+ log_seed=true,
+ log_room_attempts=true,
+ log_corridors=true,
+ log_progression=true,
+ log_repairs=true
+}
+
+gen_adaptive_settings={
+ spacing_relax_threshold=4,
+ spacing_relax_step=1,
+ spacing_max_relax=4,
+ spacing_restore_delay=2,
+ spacing_restore_step=1,
+ max_room_failures=24,
+ offcenter_bias=0.65,
+ bias_radius=12,
+ junction_retry_limit=6,
+ corridor_jog_chance=0.25
+}
+
 -- helper constants
 max_spawn_attempts=50
 max_room_attempts=100
@@ -180,11 +205,71 @@ decoration_types={
 
 -- theme definitions
 themes={
- dng={floor="stone_tile",roof="stone_ceiling",decor_prob=0.8},
- out={floor="dirt",roof="sky",decor_prob=0.5},
- dem={floor="stone_tile",roof="night_sky",decor_prob=0.9},
- house={floor="stone_tile",roof="stone_ceiling",decor_prob=0.7},
- dark={floor="stone_tile",roof="night_sky",decor_prob=0.6}
+ dng={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.8,
+  rules={
+   room_shape_weights={square=0.5,hall_horizontal=0.25,hall_vertical=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=10,
+   center_bias=0.55,
+   corridor_jog_chance=0.2,
+   erosion_intensity=1.0
+  }
+ },
+ out={
+  floor="dirt",
+  roof="sky",
+  decor_prob=0.5,
+  rules={
+   room_shape_weights={hall_horizontal=0.45,square=0.35,grand=0.05,hall_vertical=0.15},
+   room_extra_size=0,
+   bias_radius=14,
+   center_bias=0.7,
+   corridor_jog_chance=0.35,
+   erosion_intensity=1.2
+  }
+ },
+ dem={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.9,
+  rules={
+   room_shape_weights={square=0.4,hall_vertical=0.3,hall_horizontal=0.2,grand=0.15},
+   room_extra_size=2,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.15,
+   erosion_intensity=0.8
+  }
+ },
+ house={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.7,
+  rules={
+   room_shape_weights={square=0.6,hall_horizontal=0.2,hall_vertical=0.2},
+   room_extra_size=0,
+   bias_radius=9,
+   center_bias=0.6,
+   corridor_jog_chance=0.1,
+   erosion_intensity=0.5
+  }
+ },
+ dark={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.6,
+  rules={
+   room_shape_weights={square=0.35,hall_vertical=0.35,hall_horizontal=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.25,
+   erosion_intensity=0.9
+  }
+ }
 }
 
 -- fog palettes (distance-based)
@@ -339,8 +424,291 @@ gen_nodes={}
 gen_edges={}
 gen_inventory={}
 gen_objects={}
+gen_locked_edges={}
+
 -- theme-specific floor id used during carving/eroding; initialized to stone_tile (1)
 local gen_floor_id=1
+
+-- observability + diagnostics configuration (defaults if config.lua did not define them)
+local observability = rawget(_G,"gen_observability") or {
+ enable_console=false,
+ capture_history=true,
+ history_limit=400,
+ log_seed=true,
+ log_room_attempts=true,
+ log_corridors=true,
+ log_progression=true,
+ log_repairs=true
+}
+
+local gen_history={}
+local protected_tiles={}
+local dynamic_spacing=0
+local base_spacing=0
+local spacing_restore_timer=0
+local spacing_relaxations=0
+local active_theme_rules=nil
+local adaptive_settings=rawget(_G,"gen_adaptive_settings") or {
+ spacing_relax_threshold=4,
+ spacing_relax_step=1,
+ spacing_max_relax=4,
+ spacing_restore_delay=2,
+ spacing_restore_step=1,
+ max_room_failures=20,
+ offcenter_bias=0.65,
+ bias_radius=12,
+ junction_retry_limit=4,
+ corridor_jog_chance=0.25
+}
+
+local room_failure_streak=0
+local total_room_failures=0
+
+local function hist_push(entry)
+ if not observability.capture_history then return end
+ add(gen_history,entry)
+ if #gen_history>(observability.history_limit or 400) then
+  deli(gen_history,1)
+ end
+end
+
+local tick_spacing
+
+local function register_room_failure(reason)
+ room_failure_streak+=1
+ total_room_failures+=1
+ tick_spacing(false)
+ if observability.log_room_attempts then
+  gen_log("room_fail",reason.." (streak="..room_failure_streak..")")
+ end
+ if room_failure_streak>=(adaptive_settings.spacing_relax_threshold or 4) then
+  relax_spacing()
+  room_failure_streak=0
+ end
+end
+
+local function register_room_success()
+ room_failure_streak=0
+ tick_spacing(true)
+end
+
+local function gen_log(tag,msg)
+ local line="["..tag.."] "..msg
+ hist_push(line)
+ if observability.enable_console then printh(line) end
+end
+
+local function clear_protected()
+ protected_tiles={}
+end
+
+local function protect_tile(x,y)
+ if not x or not y then return end
+ protected_tiles[x]=protected_tiles[x] or {}
+ protected_tiles[x][y]=true
+end
+
+local function is_tile_protected(x,y)
+ return protected_tiles[x] and protected_tiles[x][y] or false
+end
+
+local function reset_adaptive_spacing()
+ base_spacing=gen_params.spacing or 0
+ dynamic_spacing=base_spacing
+ spacing_restore_timer=0
+ spacing_relaxations=0
+ room_failure_streak=0
+ total_room_failures=0
+end
+
+local function relax_spacing()
+ if spacing_relaxations>=(adaptive_settings.spacing_max_relax or 4) then return end
+ dynamic_spacing=max(0,dynamic_spacing-(adaptive_settings.spacing_relax_step or 1))
+ spacing_relaxations+=1
+ spacing_restore_timer=adaptive_settings.spacing_restore_delay or 2
+ gen_log("spacing","relaxed spacing to "..dynamic_spacing)
+end
+
+local function tick_spacing(success)
+ if success then
+  if spacing_restore_timer>0 then
+   spacing_restore_timer-=1
+  elseif dynamic_spacing<base_spacing then
+   dynamic_spacing=min(base_spacing,dynamic_spacing+(adaptive_settings.spacing_restore_step or 1))
+   if dynamic_spacing==base_spacing then
+    spacing_relaxations=0
+   end
+   gen_log("spacing","restored spacing to "..dynamic_spacing)
+  end
+ else
+  if spacing_restore_timer>0 then
+   spacing_restore_timer-=1
+  end
+ end
+end
+
+local function rect_area(rect)
+ return (rect[3]-rect[1]+1)*(rect[4]-rect[2]+1)
+end
+
+local function classify_room_style(rect)
+ local w=rect[3]-rect[1]+1
+ local h=rect[4]-rect[2]+1
+ local ratio=w/h
+ if ratio>=1.8 then
+  return "hall_horizontal"
+ elseif ratio<=0.55 then
+  return "hall_vertical"
+ elseif w*h>=120 then
+  return "grand"
+ elseif w<=6 and h<=6 then
+  return "compact"
+ else
+  return "square"
+ end
+end
+
+local function choose_weighted(weights,default_key)
+ if not weights then return default_key end
+ local total=0
+ for _,v in pairs(weights) do
+  total+=v
+ end
+ if total<=0 then return default_key end
+ local roll=rnd(total)
+ local acc=0
+ for key,v in pairs(weights) do
+  acc+=v
+  if roll<=acc then return key end
+ end
+ return default_key
+end
+
+local function get_edge_between(a,b)
+ for e in all(gen_edges) do
+  if (e.n1==a and e.n2==b) or (e.n1==b and e.n2==a) then
+   return e
+  end
+ end
+ return nil
+end
+
+local function locate_room_for_position(x,y)
+ for node in all(gen_nodes) do
+  local r=node.rect
+  if x>=r[1] and x<=r[3] and y>=r[2] and y<=r[4] then
+   return node
+  end
+ end
+ return nil
+end
+
+local function relocate_key_to_room(keynum,target_node)
+ if not target_node then return false end
+ local sx,sy=find_spawn_point(target_node.rect)
+ if not sx then
+  sx=target_node.midx+0.5
+  sy=target_node.midy+0.5
+ end
+ for ob in all(gen_objects) do
+  if ob.typ==obj_types.key and ob.keynum==keynum then
+   ob.pos={sx,sy}
+   ob.room_index=target_node.index
+   if observability.log_progression then
+    gen_log("progression","relocated key#"..keynum.." to room "..target_node.index)
+   end
+   return true
+  end
+ end
+ return false
+end
+
+local function validate_and_repair_progression(start_node,locked_edges)
+ if not locked_edges or #locked_edges==0 then return end
+ local key_rooms={}
+ for ob in all(gen_objects) do
+  if ob.typ==obj_types.key and ob.keynum then
+   if not ob.room_index then
+    local node=locate_room_for_position(ob.pos[1],ob.pos[2])
+    ob.room_index=node and node.index or nil
+   end
+   key_rooms[ob.keynum]=ob.room_index
+  end
+ end
+
+ local acquired={}
+ local visited={}
+ local queue={start_node}
+ visited[start_node]=true
+ local function collect_keys(node)
+  for ob in all(gen_objects) do
+   if ob.typ==obj_types.key and ob.keynum and ob.room_index==node.index then
+    acquired[ob.keynum]=true
+   end
+  end
+ end
+ collect_keys(start_node)
+ local progressed=true
+ while progressed do
+  progressed=false
+  for edge in all(gen_edges) do
+   local a,b=edge.n1,edge.n2
+   local a_vis=visited[a]
+   local b_vis=visited[b]
+   if a_vis and not b_vis then
+    local can_traverse=true
+    if edge.locked and edge.keynum and not acquired[edge.keynum] then
+     can_traverse=false
+    end
+    if can_traverse then
+     visited[b]=true
+     collect_keys(b)
+     progressed=true
+    end
+   elseif b_vis and not a_vis then
+    local can_traverse=true
+    if edge.locked and edge.keynum and not acquired[edge.keynum] then
+     can_traverse=false
+    end
+    if can_traverse then
+     visited[a]=true
+     collect_keys(a)
+     progressed=true
+    end
+   end
+  end
+ end
+
+ local relocated=false
+ for edge in all(locked_edges) do
+  if edge.locked and edge.keynum then
+   local n1_vis=visited[edge.n1]
+   local n2_vis=visited[edge.n2]
+   if not (n1_vis and n2_vis) then
+    if relocate_key_to_room(edge.keynum,start_node) then
+     relocated=true
+     acquired[edge.keynum]=true
+     visited[edge.n1]=true
+     visited[edge.n2]=true
+    end
+   end
+  end
+ end
+ if relocated then
+  validate_and_repair_progression(start_node,locked_edges)
+ end
+end
+
+local function ensure_theme_rules(theme)
+ local rules=(themes[theme] and themes[theme].rules) or nil
+ active_theme_rules=rules or {
+  room_aspect_bias=0.35,
+  room_extra_size=0,
+  spacing_floor=0,
+  corridor_width=1,
+  corridor_jog_chance=adaptive_settings.corridor_jog_chance or 0.25
+ }
+end
 
 -- helper: check if tile is a wall
 function is_wall(val)
@@ -374,9 +742,34 @@ function rect_overlaps(rect)
   return true
  end
  for r in all(gen_rects) do
-  if not (rect[3]+gen_params.spacing<r[1] or rect[1]>r[3]+gen_params.spacing or
-          rect[4]+gen_params.spacing<r[2] or rect[2]>r[4]+gen_params.spacing) then
+  local spacing=dynamic_spacing or 0
+  if not (rect[3]+spacing<r[1] or rect[1]>r[3]+spacing or
+          rect[4]+spacing<r[2] or rect[2]>r[4]+spacing) then
    return true
+  end
+ end
+ return false
+end
+
+local function rect_conflicts(rect,ignore_nodes,spacing_override)
+ if rect[1]<0 or rect[3]>=map_size or rect[2]<0 or rect[4]>=map_size then
+  return true
+ end
+ local ignore={}
+ if ignore_nodes then
+  for n in all(ignore_nodes) do
+   if n and n.index then
+    ignore[n.index]=true
+   end
+  end
+ end
+ local spacing=(spacing_override~=nil) and spacing_override or (dynamic_spacing or 0)
+ for idx=1,#gen_rects do
+  if not ignore[idx] then
+   local r=gen_rects[idx]
+   if r and not (rect[3]+spacing<r[1] or rect[1]>r[3]+spacing or rect[4]+spacing<r[2] or rect[2]>r[4]+spacing) then
+    return true
+   end
   end
  end
  return false
@@ -393,66 +786,121 @@ function fill_rect(rect,val)
  local fill_val=(val or 0)
  for x=x0,x1 do
   for y=y0,y1 do
-			map.walls:set(x,y,fill_val)
+   set_wall(x,y,fill_val)
   end
  end
 end
 
 -- helper: try place door with fallback positions
 function try_place_door_with_fallback(x,y,dtype)
- local attempts={
-  {x,y},
-  {x-1,y},{x+1,y},{x,y-1},{x,y+1}
- }
- 
- -- evaluate door placement probability once per logical placement
- local should_place_door=rnd(1)<gen_params.room_door_prob
- 
- for attempt in all(attempts) do
-  local ax,ay=attempt[1],attempt[2]
-  if ax>=0 and ax<128 and ay>=0 and ay<128 then
-			if is_wall(get_wall(ax,ay)) and should_place_door then
-				map.walls:set(ax,ay,(dtype or 0))
+ dtype=dtype or door_normal
+ local attempts={{0,0},{-1,0},{1,0},{0,-1},{0,1},{-2,0},{2,0},{0,-2},{0,2}}
+ local should_place=rnd(1)<gen_params.room_door_prob
+ if not should_place then
+  gen_log("door","skipped optional door at "..x..","..y)
+  return false
+ end
+ for i=1,#attempts do
+  local off=attempts[i]
+  local ax,ay=x+off[1],y+off[2]
+  if ax>=0 and ax<map_size and ay>=0 and ay<map_size then
+   local existing=get_wall(ax,ay)
+   if is_wall(existing) then
+    set_wall(ax,ay,dtype)
     create_door(ax,ay,dtype)
+    protect_tile(ax,ay)
+    if observability.log_corridors then
+     gen_log("door","placed door at "..ax..","..ay.." after "..i.." attempts")
+    end
     return true
    end
   end
+ end
+ if observability.log_repairs then
+  gen_log("door","failed to place door near "..x..","..y)
  end
  return false
 end
 
 -- helper: generate random room
 function random_room(base_node,is_special)
+ local min_size=gen_params.min_size or 4
+ local max_size=gen_params.max_size or 12
+ if active_theme_rules and active_theme_rules.room_extra_size then
+  max_size+=active_theme_rules.room_extra_size
+ end
+ if max_size<min_size then max_size=min_size end
+ local shape_weights=active_theme_rules and active_theme_rules.room_shape_weights
+ local shape=choose_weighted(shape_weights,"square")
  local w,h
  if is_special then
   w,h=12,12
  else
-  w=flr(rnd(gen_params.max_size-gen_params.min_size+1))+gen_params.min_size
-  h=flr(rnd(gen_params.max_size-gen_params.min_size+1))+gen_params.min_size
+  if shape=="hall_horizontal" then
+   w=flr(rnd(max_size-min_size+1))+min_size
+   h=max(min_size,flr(w*0.5))
+  elseif shape=="hall_vertical" then
+   h=flr(rnd(max_size-min_size+1))+min_size
+   w=max(min_size,flr(h*0.5))
+  elseif shape=="grand" then
+   w=max_size
+   h=max(min_size,max_size-2)
+  else
+   w=flr(rnd(max_size-min_size+1))+min_size
+   h=flr(rnd(max_size-min_size+1))+min_size
+  end
  end
- 
+ w=min(w, max_size)
+ h=min(h, max_size)
+ w=max(w,min_size)
+ h=max(h,min_size)
+
+ local function sample_offset(range)
+  local bias=(active_theme_rules and active_theme_rules.center_bias) or adaptive_settings.offcenter_bias or 0.65
+  local magnitude=flr(range*(rnd()^bias))
+  if rnd(1)<0.5 then magnitude=-magnitude end
+  return magnitude
+ end
+
  local x,y
  if base_node then
-  x=base_node.midx+flr(rnd(20)-10)
-  y=base_node.midy+flr(rnd(20)-10)
+  local radius=(active_theme_rules and active_theme_rules.bias_radius) or adaptive_settings.bias_radius or 12
+  local dx=sample_offset(radius)
+  local dy=sample_offset(radius)
+  x=base_node.midx+dx-flr(w/2)
+  y=base_node.midy+dy-flr(h/2)
  else
-  x=flr(rnd(122))+3
-  y=flr(rnd(122))+3
+  local margin=4
+  x=flr(rnd(map_size-w-margin*2))+margin
+  y=flr(rnd(map_size-h-margin*2))+margin
  end
- 
- return {x,y,x+w-1,y+h-1},gen_params.room_door_prob
+
+ x=max(1,min(map_size-w-2,x))
+ y=max(1,min(map_size-h-2,y))
+
+ return {x,y,x+w-1,y+h-1}
 end
 
 -- helper: add room to generation state
 function add_room(rect,is_junction)
- add(gen_rects,rect)
+ local index=#gen_nodes+1
+ gen_rects[index]=rect
+ local style=classify_room_style(rect)
  local node={
   rect=rect,
   midx=flr((rect[1]+rect[3])/2),
   midy=flr((rect[2]+rect[4])/2),
   edges={},
-  is_junction=is_junction or false
+  is_junction=is_junction or false,
+  style=style,
+  area=rect_area(rect),
+  theme=gen_params.theme,
+  metadata={},
+  index=index
  }
+ if observability.log_room_attempts then
+  gen_log("room","added room "..(#gen_nodes+1).." style="..style.." rect=("..rect[1]..","..rect[2]..")-("..rect[3]..","..rect[4]..")")
+ end
  add(gen_nodes,node)
  return node
 end
@@ -468,12 +916,21 @@ end
 
 -- helper: place door at exact boundary wall tile with retry
 function place_boundary_door_with_retry(bx,by,dtype,max_attempts)
- max_attempts=max_attempts or 3
- for attempt=1,max_attempts do
-  if bx>=0 and bx<128 and by>=0 and by<128 then
-   if is_wall(get_wall(bx,by)) then
-   map.walls:set(bx,by,(dtype or 0))
-    create_door(bx,by,dtype)
+ dtype=dtype or door_normal
+ local offsets={{0,0},{-1,0},{1,0},{0,-1},{0,1},{-2,0},{2,0},{0,-2},{0,2}}
+ local attempts=max_attempts or #offsets
+ for i=1,attempts do
+  local off=offsets[i] or offsets[#offsets]
+  local ax,ay=bx+off[1],by+off[2]
+  if ax>=0 and ax<map_size and ay>=0 and ay<map_size then
+   local tile=get_wall(ax,ay)
+   if is_wall(tile) then
+    set_wall(ax,ay,dtype)
+    create_door(ax,ay,dtype)
+    protect_tile(ax,ay)
+    if observability.log_corridors then
+     gen_log("door","boundary door placed at "..ax..","..ay.." (from "..bx..","..by..")")
+    end
     return true
    end
   end
@@ -485,9 +942,10 @@ end
 function place_boundary_door(bx,by,dtype)
  -- bx,by = boundary wall tile (between corridor and room)
  if bx>=0 and bx<128 and by>=0 and by<128 then
-		if is_wall(get_wall(bx,by)) then
-			map.walls:set(bx,by,(dtype or 0))
+  if is_wall(get_wall(bx,by)) then
+   set_wall(bx,by,dtype or door_normal)
    create_door(bx,by,dtype)
+   protect_tile(bx,by)
    return true
   end
  end
@@ -500,236 +958,300 @@ function ensure_boundary_passage(bx,by)
   local tile=get_wall(bx,by)
   -- if wall is still blocking and not a door, clear it
   if tile>0 and not is_door(tile) and not is_exit(tile) then
-   map.walls:set(bx,by,0)
+   set_wall(bx,by,0)
    set_floor(bx,by,gen_floor_id)
-   printh("fallback: cleared blocking wall at ("..bx..","..by..")")
+   protect_tile(bx,by)
+   if observability.log_repairs then
+    gen_log("door","fallback cleared wall at ("..bx..","..by..")")
+   end
    return true
   end
  end
  return false
 end
 
--- helper: create corridor between two nodes
-function create_corridor(n1,n2)
- local ctype=get_corridor_type(n1.rect,n2.rect)
-	local b1,b2
- 
- if ctype=="horiz" then
-  local x0,x1=min(n1.midx,n2.midx),max(n1.midx,n2.midx)
-  local y=n1.midy
-  local r1,r2=n1.rect,n2.rect
-  
-  -- identify boundary wall tiles before carving
-  local bx1,bx2
-  if r1[1]<=r2[1] then
-   bx1=r1[3]+1
-   bx2=r2[1]-1
-  else
-   bx1=r2[3]+1
-   bx2=r1[1]-1
-  end
-  
-  -- place doors on boundary walls (robust: retry and fallback to passage)
-  local d1_ok=place_boundary_door_with_retry(bx1,y,door_normal,3)
-  if not d1_ok then ensure_boundary_passage(bx1,y) end
-  local d2_ok=place_boundary_door_with_retry(bx2,y,door_normal,3)
-  if not d2_ok then ensure_boundary_passage(bx2,y) end
-  
-  -- carve corridor between doors (exclusive)
-  local x_start=max(0,bx1+1)
-  local x_end=min(127,bx2-1)
-  local cy=y
-  local cfloor_id=gen_floor_id
-  for x=x_start,x_end do
-				map.walls:set(x,cy,0)
-				set_floor(x,cy,cfloor_id)
-  end
-
-		-- store boundary tiles
-		b1={x=bx1,y=y}
-		b2={x=bx2,y=y}
-  
- elseif ctype=="vert" then
-  local y0,y1=min(n1.midy,n2.midy),max(n1.midy,n2.midy)
-  local x=n1.midx
-  local r1,r2=n1.rect,n2.rect
-  
-  -- identify boundary wall tiles before carving
-  local by1,by2
-  if r1[2]<=r2[2] then
-   by1=r1[4]+1
-   by2=r2[2]-1
-  else
-   by1=r2[4]+1
-   by2=r1[2]-1
-  end
-  
-  -- place doors on boundary walls (robust: retry and fallback to passage)
-  local d1_ok=place_boundary_door_with_retry(x,by1,door_normal,3)
-  if not d1_ok then ensure_boundary_passage(x,by1) end
-  local d2_ok=place_boundary_door_with_retry(x,by2,door_normal,3)
-  if not d2_ok then ensure_boundary_passage(x,by2) end
-  
-  -- carve corridor between doors (exclusive)
-  local y_start=max(0,by1+1)
-  local y_end=min(127,by2-1)
-  local cx=x
-  local cfloor_id=gen_floor_id
-  for y=y_start,y_end do
-				map.walls:set(cx,y,0)
-				set_floor(cx,y,cfloor_id)
-  end
-
-		-- store boundary tiles
-		b1={x=x,y=by1}
-		b2={x=x,y=by2}
-  
- else -- l_shape
-	local jx,jy=n1.midx,n2.midy
-  local jw,jh=3,3
-  local jrect={jx-1,jy-1,jx+jw-2,jy+jh-2}
-  fill_rect(jrect,0)
-  for x=max(0,jrect[1]),min(127,jrect[3]) do
-   for y=max(0,jrect[2]),min(127,jrect[4]) do
-    set_floor(x, y, gen_floor_id)
-   end
-  end
-  -- tag as junction to skip perimeter wall texturing
-  local jnode=add_room(jrect,true)
-  
-  -- connect n1 to junction (horizontal)
-  local x0,x1=min(n1.midx,jx),max(n1.midx,jx)
-  local r1=n1.rect
-  local bx1_horiz,bx2_horiz
-  if r1[1]<=jx then
-   bx1_horiz=r1[3]+1
-   -- place door on the wall just outside the junction (left side)
-   bx2_horiz=jrect[1]-1
-  else
-   -- place door on the wall just outside the junction (right side)
-   bx1_horiz=jrect[3]+1
-   bx2_horiz=r1[1]-1
-  end
-  
-  -- place doors on horizontal segment boundaries with retry and fallback
-  if bx1_horiz>=0 and bx1_horiz<128 then
-   local door1_ok=place_boundary_door_with_retry(bx1_horiz,n1.midy,door_normal,3)
-   if not door1_ok then
-    printh("warning: failed to place junction door at ("..bx1_horiz..","..n1.midy.."), clearing as passage")
-    ensure_boundary_passage(bx1_horiz,n1.midy)
-   end
-  end
-  
-  if bx2_horiz>=0 and bx2_horiz<128 then
-   local door2_ok=place_boundary_door_with_retry(bx2_horiz,n1.midy,door_normal,3)
-   if not door2_ok then
-    printh("warning: failed to place junction door at ("..bx2_horiz..","..n1.midy.."), clearing as passage")
-    ensure_boundary_passage(bx2_horiz,n1.midy)
-   end
-  end
-  
-	-- carve horizontal segment
-  local xh_start=max(0,bx1_horiz+1)
-  local xh_end=min(127,bx2_horiz-1)
-  local hy=n1.midy
-  local hfloor_id=gen_floor_id
-  for x=xh_start,xh_end do
-				map.walls:set(x,hy,0)
-				set_floor(x,hy,hfloor_id)
-  end
-  
-  -- connect junction to n2 (vertical)
-  local y0,y1=min(jy,n2.midy),max(jy,n2.midy)
-  local r2=n2.rect
-  local by1_vert,by2_vert
-  if jy<=r2[2] then
-   -- place door on the wall just outside the junction (bottom side)
-   by1_vert=jrect[4]+1
-   by2_vert=r2[2]-1
-  else
-   by1_vert=r2[4]+1
-   -- place door on the wall just outside the junction (top side)
-   by2_vert=jrect[2]-1
-  end
-  
-  -- place doors on vertical segment boundaries with retry and fallback
-  if by1_vert>=0 and by1_vert<128 then
-   local door3_ok=place_boundary_door_with_retry(jx,by1_vert,door_normal,3)
-   if not door3_ok then
-    printh("warning: failed to place junction door at ("..jx..","..by1_vert.."), clearing as passage")
-    ensure_boundary_passage(jx,by1_vert)
-   end
-  end
-  
-  if by2_vert>=0 and by2_vert<128 then
-   local door4_ok=place_boundary_door_with_retry(jx,by2_vert,door_normal,3)
-   if not door4_ok then
-    printh("warning: failed to place junction door at ("..jx..","..by2_vert.."), clearing as passage")
-    ensure_boundary_passage(jx,by2_vert)
-   end
-  end
-  
-	-- carve vertical segment
-  local yv_start=max(0,by1_vert+1)
-  local yv_end=min(127,by2_vert-1)
-  local vx=jx
-  local vfloor_id=gen_floor_id
-  for y=yv_start,yv_end do
-				map.walls:set(vx,y,0)
-				set_floor(vx,y,vfloor_id)
-  end
-  
-  -- validation: ensure all boundary passages are clear
-  ensure_boundary_passage(bx1_horiz,n1.midy)
-  ensure_boundary_passage(bx2_horiz,n1.midy)
-  ensure_boundary_passage(jx,by1_vert)
-  ensure_boundary_passage(jx,by2_vert)
-
-		-- store boundary tiles near rooms
-		local near_n1
-		if r1[1]<=jx then
-			near_n1={x=bx1_horiz,y=n1.midy}
-		else
-			near_n1={x=bx2_horiz,y=n1.midy}
-		end
-		local near_n2
-		if jy<=r2[2] then
-			near_n2={x=jx,y=by2_vert}
-		else
-			near_n2={x=jx,y=by1_vert}
-		end
-		b1=near_n1
-		b2=near_n2
+local function verify_boundary_door(bx,by,dtype)
+ if not bx or not by then return end
+ dtype=dtype or door_normal
+ if bx<0 or bx>=map_size or by<0 or by>=map_size then return end
+ local tile=get_wall(bx,by)
+ if is_door(tile) then
+  protect_tile(bx,by)
+  return
  end
- 
- -- store boundary tiles for progression gating
-	local edge={n1=n1,n2=n2,b1=b1,b2=b2}
+ if tile==0 then
+  set_wall(bx,by,dtype)
+  create_door(bx,by,dtype)
+  protect_tile(bx,by)
+  if observability.log_repairs then
+   gen_log("door","repaired missing door at "..bx..","..by)
+  end
+ else
+  local ok=place_boundary_door_with_retry(bx,by,dtype,6)
+  if not ok then
+   ensure_boundary_passage(bx,by)
+  end
+ end
+end
+
+local function carve_horizontal_span(y,x_start,x_end,floor_id)
+ if not floor_id then floor_id=gen_floor_id end
+ if y<0 or y>=map_size then return end
+ local a=min(x_start,x_end)
+ local b=max(x_start,x_end)
+ a=max(0,a)
+ b=min(map_size-1,b)
+ for x=a,b do
+  set_wall(x,y,0)
+  set_floor(x,y,floor_id)
+ end
+end
+
+local function carve_vertical_span(x,y_start,y_end,floor_id)
+ if not floor_id then floor_id=gen_floor_id end
+ if x<0 or x>=map_size then return end
+ local a=min(y_start,y_end)
+ local b=max(y_start,y_end)
+ a=max(0,a)
+ b=min(map_size-1,b)
+ for y=a,b do
+  set_wall(x,y,0)
+  set_floor(x,y,floor_id)
+ end
+end
+
+local function create_horizontal_corridor(n1,n2,edge)
+ local left,right=n1,n2
+ if n1.midx>n2.midx then left,right=n2,n1 end
+ local r_left,r_right=left.rect,right.rect
+ local y_start=max(r_left[2],r_right[2])
+ local y_end=min(r_left[4],r_right[4])
+ local y
+ if y_start<=y_end then
+  y=flr((y_start+y_end)/2)
+ else
+  y=flr((n1.midy+n2.midy)/2)
+ end
+ local jog_offset=0
+ local jog_chance=(active_theme_rules and active_theme_rules.corridor_jog_chance) or adaptive_settings.corridor_jog_chance or 0.25
+ if rnd(1)<jog_chance then
+  local offset=(rnd(1)<0.5) and -1 or 1
+  local candidate=y+offset
+  if candidate>1 and candidate<map_size-2 then
+   y=candidate
+   jog_offset=offset
+  end
+ end
+ local bx_left=r_left[3]+1
+ local bx_right=r_right[1]-1
+ local success=true
+ if not place_boundary_door_with_retry(bx_left,y,door_normal,5) then
+  success=false
+  ensure_boundary_passage(bx_left,y)
+ end
+ if not place_boundary_door_with_retry(bx_right,y,door_normal,5) then
+  success=false
+  ensure_boundary_passage(bx_right,y)
+ end
+ carve_horizontal_span(y,bx_left+1,bx_right-1,gen_floor_id)
+ verify_boundary_door(bx_left,y,door_normal)
+ verify_boundary_door(bx_right,y,door_normal)
+ edge.b1={x=bx_left,y=y}
+ edge.b2={x=bx_right,y=y}
+ edge.shape=jog_offset~=0 and "jog" or "straight"
+ edge.metadata.corridor_y=y
+ edge.metadata.jog_offset=jog_offset
+ return success
+end
+
+local function create_vertical_corridor(n1,n2,edge)
+ local top,bottom=n1,n2
+ if n1.midy>n2.midy then top,bottom=n2,n1 end
+ local r_top,r_bottom=top.rect,bottom.rect
+ local x_start=max(r_top[1],r_bottom[1])
+ local x_end=min(r_top[3],r_bottom[3])
+ local x
+ if x_start<=x_end then
+  x=flr((x_start+x_end)/2)
+ else
+  x=flr((n1.midx+n2.midx)/2)
+ end
+ local jog_offset=0
+ local jog_chance=(active_theme_rules and active_theme_rules.corridor_jog_chance) or adaptive_settings.corridor_jog_chance or 0.25
+ if rnd(1)<jog_chance then
+  local offset=(rnd(1)<0.5) and -1 or 1
+  local candidate=x+offset
+  if candidate>1 and candidate<map_size-2 then
+   x=candidate
+   jog_offset=offset
+  end
+ end
+ local by_top=r_top[4]+1
+ local by_bottom=r_bottom[2]-1
+ local success=true
+ if not place_boundary_door_with_retry(x,by_top,door_normal,5) then
+  success=false
+  ensure_boundary_passage(x,by_top)
+ end
+ if not place_boundary_door_with_retry(x,by_bottom,door_normal,5) then
+  success=false
+  ensure_boundary_passage(x,by_bottom)
+ end
+ carve_vertical_span(x,by_top+1,by_bottom-1,gen_floor_id)
+ verify_boundary_door(x,by_top,door_normal)
+ verify_boundary_door(x,by_bottom,door_normal)
+ edge.b1={x=x,y=by_top}
+ edge.b2={x=x,y=by_bottom}
+ edge.shape=jog_offset~=0 and "jog" or "straight"
+ edge.metadata.corridor_x=x
+ edge.metadata.jog_offset=jog_offset
+ return success
+end
+
+local function create_l_shaped_corridor(n1,n2,edge)
+local orient_horizontal_first=rnd(1)<0.5
+local anchor_x=orient_horizontal_first and n2.midx or n1.midx
+local anchor_y=orient_horizontal_first and n1.midy or n2.midy
+local jrect
+local offsets={{0,0},{1,0},{-1,0},{0,1},{0,-1},{2,0},{-2,0},{0,2},{0,-2}}
+local attempt_limit=adaptive_settings.junction_retry_limit or 4
+for i=1,#offsets do
+ local off=offsets[i]
+ local cx=max(1,min(map_size-2,anchor_x+off[1]))
+ local cy=max(1,min(map_size-2,anchor_y+off[2]))
+ local candidate={cx-1,cy-1,cx+1,cy+1}
+ if not rect_conflicts(candidate,{n1,n2},0) then
+  jrect=candidate
+  anchor_x=cx
+  anchor_y=cy
+  break
+ end
+ if i>=attempt_limit then break end
+end
+ local success=true
+ if not jrect then
+  -- fallback: carve direct manhattan path without junction
+  orient_horizontal_first=true
+  anchor_x=n2.midx
+  anchor_y=n1.midy
+  jrect=nil
+  success=false
+  if observability.log_corridors then
+   gen_log("corridor","fallback L-shape without junction between rooms")
+  end
+ else
+  fill_rect(jrect,0)
+  for x=jrect[1],jrect[3] do
+   for y=jrect[2],jrect[4] do
+    set_floor(x,y,gen_floor_id)
+   end
+  end
+  local jnode=add_room(jrect,true)
+  edge.metadata.junction_node=jnode
+ end
+
+ local function connect_horizontal(from_node, target_x, y)
+  local rect=from_node.rect
+  local side=target_x>from_node.midx and 1 or -1
+  local boundary_from=(side==1) and rect[3]+1 or rect[1]-1
+  local boundary_to=side==1 and target_x-1 or target_x+1
+  local door_pos=boundary_from
+  if not place_boundary_door_with_retry(door_pos, y, door_normal,5) then
+   success=false
+   ensure_boundary_passage(door_pos,y)
+  end
+  carve_horizontal_span(y, boundary_from+side, boundary_to, gen_floor_id)
+  verify_boundary_door(door_pos,y,door_normal)
+  return {x=door_pos,y=y}
+ end
+
+ local function connect_vertical(from_node, x, target_y)
+  local rect=from_node.rect
+  local side=target_y>from_node.midy and 1 or -1
+  local boundary_from=(side==1) and rect[4]+1 or rect[2]-1
+  local boundary_to=side==1 and target_y-1 or target_y+1
+  local door_pos=boundary_from
+  if not place_boundary_door_with_retry(x,door_pos,door_normal,5) then
+   success=false
+   ensure_boundary_passage(x,door_pos)
+  end
+  carve_vertical_span(x, boundary_from+side, boundary_to, gen_floor_id)
+  verify_boundary_door(x,door_pos,door_normal)
+  return {x=x,y=door_pos}
+ end
+
+ local b1,b2
+ if orient_horizontal_first then
+  local horizontal_y=n1.midy
+  b1=connect_horizontal(n1, anchor_x, horizontal_y)
+  local vertical_x=jrect and anchor_x or b1.x+(anchor_x>b1.x and 1 or -1)
+  b2=connect_vertical(n2, vertical_x, anchor_y)
+ else
+  local vertical_x=n1.midx
+  b1=connect_vertical(n1, vertical_x, anchor_y)
+  local horizontal_y=jrect and anchor_y or b1.y+(anchor_y>b1.y and 1 or -1)
+  b2=connect_horizontal(n2, anchor_x, horizontal_y)
+ end
+
+ edge.b1=b1
+ edge.b2=b2
+ edge.shape="l_shape"
+ edge.metadata.anchor={x=anchor_x,y=anchor_y}
+ edge.metadata.orientation=orient_horizontal_first and "hv" or "vh"
+ return success
+end
+
+function create_corridor(n1,n2)
+ local edge={n1=n1,n2=n2,metadata={}}
+ local ctype=get_corridor_type(n1.rect,n2.rect)
+ local success=true
+ if ctype=="horiz" then
+  success=create_horizontal_corridor(n1,n2,edge)
+ elseif ctype=="vert" then
+  success=create_vertical_corridor(n1,n2,edge)
+ else
+  success=create_l_shaped_corridor(n1,n2,edge)
+ end
+ edge.success=success
  add(gen_edges,edge)
  add(n1.edges,n2)
  add(n2.edges,n1)
+ if observability.log_corridors then
+  local status=success and "ok" or "fallback"
+  gen_log("corridor","linked nodes "..n1.index.." <-> "..n2.index.." ("..ctype..","..status..")")
+ end
+ return success
 end
 
 -- helper: try to generate and connect a room
 function try_generate_room()
+ if #gen_nodes==0 then return false end
  local base=gen_nodes[flr(rnd(#gen_nodes))+1]
+ if not base then return false end
  local rect=random_room(base,false)
  
- if rect[1]<3 or rect[3]>126 or rect[2]<3 or rect[4]>126 then
+ if rect[1]<2 or rect[3]>map_size-3 or rect[2]<2 or rect[4]>map_size-3 then
+  register_room_failure("bounds")
   return false
  end
  
  if rect_overlaps(rect) then
+  register_room_failure("overlap")
   return false
  end
  
  local node=add_room(rect)
  fill_rect(rect,0)
- for x=max(0,rect[1]),min(127,rect[3]) do
-  for y=max(0,rect[2]),min(127,rect[4]) do
+ for x=max(0,rect[1]),min(map_size-1,rect[3]) do
+  for y=max(0,rect[2]),min(map_size-1,rect[4]) do
    set_floor(x, y, gen_floor_id)
   end
  end
- create_corridor(base,node)
+ local corridor_ok=create_corridor(base,node)
+ if not corridor_ok and observability.log_corridors then
+  gen_log("corridor","degenerate corridor between nodes "..base.index.." and "..node.index)
+ end
+ register_room_success()
  return true
 end
 
@@ -742,13 +1264,13 @@ function apply_room_walls(rect,tex)
   if rect[2]-1>=0 and rect[2]-1<128 and x>=0 and x<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(x,rect[2]-1) then
-			map.walls:set(x,rect[2]-1,tex)
+     set_wall(x,rect[2]-1,tex)
    end
   end
   if rect[4]+1>=0 and rect[4]+1<128 and x>=0 and x<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(x,rect[4]+1) then
-			map.walls:set(x,rect[4]+1,tex)
+     set_wall(x,rect[4]+1,tex)
    end
   end
  end
@@ -756,13 +1278,13 @@ function apply_room_walls(rect,tex)
   if rect[1]-1>=0 and rect[1]-1<128 and y>=0 and y<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(rect[1]-1,y) then
-			map.walls:set(rect[1]-1,y,tex)
+     set_wall(rect[1]-1,y,tex)
    end
   end
   if rect[3]+1>=0 and rect[3]+1<128 and y>=0 and y<128 then
    -- skip reserved cells (doors/exits in any layer)
 		if not is_reserved_boundary(rect[3]+1,y) then
-			map.walls:set(rect[3]+1,y,tex)
+     set_wall(rect[3]+1,y,tex)
    end
   end
  end
@@ -786,7 +1308,9 @@ function enforce_door_tiles()
       -- restore door tile from doorgrid or use default
       local correct_tile=doorgrid[x][y].tile or door_normal
       set_wall(x,y,correct_tile)
-      printh("warning: restored door tile at ("..x..","..y..")")
+      if observability.log_repairs then
+       gen_log("door","restored door tile at ("..x..","..y..")")
+      end
      end
     end
    end
@@ -801,13 +1325,13 @@ function enforce_border_ring()
   -- top edge
   local top_tile=get_wall(x,0)
   if not is_door(top_tile) and not is_exit(top_tile) then
-   map.walls:set(x,0,wall_fill_tile)
+  set_wall(x,0,wall_fill_tile)
   end
   
   -- bottom edge
   local bottom_tile=get_wall(x,map_size-1)
   if not is_door(bottom_tile) and not is_exit(bottom_tile) then
-   map.walls:set(x,map_size-1,wall_fill_tile)
+  set_wall(x,map_size-1,wall_fill_tile)
   end
  end
  
@@ -816,13 +1340,13 @@ function enforce_border_ring()
   -- left edge
   local left_tile=get_wall(0,y)
   if not is_door(left_tile) and not is_exit(left_tile) then
-   map.walls:set(0,y,wall_fill_tile)
+  set_wall(0,y,wall_fill_tile)
   end
   
   -- right edge
   local right_tile=get_wall(map_size-1,y)
   if not is_door(right_tile) and not is_exit(right_tile) then
-   map.walls:set(map_size-1,y,wall_fill_tile)
+  set_wall(map_size-1,y,wall_fill_tile)
   end
  end
 end
@@ -922,24 +1446,38 @@ end
 
 -- helper: erode map for organic feel (generalized for all wall types)
 function erode_map(amount)
- for i=1,amount do
-  local x,y=flr(rnd(128)),flr(rnd(128))
-		if is_wall(get_wall(x,y)) then
+ local intensity=(active_theme_rules and active_theme_rules.erosion_intensity) or 1
+ local target=flr(amount*intensity)
+ local removed=0
+ for i=1,target do
+  local x,y=flr(rnd(map_size)),flr(rnd(map_size))
+  if is_tile_protected(x,y) then goto continue end
+  if is_wall(get_wall(x,y)) then
    local neighbors=0
+   local near_protected=false
    for dx=-1,1 do
     for dy=-1,1 do
      local nx,ny=x+dx,y+dy
-					if nx>=0 and nx<128 and ny>=0 and ny<128 and get_wall(nx,ny)==0 then
-      neighbors+=1
+     if nx>=0 and nx<map_size and ny>=0 and ny<map_size then
+      if is_tile_protected(nx,ny) then
+       near_protected=true
+      end
+      if get_wall(nx,ny)==0 then
+       neighbors+=1
+      end
      end
     end
    end
-   if neighbors>=3 then
-				map.walls:set(x,y,0)
-    -- ensure eroded clears become traversable floor with theme-specific type
+   if not near_protected and neighbors>=3 then
+    set_wall(x,y,0)
     set_floor(x,y,gen_floor_id)
+    removed+=1
    end
   end
+ ::continue::
+ end
+ if observability.log_corridors and removed>target*0.7 then
+  gen_log("erosion","high erosion count "..removed.."/"..target)
  end
 end
 
@@ -967,7 +1505,7 @@ function generate_exit(rect,exit_type)
   local pos=walls[flr(rnd(#walls))+1]
   -- write exit tile to map
   local exit_tile=exit_type==3 and exit_start or exit_end
-  map.walls:set(pos[1],pos[2],(exit_tile or 0))
+  set_wall(pos[1],pos[2],exit_tile or 0)
   -- also add interactable exit object
   local ob={
    pos={pos[1]+0.5,pos[2]+0.5},
@@ -986,6 +1524,7 @@ end
 function generate_gameplay()
  -- guard against empty gen_nodes to avoid nil dereference
  if not gen_nodes or #gen_nodes==0 then
+  gen_log("error","generate_gameplay() called with no rooms")
   printh("error: generate_gameplay() called with no rooms")
   return
  end
@@ -1048,10 +1587,9 @@ function generate_progression_loop(start_node)
   add(combined_locked,edge)
   local test_accessible=find_accessible_rooms(start_node,combined_locked)
   
-		-- if locking this edge hides new rooms, add it as a gate
-		if #test_accessible<#full_accessible then
-			-- choose the actual corridor boundary door tile
-			local candidates={edge.b1,edge.b2}
+  -- if locking this edge hides new rooms, add it as a gate
+  if #test_accessible<#full_accessible then
+   local candidates={edge.b1,edge.b2}
    local chosen=nil
    for c in all(candidates) do
     if c and c.x and c.y then
@@ -1062,29 +1600,35 @@ function generate_progression_loop(start_node)
      end
     end
    end
-			if chosen then
-				local x,y=chosen.x,chosen.y
-				local door=doorgrid[x] and doorgrid[x][y] or nil
-				if door then
-					-- convert existing door to locked
-					map.walls:set(x,y,door_locked)
-					door.dtype=door_locked
-					door.keynum=key_counter
-				else
-					-- fallback: create a new locked door here
-					map.walls:set(x,y,door_locked)
-					create_door(x,y,door_locked,key_counter)
-				end
-				add(locked_edges,edge)
-     -- update cached accessibility after modifying locked edges
-     full_accessible=find_accessible_rooms(start_node,locked_edges)
-				-- add key to inventory
-				add(gen_inventory,{type="key",keynum=key_counter})
-				key_counter+=1
+   if chosen then
+    local x,y=chosen.x,chosen.y
+    local door=doorgrid[x] and doorgrid[x][y] or nil
+    if door then
+     set_wall(x,y,door_locked)
+     door.dtype=door_locked
+     door.keynum=key_counter
+     door.locked=true
+    else
+     set_wall(x,y,door_locked)
+     create_door(x,y,door_locked,key_counter)
+    end
+    protect_tile(x,y)
+    edge.locked=true
+    edge.keynum=key_counter
+    edge.lock_tile={x=x,y=y}
+    add(locked_edges,edge)
+    full_accessible=find_accessible_rooms(start_node,locked_edges)
+    add(gen_inventory,{type="key",keynum=key_counter})
+    if observability.log_progression then
+     gen_log("progression","locked edge "..n1.index.." <-> "..n2.index.." key#"..key_counter)
+    end
+    key_counter+=1
    else
-    printh("warning: no valid boundary door tile for gate; skipping")
-			end
-		end
+    if observability.log_progression then
+     gen_log("progression","edge "..n1.index.." <-> "..n2.index.." missing door; skipped")
+    end
+   end
+  end
  end
  
  -- place inventory items in accessible rooms
@@ -1101,8 +1645,8 @@ function generate_progression_loop(start_node)
    local x,y=find_spawn_point(room.rect)
    if x then
     failed_placements=0
-   if item.type=="key" then
-     local ob={pos={x,y},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
+    if item.type=="key" then
+     local ob={pos={x,y},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=room.index}
      add(gen_objects,ob)
     else
      local ob={pos={x,y},typ=obj_types[item.type],rel={0,0},frame=0,animloop=true,autoanim=true}
@@ -1118,7 +1662,7 @@ function generate_progression_loop(start_node)
       local rr=accessible[flr(rnd(#accessible))+1]
       local kx,ky=find_spawn_point(rr.rect)
       if kx then
-       local ob={pos={kx,ky},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
+       local ob={pos={kx,ky},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=rr.index}
        add(gen_objects,ob)
        placed=true
        break
@@ -1132,13 +1676,13 @@ function generate_progression_loop(start_node)
        sx=start_node.midx+0.5
        sy=start_node.midy+0.5
       end
-      local ob={pos={sx,sy},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum}
+      local ob={pos={sx,sy},typ=obj_types.key,rel={0,0},frame=0,animloop=true,autoanim=true,keynum=item.keynum,room_index=start_node.index}
       add(gen_objects,ob)
      end
     else
      failed_placements+=1
      if failed_placements>10 then
-      printh("warning: failed to place items after multiple attempts; stopping")
+      gen_log("items","failed to place items after multiple attempts; stopping")
       break
      end
     end
@@ -1147,6 +1691,9 @@ function generate_progression_loop(start_node)
    break
   end
  end
+
+validate_and_repair_progression(start_node,locked_edges)
+gen_locked_edges=locked_edges
 end
 
 -- generate npcs (hostile and non-hostile) in rooms
@@ -1402,9 +1949,17 @@ function generate_decorations()
 end
 
 -- generate a complete dungeon
-function generate_dungeon()
- local seed=flr(rnd(10000))
+function generate_dungeon(opts)
+ opts=opts or {}
+ local seed=opts.seed or flr(rnd(1000000))
  srand(seed)
+ gen_history={}
+ clear_protected()
+ reset_adaptive_spacing()
+ if gen_params.spacing==nil then gen_params.spacing=0 end
+ if observability.log_seed then
+  gen_log("seed","generation seed "..seed)
+ end
  
  -- initialize state
  gen_rects={}
@@ -1412,21 +1967,34 @@ function generate_dungeon()
  gen_edges={}
  gen_inventory={}
  gen_objects={}
+ doors={}
+ animated_objects={}
+ -- clear doorgrid
+ for x=0,map_size-1 do
+  if doorgrid[x] then
+   for y=0,map_size-1 do
+    doorgrid[x][y]=nil
+   end
+  end
+ end
  
  -- fill with walls (non-zero tile)
- fill_rect({0,0,127,127},wall_fill_tile)
+ fill_rect({0,0,map_size-1,map_size-1},wall_fill_tile)
  
  -- assign global theme before carving (ensures theme floor id is available)
- local theme_roll=rnd(1)
- local selected_theme="dng"
- if theme_roll<0.7 then
-  selected_theme="dng"
- elseif theme_roll<0.9 then
-  selected_theme="out"
- else
-  selected_theme="dem"
+ local selected_theme=opts.theme or "dng"
+ if not opts.theme then
+  local theme_roll=rnd(1)
+  if theme_roll<0.7 then
+   selected_theme="dng"
+  elseif theme_roll<0.9 then
+   selected_theme="out"
+  else
+   selected_theme="dem"
+  end
  end
  gen_params.theme=selected_theme
+ ensure_theme_rules(selected_theme)
  local theme_config=themes[selected_theme] or themes.dng
  
  -- set floor and ceiling types based on theme
@@ -1450,26 +2018,30 @@ function generate_dungeon()
  local first_rect=random_room(nil,false)
  local first_node=add_room(first_rect)
  fill_rect(first_rect,0)
- for x=max(0,first_rect[1]),min(127,first_rect[3]) do
-  for y=max(0,first_rect[2]),min(127,first_rect[4]) do
+ for x=max(0,first_rect[1]),min(map_size-1,first_rect[3]) do
+  for y=max(0,first_rect[2]),min(map_size-1,first_rect[4]) do
    set_floor(x, y, gen_floor_id)
   end
  end
+ register_room_success()
  
  -- generate additional rooms
- local room_count=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
- for i=2,room_count do
+ local target_rooms=flr(rnd(gen_params.max_rooms-gen_params.min_rooms+1))+gen_params.min_rooms
+ for i=2,target_rooms do
+  local placed=false
   for attempt=1,max_room_attempts do
    if try_generate_room() then
+    placed=true
     break
    end
   end
+  if not placed and observability.log_room_attempts then
+   gen_log("room","failed to place room "..i.." after "..max_room_attempts.." attempts")
+  end
  end
  
- -- theme already chosen and floors configured above
  -- apply wall textures based on theme
  for node in all(gen_nodes) do
-  -- skip junction rooms to avoid texturing their perimeters
   if not node.is_junction then
    local texset=theme_wall_texture(selected_theme)
    local tex=texset.variants[flr(rnd(#texset.variants))+1]
@@ -1489,7 +2061,9 @@ function generate_dungeon()
  enforce_border_ring()
  -- re-assert door tiles after border enforcement
  enforce_door_tiles()
- printh("Border ring enforced, doors preserved")
+ if observability.enable_console then
+  gen_log("summary","border ring enforced")
+ end
  
  -- export objects to global arrays (flat iteration, no spatial grid)
  objects=gen_objects
@@ -1506,10 +2080,13 @@ function generate_dungeon()
  player.x=first_node.midx+0.5
  player.y=first_node.midy+0.5
  
- printh("generated dungeon: "..#gen_nodes.." rooms, "..#gen_objects.." objects, seed "..seed)
+ if observability.enable_console then
+  gen_log("summary","rooms="..#gen_nodes.." objects="..#gen_objects)
+ end
  
- return {x=player.x,y=player.y},{rooms=#gen_nodes,objects=#gen_objects,seed=seed}
+ return {x=player.x,y=player.y},{rooms=#gen_nodes,objects=#gen_objects,seed=seed,history=gen_history}
 end
+
 
 :: src/raycast.lua
 --[[pod_format="raw",created="2025-11-07 21:17:12",modified="2025-11-07 21:48:07",revision=1]]
@@ -1760,6 +2337,8 @@ function raycast_scene()
   ray_z:set(i, z)
   rbuf_tile:set(i, tile)
   rbuf_tx:set(i, tx)
+  ray_hitx:set(i, hx)
+  ray_hity:set(i, hy)
   
   maxz=max(maxz,z)
  end
@@ -1798,6 +2377,16 @@ function hitscan(x,y,dx,dy)
 end
 
 :: src/render.lua
+ local function clamped_blit(src_row,dst_row)
+  if dst_row>y1 then return end
+  local dst_y=screen_center_y+dst_row
+  if dst_y<0 or dst_y>=screen_height then return end
+  local src_y=screen_center_y+src_row
+  if src_y<0 or src_y>=screen_height then return end
+  blit(get_draw_target(),get_draw_target(),0,src_y,0,dst_y,screen_width,1)
+  diag_floor_rows+=1
+  diag_floor_batches+=1
+ end
 --[[pod_format="raw",created="2025-11-07 21:17:11",modified="2025-11-07 21:48:08",revision=1]]
 -- rendering pipeline
 
@@ -1989,20 +2578,6 @@ local merged_x1=userdata("i16", RUN_CAP)
 local merged_id=userdata("i16", RUN_CAP)
 
 -- Precomputed wall y-ranges for merged rendering (avoid per-scanline recalculation)
-local wall_y0 = {}   -- Top y-coordinate for each ray's wall
-local wall_y1 = {}   -- Bottom y-coordinate for each ray's wall
-local wall_valid = {} -- Boolean: true if ray hit a wall (z<999)
--- Cached per-ray wall draw data to minimize inner-loop work
-local wall_tile = {}
-local wall_tx = {}
-local wall_u0 = {}
-local wall_u1 = {}
-local wall_spr_idx = {}
-local wall_tdy0 = {}
-local wall_tdy1 = {}
-local wall_tiny = {}
-local wall_z = {}
-
 -- render perspective floor/ceiling and walls (flat shading, fog removed)
 function render_floor_ceiling()
  palt(0,false)
@@ -2010,53 +2585,7 @@ function render_floor_ceiling()
  local fwdx=(ca_cached or cos(player.a))
  local fwdy=(sa_cached or sin(player.a))
  local tex_size=sprite_size or 32
- 
- -- Precompute wall y-ranges for all rays (used during scanline iteration)
  local _rc = active_ray_count or ray_count
- for ray_idx=0,_rc-1 do
-  local z=ray_z:get(ray_idx)
-  if z<999 then
-   -- Calculate wall height and y-range
-   local h=sdist/z
-   local y0 = screen_center_y-h/2
-   local y1 = screen_center_y+h/2
-   wall_y0[ray_idx]=y0
-   wall_y1[ray_idx]=y1
-   wall_z[ray_idx]=z
-   -- screen-space tiny wall threshold (use LOD when very short)
-   local tdy0=ceil(y0)
-   local tdy1=min(flr(y1),screen_height-1)
-   wall_tdy0[ray_idx]=tdy0
-   wall_tdy1[ray_idx]=tdy1
-   wall_tiny[ray_idx]=(tdy1 - tdy0) < (wall_tiny_screen_px or 4)
-   -- cache texture info
-   local tile=rbuf_tile:get(ray_idx)
-   local tx=rbuf_tx:get(ray_idx)
-   wall_tile[ray_idx]=tile
-   wall_tx[ray_idx]=tx
-  -- compute base u coordinate and possible interpolation with next ray
-  local u0=tx*tex_size
-  u0=max(0,min(tex_size-0.001,u0))
-   local u1=u0
-   if ray_idx<_rc-1 then
-    local tile_next=rbuf_tile:get(ray_idx+1)
-    if tile_next==tile then
-     local tx_next=rbuf_tx:get(ray_idx+1)
-    local u1_next=tx_next*tex_size
-    u1_next=max(0,min(tex_size-0.001,u1_next))
-     u1=u1_next
-    end
-   end
-   wall_u0[ray_idx]=u0
-   wall_u1[ray_idx]=u1
-   -- resolve sprite once
-   local spr_idx=resolve_sprite_index(tile, (is_door and is_door(tile)) and "door" or "wall")
-   wall_spr_idx[ray_idx]=spr_idx
-   wall_valid[ray_idx]=true
-  else
-   wall_valid[ray_idx]=false
-  end
- end
  
  -- Draw ceiling and floor first so walls overlay them
  batch_reset()
@@ -2074,83 +2603,165 @@ function render_floor_ceiling()
  -- Render walls per-ray in a single vertical pass (drawn after floors)
  rbatch_reset()
  batch_reset()
- local any_rect=false
- for ray_idx=0,_rc-1 do
-  if wall_valid[ray_idx] then
-   -- read cached values
-   local z=wall_z[ray_idx]
-   local x0=ray_x0:get(ray_idx)
-   local x1=ray_x1:get(ray_idx)
-   if x0<=x1 then
-    local tdy0=wall_tdy0[ray_idx]
-    local tdy1=wall_tdy1[ray_idx]
-    local tile=wall_tile[ray_idx]
-    -- LOD or tiny: solid fill via rect batch
-    if z>wall_lod_distance or wall_tiny[ray_idx] then
-     local avg_color=avg_color_cache[tile]
-     if not avg_color then
-      local cached=tex_cache[tile]
-      local src,is_fallback
-      if cached then
-       src,is_fallback=cached.src,cached.is_fallback
-      else
-       local obj_type=is_door and is_door(tile) and "door" or "wall"
-       src,is_fallback=get_texture_source(tile,obj_type)
-       cache_tex(tile, src, is_fallback)
-      end
-      avg_color=5
-      if src and src.get then
-       avg_color=src:get(16,16) or 5
-      end
-      cache_avg(tile, avg_color)
-     end
-     rbatch_push(x0, tdy0, x1, tdy1, avg_color)
-     any_rect=true
-     -- write zbuf for span
-     for x=x0,x1 do
-      if zwrite then zwrite(x,z) else zbuf:set(x,z) end
-     end
+ local span_start=nil
+ local span_tile=nil
+ local span_spr=nil
+ local span_avg=nil
+ local span_tx0=nil
+ local span_tx1=nil
+ local span_hitx0=nil
+ local span_hity0=nil
+ local span_hitx1=nil
+ local span_hity1=nil
+ local function flush_span(span_end)
+  if not span_start then return end
+  local x0=ray_x0:get(span_start)
+  local x1=ray_x1:get(span_end)
+  if x0>x1 then span_start=nil return end
+  local spr_idx=span_spr
+  local avg_color=span_avg
+  local hx0=span_hitx0
+  local hy0=span_hity0
+  local hx1=span_hitx1
+  local hy1=span_hity1
+  local tx0=span_tx0
+  local tx1=span_tx1
+  local span_width=x1-x0
+  local base_z=nil
+  local base_tdy0=nil
+  local base_tdy1=nil
+  local first_wall=false
+  if span_width<=0 then
+   span_width=0
+   local rel_x=hx0-player.x
+   local rel_y=hy0-player.y
+   base_z=rel_x*fwdx+rel_y*fwdy
+   if base_z<=0.0001 then base_z=0.0001 end
+   local h=sdist/base_z
+   local y0=screen_center_y-h/2
+   local y1=screen_center_y+h/2
+   base_tdy0=ceil(y0)
+   base_tdy1=min(flr(y1),screen_height-1)
+   if base_tdy0<=base_tdy1 then
+    local wall_height=base_tdy1-base_tdy0
+    if base_z>wall_lod_distance or wall_height<wall_tiny_screen_px then
+     rbatch_push(x0, base_tdy0, x1, base_tdy1, avg_color)
+     diag_wall_lod_columns+=x1-x0+1
     else
-     -- textured vertical columns
-     local u0=wall_u0[ray_idx]
-     local u1=wall_u1[ray_idx]
-     local spr_idx=wall_spr_idx[ray_idx]
-     local y0=wall_y0[ray_idx]
-     local y1=wall_y1[ray_idx]
-     -- compute v0/v1 mapped across clipped span
-     local full_h=y1-y0
+     local u0=tx0*tex_size
      local v0=0
-     local v1=tex_size
-     if full_h>0 and tdy0<y1 then
-      v0+=((tdy0-y0)/full_h)*tex_size
-      v1=v0+tex_size
+     local full_h=y1-y0
+     if full_h>0 and base_tdy0<y1 then
+      v0=((base_tdy0-y0)/full_h)*tex_size
      end
-     local span_w=max(1,(x1-x0))
-     local delta_u=u1-u0
-     if delta_u>tex_size*0.5 or delta_u < -tex_size*0.5 then
-      delta_u=0
-      u1=u0
-     end
-     local du=delta_u/span_w
-     local u_interp=u0
-     -- Hardcode flags=0 for consistent fast path (Picotron guideline: minimize tline3d overhead)
-     local flags=0
-     for x=x0,x1 do
-      u_interp=max(0,min(tex_size-0.001,u_interp))
-      batch_push(spr_idx, x, tdy0, x, tdy1, u_interp, v0, u_interp, v1, 1, 1, flags)
-      if zwrite then zwrite(x, z) else zbuf:set(x,z) end
-      u_interp+=du
-     end
+     local w0=1/base_z
+     batch_push(spr_idx,x0,base_tdy0,x1,base_tdy1,u0,v0,u0,v0+tex_size,w0,w0,0)
+     diag_wall_columns+=x1-x0+1
     end
+    if zwrite then zwrite(x0,base_z) else zbuf:set(x0,base_z) end
    end
+   span_start=nil
+   return
+  end
+  local rel_x0=hx0-player.x
+  local rel_y0=hy0-player.y
+  local z0=rel_x0*fwdx+rel_y0*fwdy
+  if z0<=0.0001 then z0=0.0001 end
+  local h0=sdist/z0
+  local base_y0=screen_center_y-h0/2
+  local base_y1=screen_center_y+h0/2
+  local tdy0=ceil(base_y0)
+  local tdy1=min(flr(base_y1),screen_height-1)
+  if tdy0>tdy1 then
+   span_start=nil
+   return
+  end
+  local rel_x1=hx1-player.x
+  local rel_y1=hy1-player.y
+  local z1=rel_x1*fwdx+rel_y1*fwdy
+  if z1<=0.0001 then z1=0.0001 end
+  local h1=sdist/z1
+  local y1_top=screen_center_y-h1/2
+  local y1_bot=screen_center_y+h1/2
+  local tdy1_alt=ceil(y1_top)
+  local tdy1_bot=min(flr(y1_bot),screen_height-1)
+  tdy0=min(tdy0,tdy1_alt)
+  tdy1=max(tdy1,tdy1_bot)
+  tdy0=max(tdy0,0)
+  tdy1=min(tdy1,screen_height-1)
+  if tdy0>tdy1 then
+   span_start=nil
+   return
+  end
+  local wall_height=tdy1-tdy0
+  local column_count=x1-x0+1
+  if z0>wall_lod_distance and z1>wall_lod_distance then
+   rbatch_push(x0, tdy0, x1, tdy1, avg_color)
+   diag_wall_lod_columns+=column_count
+  else
+   local u0=tx0*tex_size
+   local u1=tx1*tex_size
+   local v0=((tdy0-base_y0)/(base_y1-base_y0))*tex_size
+   if base_y1-base_y0<=0 then v0=0 end
+   if v0<0 then v0=0 elseif v0>tex_size then v0=tex_size end
+   local v1=v0+tex_size
+   batch_push(spr_idx, x0, tdy0, x1, tdy1, u0, v0, u1, v1, 1/z0, 1/z1, 0)
+   diag_wall_columns+=column_count
+  end
+  for col=x0,x1 do
+   local t=(span_width>0) and ((col-x0)/span_width) or 0
+   local world_x=hx0+(hx1-hx0)*t
+   local world_y=hy0+(hy1-hy0)*t
+   local rel_x=world_x-player.x
+   local rel_y=world_y-player.y
+   local z=rel_x*fwdx+rel_y*fwdy
+   if z<=0.0001 then z=0.0001 end
+   if zwrite then zwrite(col,z) else zbuf:set(col,z) end
+  end
+  span_start=nil
+ end
+ for ray_idx=0,_rc-1 do
+  local tile=rbuf_tile:get(ray_idx)
+  if tile and tile>0 then
+   if span_start and tile==span_tile then
+    span_tx1=rbuf_tx:get(ray_idx)
+    span_hitx1=ray_hitx:get(ray_idx)
+    span_hity1=ray_hity:get(ray_idx)
+   else
+    if span_start then flush_span(ray_idx-1) end
+    span_start=ray_idx
+    span_tile=tile
+    span_spr=resolve_sprite_index(tile,(is_door and is_door(tile)) and "door" or "wall")
+    local avg=avg_color_cache[tile]
+    if not avg then
+     local cached=tex_cache[tile]
+     local src,is_fallback
+     if cached then
+      src,is_fallback=cached.src,cached.is_fallback
+     else
+      local obj_type=is_door and is_door(tile) and "door" or "wall"
+      src,is_fallback=get_texture_source(tile,obj_type)
+      cache_tex(tile, src, is_fallback)
+     end
+     avg=5
+     if src and src.get then
+      avg=src:get(16,16) or 5
+     end
+     cache_avg(tile, avg)
+    end
+    span_avg=avg
+    span_tx0=rbuf_tx:get(ray_idx)
+    span_tx1=span_tx0
+    span_hitx0=ray_hitx:get(ray_idx)
+    span_hity0=ray_hity:get(ray_idx)
+    span_hitx1=span_hitx0
+    span_hity1=span_hity0
+   end
+  else
+   if span_start then flush_span(ray_idx-1) end
   end
  end
- if any_rect then
-  -- apply dithering pattern and submit
-  fillp(0x55aa55aa)
-  rbatch_submit()
-  fillp()
- end
+ if span_start then flush_span(_rc-1) end
  batch_submit()
  
  palt()
@@ -2159,38 +2770,21 @@ end
 -- draw horizontal scanlines with 32x32 sprite sampling and optional wall rendering (flat shading)
 function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
  local size=sprite_size or 32
- 
- for y=y0,y1 do
-  -- calculate ray gradient using half-pixel offset (avoid horizon singularity)
-  local y_offset
-  if y>=0 then
-   y_offset=y+0.5
-  else
-   y_offset=abs(y-0.5)
-  end
+ local function draw_single_row(row)
+  diag_floor_rows+=1
+  local y=row
+  local y_offset=y>=0 and (y+0.5) or abs(y-0.5)
   local g=y_offset/sdist
   if g<0.0001 then g=0.0001 end
-  
-  -- calculate z distance
   local z=(height or 0.5)/g
-  
-  -- calculate map coordinates
   local mx=(cx+z*sa)/tilesize
   local my=(cy+z*ca)/tilesize
-  
-  -- calculate texture deltas
   local s=sdist/z*tilesize
   local mdx=-ca/s
   local mdy=sa/s
-  
-  -- offset to left edge
   mx-=screen_center_x*mdx
   my-=screen_center_x*mdy
-  
- -- diagnostics removed for production
-  
   if per_cell_floors_enabled then
-   -- per-cell floor type rendering using preallocated buffers (no per-frame table allocs)
    local sample_interval=12
    local rcount=0
    local cur_id=-1
@@ -2221,7 +2815,6 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
     runs_id:set(rcount, cur_id)
     rcount+=1
    end
-   -- merge short runs into previous using preallocated buffers
    local mcount=0
    for i=0,rcount-1 do
     local x0i=runs_x0:get(i)
@@ -2240,7 +2833,6 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
      end
     end
    end
-   -- draw all merged runs with batching
    for i=0,mcount-1 do
     local rx0=merged_x0:get(i)
     local rx1=merged_x1:get(i)
@@ -2257,18 +2849,55 @@ function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
     local u1=u0+(rx1-rx0)*mdx*size
     local v1=v0+(rx1-rx0)*mdy*size
     batch_push(idx, rx0, screen_center_y+y, rx1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
+    diag_floor_batches+=1
    end
   else
-   -- simplified rendering: draw full scanline with single texture
    local idx=resolve_sprite_index(tex,"floor")
    local u0=(mx)%1*size
    local v0=(my)%1*size
-  u0=max(0,min(size-0.001,u0))
-  v0=max(0,min(size-0.001,v0))
+   u0=max(0,min(size-0.001,u0))
+   v0=max(0,min(size-0.001,v0))
    local u1=u0+(screen_width-1)*mdx*size
    local v1=v0+(screen_width-1)*mdy*size
    batch_push(idx, 0, screen_center_y+y, screen_width-1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
+   diag_floor_batches+=1
   end
+ end
+ local function duplicate_rows(src_row, count)
+  if count<=0 then return end
+  local y0=screen_center_y+src_row+1
+  local y1=y0+count-1
+  if y0>screen_center_y+y1 then return end
+  y1=min(y1,screen_center_y+y1)
+  if y0>screen_height-1 then return end
+ end
+ local function blit_rows(src_row,rep_count)
+  if rep_count<=0 then return end
+  for k=1,rep_count do
+   local row=src_row+k
+  if row>y1 then break end
+   diag_floor_rows+=1
+   diag_floor_batches+=1
+   blit(get_draw_target(),get_draw_target(),0,screen_center_y+src_row,0,screen_center_y+row,screen_width,1)
+  end
+ end
+ local near_end = min(y1, -16)
+ local mid_end = min(y1, 32)
+ for y=y0, near_end do
+  draw_single_row(y)
+ end
+ local y=near_end+1
+ while y<=mid_end do
+  draw_single_row(y)
+ clamped_blit(y,y+1)
+  y+=2
+ end
+ while y<=y1 do
+  draw_single_row(y)
+ clamped_blit(y,y+1)
+ clamped_blit(y,y+2)
+ clamped_blit(y,y+3)
+  y+=4
  end
 end
 
@@ -2517,6 +3146,7 @@ function drawobj_single(ob, sa, ca)
     end
    end
    rbatch_submit()
+   diag_sprite_impostor_columns+=max(0,x1-x0+1)
    end
    
    return
@@ -2608,6 +3238,7 @@ function drawobj_single(ob, sa, ca)
     elseif zbuf.set then
      zbuf:set(px, z)
     end
+   diag_sprite_columns+=1
    end
   end
   sbatch_submit()
@@ -2618,6 +3249,76 @@ function drawobj_single(ob, sa, ca)
   end
 end
 
+:: tests/dungeon_harness.lua
+-- deterministic dungeon generation harness
+local harness={}
+
+harness.default_seeds={1111,2222,3333,4444,5555}
+
+local function validate_locked_edges(issues)
+ if not gen_locked_edges then return end
+ for edge in all(gen_locked_edges) do
+  if edge.locked and edge.keynum then
+   local lt=edge.lock_tile
+   if not lt then
+    add(issues,"edge "..edge.n1.index.."->"..edge.n2.index.." missing lock tile")
+   else
+    local tile=get_wall(lt.x,lt.y)
+    if tile~=door_locked then
+     add(issues,"door at "..lt.x..","..lt.y.." not locked")
+    end
+   end
+   local key_found=false
+   for ob in all(gen_objects) do
+    if ob.typ==obj_types.key and ob.keynum==edge.keynum then
+     key_found=true
+     break
+    end
+   end
+   if not key_found then
+    add(issues,"missing key#"..edge.keynum.." for edge "..edge.n1.index.."->"..edge.n2.index)
+   end
+  end
+ end
+end
+
+function harness.run(seeds)
+ seeds=seeds or harness.default_seeds
+ local summary={
+  total=#seeds,
+  failures=0,
+  results={}
+ }
+ local original_seed=nil
+ for _,seed in ipairs(seeds) do
+  local ok,meta=pcall(function()
+   local _,stats=generate_dungeon({seed=seed})
+   return stats
+  end)
+  local record={seed=seed,issues={},rooms=0,objects=0}
+  if not ok then
+   record.error=meta
+   summary.failures+=1
+  else
+   record.rooms=meta.rooms or 0
+   record.objects=meta.objects or 0
+   if record.rooms<(gen_params.min_rooms or 0) then
+    add(record.issues,"room count "..record.rooms.." below min "..gen_params.min_rooms)
+   end
+   validate_locked_edges(record.issues)
+   if #record.issues>0 then
+    summary.failures+=1
+   end
+  end
+  add(summary.results,record)
+ end
+ return summary
+end
+
+dungeon_harness=harness
+return harness
+
+
 :: .info.pod
 --[[pod,created="2025-11-07 22:14:20",modified="2025-11-10 12:35:37",runtime=21,workspaces={{location="main.lua#828",workspace_index=1}}]]
 :: main.lua
@@ -2626,91 +3327,110 @@ aWZpZWQ9IjIwMjUtMTEtMDcgMjI6MTg6NTEiLHJldmlzaW9uPTVdXQotLSBub25ib3kgcmF5Y2Fz
 dCBlbmdpbmUgdjEuMAotLSBtYWluIGVudHJ5IHBvaW50CgppbmNsdWRlInNyYy9jb25maWcubHVh
 IgppbmNsdWRlInNyYy9yYXljYXN0Lmx1YSIKaW5jbHVkZSJzcmMvcmVuZGVyLmx1YSIKaW5jbHVk
 ZSJzcmMvcmVuZGVyX3Nwcml0ZS5sdWEiCmluY2x1ZGUic3JjL2Rvb3Jfc3lzdGVtLmx1YSIKaW5j
-bHVkZSJzcmMvZHVuZ2Vvbl9nZW4ubHVhIgoKLS0gY29uc3RhbnRzCnBsYXllcl9jb2xsaXNpb25f
-cmFkaXVzPTAuMTUKCmZ1bmN0aW9uIF9pbml0KCkKIHdpbmRvdyhzY3JlZW5fd2lkdGgsc2NyZWVu
-X2hlaWdodCkKIAogLS0gcGluIG1hc2tzIHRvIGRlZmF1bHRzIGZvciBzaW5nbGUgY29sb3VyLXRh
-YmxlIGZhc3QgcGF0aAogcG9rZSgweDU1MDgsMHgzZikgcG9rZSgweDU1MDksMHgzZikgcG9rZSgw
-eDU1MGEsMHgzZikgcG9rZSgweDU1MGIsMHgwMCkKIAogLS0gdGlsZSAwIGRyYXdpbmcgc3RhdGU6
-IHZlcmlmaWVkIG5vdCByZXF1aXJlZDsgbGVhdmUgMHg1ZjM2IGF0IGRlZmF1bHQgKG5vIGV4cGxp
-Y2l0IHBva2UpCiAtLSBzc3ByKCkgdXNhZ2UgdmVyaWZpZWQ6IE5vbmUgaW4gcHJvZHVjdGlvbiBj
-b2RlIChvbmx5IGluIHNhbXBsZSBmaWxlcykKIC0tIFBlciBQaWNvdHJvbiBndWlkZWxpbmVzOiBi
-bGl0KCkgaXMgZmFzdGVyOyBIVUQvbWluaW1hcCB1c2UgZGlyZWN0IGRyYXdpbmcKIC0tIGNvbmZp
-Z3VyYXRpb24gZ3VhcmQ6IHByZXZlbnQgZm9nIHBvcHBpbmcgYmV5b25kIGZhci1wbGFuZQogYXNz
-ZXJ0KGZhcl9wbGFuZT49Zm9nX2ZhcisxLCJjb25maWcgZXJyb3I6IGZhcl9wbGFuZSBtdXN0IGJl
-ID49IGZvZ19mYXIgKyAxIikKIAogLS0gZGVmZW5zaXZlIGRlZmF1bHRzIGlmIGNvbmZpZyBpbmNs
-dWRlIGZhaWxlZCB0byBzZXQgdGhlbSBmb3IgYW55IHJlYXNvbgogaWYgbm90IG9iamdyaWRfc2l6
-ZSB0aGVuIG9iamdyaWRfc2l6ZT01IGVuZAogaWYgbm90IG9iamdyaWRfYXJyYXlfc2l6ZSB0aGVu
-IG9iamdyaWRfYXJyYXlfc2l6ZT0yNiBlbmQKIAogLS0gZnJhbWUgY291bnRlciBmb3IgYWkgdGlt
-aW5nCiBmcmFtZV9jdD0wCiAKIC0tIHBsYXllciBzdGF0ZQogcGxheWVyPXsKICB4PTY0LHk9NjQs
-CiAgYT0wLAogIHNwZD1wbGF5ZXJfbW92ZV9zcGVlZCwKICBrZXlzPXt9LAogIGhwPTEwMAogfQog
-CiAtLSBpbnRlcmFjdGlvbiBzdGF0ZQogaW50ZXJhY3Rpb25fYWN0aXZlPWZhbHNlCiBjdXJyZW50
-X2ludGVyYWN0PW5pbAogCiAtLSBjb21iYXQgc3RhdGUKIGluX2NvbWJhdD1mYWxzZQogY3VycmVu
-dF90YXJnZXQ9bmlsCiAKIC0tIHRyYXAgbWVzc2FnZSB0aW1lcgogdHJhcF9tc2dfdGltZXI9MAog
-CiAtLSBjYW1lcmEKIGNhbT17cGxheWVyLngscGxheWVyLnl9CiAKIC0tIG1hcCBhYnN0cmFjdGlv
-biB3aXRoIHVzZXJkYXRhIGxheWVycwogbWFwPXt9CiBtYXAud2FsbHM9dXNlcmRhdGEoImkxNiIs
-MTI4LDEyOCkKIG1hcC5kb29ycz11c2VyZGF0YSgiaTE2IiwxMjgsMTI4KQogbWFwLmZsb29ycz11
-c2VyZGF0YSgiaTE2IiwxMjgsMTI4KQogCiAtLSBoZWxwZXI6IGdldCB3YWxsIHRpbGUKLS0gUHVy
-cG9zZTogUmV0cmlldmUgd2FsbCB0aWxlIElEIGF0IGdyaWQgcG9zaXRpb24KIC0tIFBhcmFtZXRl
-cnM6IHgsIHkgKGdyaWQgY29vcmRpbmF0ZXMgMC0xMjcpCiAtLSBSZXR1cm5zOiB0aWxlIElEICgw
-PWVtcHR5LCA_MD13YWxsL2Rvb3IvZXhpdCkKIGZ1bmN0aW9uIGdldF93YWxsKHgseSkKIGlmIHg_
-PTAgYW5kIHg8MTI4IGFuZCB5Pj0wIGFuZCB5PDEyOCB0aGVuCiAgcmV0dXJuIG1hcC53YWxsczpn
-ZXQoeCx5KSBvciAwCiBlbmQKIHJldHVybiAwCiBlbmQKIAogLS0gaGVscGVyOiBzZXQgd2FsbCB0
-aWxlCiBmdW5jdGlvbiBzZXRfd2FsbCh4LHksdmFsKQogIGlmIHg_PTAgYW5kIHg8MTI4IGFuZCB5
-Pj0wIGFuZCB5PDEyOCB0aGVuCgkJbWFwLndhbGxzOnNldCh4LHksdmFsIG9yIDApCiAgZW5kCiBl
-bmQKIAogLS0gaGVscGVyOiBnZXQgZG9vciB0aWxlCiBmdW5jdGlvbiBnZXRfZG9vcih4LHkpCiAg
-aWYgeD49MCBhbmQgeDwxMjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KICAgcmV0dXJuIG1hcC5k
-b29yczpnZXQoeCx5KSBvciAwCiAgZW5kCiAgcmV0dXJuIDAKIGVuZAogCiAtLSBoZWxwZXI6IHNl
-dCBkb29yIHRpbGUKIGZ1bmN0aW9uIHNldF9kb29yKHgseSx2YWwpCiAgaWYgeD49MCBhbmQgeDwx
-MjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KICAgbWFwLmRvb3JzOnNldCh4LHksdmFsIG9yIDAp
-CiAgZW5kCiBlbmQKCiAtLSBoZWxwZXI6IGdldCBmbG9vciB0aWxlCiAtLSBQdXJwb3NlOiBSZXRy
-aWV2ZSBmbG9vciB0eXBlIElEIGF0IGdyaWQgcG9zaXRpb24KIC0tIFBhcmFtZXRlcnM6IHgsIHkg
-KGdyaWQgY29vcmRpbmF0ZXMgMC0xMjcpCiAtLSBSZXR1cm5zOiBmbG9vciB0eXBlIElEICgwPXVz
-ZSBnbG9iYWwgZGVmYXVsdCwgMS04PXNwZWNpZmljIGZsb29yIHR5cGUgZnJvbSBwbGFuZXR5cHMp
-CiAtLSBOb3RlczogRmxvb3IgdHlwZSBJRHMgbWFwIHRvIGluZGljZXMgaW4gdGhlIHBsYW5ldHlw
-cyB0YWJsZSBkZWZpbmVkIGluIGNvbmZpZy5sdWEKIGZ1bmN0aW9uIGdldF9mbG9vcih4LHkpCiAg
-aWYgeD49MCBhbmQgeDwxMjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KICAgcmV0dXJuIG1hcC5m
-bG9vcnM6Z2V0KHgseSkgb3IgMAogIGVuZAogIHJldHVybiAwCiBlbmQKCiAtLSBoZWxwZXI6IHNl
-dCBmbG9vciB0aWxlCiAtLSBQdXJwb3NlOiBTdG9yZSBwZXItY2VsbCBmbG9vciB0eXBlIElEcyBm
-b3IgdmFyaWVkIGZsb29yIHRleHR1cmVzCiAtLSBQYXJhbWV0ZXJzOiB4LCB5IChncmlkIGNvb3Jk
-aW5hdGVzIDAtMTI3KSwgdmFsIChmbG9vciB0eXBlIElEIDAtOCkKIC0tIE5vdGVzOiAwPXVzZSBn
-bG9iYWwgZGVmYXVsdCBmbG9vciB0eXBlLCAxLTg9c3BlY2lmaWMgZmxvb3IgdHlwZSBmcm9tIHBs
-YW5ldHlwcwogZnVuY3Rpb24gc2V0X2Zsb29yKHgseSx2YWwpCiAgaWYgeD49MCBhbmQgeDwxMjgg
-YW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KICAgLS0gbm9ybWFsaXplIHZhbCB0byB2YWxpZCByYW5n
-ZSAwLTgKICAgaWYgdHlwZSh2YWwpfj0ibnVtYmVyIiBvciB2YWw9PW5pbCB0aGVuCiAgICB2YWw9
-MAogICBlbHNlaWYgdmFsPDAgdGhlbgogICAgdmFsPTAKICAgZWxzZWlmIHZhbD44IHRoZW4KICAg
-IHZhbD04CiAgIGVuZAogICBtYXAuZmxvb3JzOnNldCh4LHksdmFsKQogIGVuZAogZW5kCiAKIGRv
-b3JncmlkPXt9CiBmb3IgaT0wLDEyNyBkbwogIGRvb3JncmlkW2ldPXt9CiAgZm9yIGo9MCwxMjcg
-ZG8KICAgZG9vcmdyaWRbaV1bal09bmlsCiAgZW5kCiBlbmQKIAogLS0gaW5pdGlhbGl6ZSBmbG9v
-ciBkYXRhCiBmb3IgaT0wLDEyNyBkbwogIGZvciBqPTAsMTI3IGRvCiAgIHNldF9mbG9vcihpLGos
-MCkKICBlbmQKIGVuZAogIAogZG9vcnM9e30KIG9iamVjdHM9e30KIGFuaW1hdGVkX29iamVjdHM9
-e30KIAotLSB6LWJ1ZmZlciBhbmQgZnJhbWUtc3RhbXAgYXMgdHlwZWQgdXNlcmRhdGEgZm9yIHNw
-ZWVkCi0tIHpidWY6IHBlci1jb2x1bW4gZGVwdGggdmFsdWVzIChvbmUgeiBwZXIgc2NyZWVuIHgp
-OyB6c3RhbXA6IGZyYW1lLXN0YW1wIHRvIGF2b2lkIHBlci1mcmFtZSBjbGVhcnMKIHpidWY9dXNl
-cmRhdGEoImY2NCIsIHNjcmVlbl93aWR0aCkKIHpzdGFtcD11c2VyZGF0YSgiaTMyIiwgc2NyZWVu
-X3dpZHRoKQogZm9yIGk9MCxzY3JlZW5fd2lkdGgtMSBkbwogIC0tIGluaXRpYWxpemUgc3RhbXBz
-IHRvIDA7IHogdmFsdWVzIGFyZSBjb25zaWRlcmVkIGludmFsaWQgdW50aWwgc3RhbXBlZAogIHpz
-dGFtcDpzZXQoaSwgMCkKIGVuZAogCiAtLSBkeW5hbWljIGJ1ZGdldHMKIGFjdGl2ZV9yYXlfY291
-bnQ9cmF5X2NvdW50CiByb3dfc3RyaWRlX2R5bmFtaWM9cm93X3N0cmlkZQogCiAtLSBDb252ZXJ0
-IHRvIHVzZXJkYXRhIGZvciAyNHggcGVyZm9ybWFuY2UgZ2FpbiAoUGljb3Ryb24gb3B0aW1pemF0
-aW9uIGd1aWRlbGluZSkKIHJheV96ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIHJheV94
-MCA9IHVzZXJkYXRhKCJpMTYiLCByYXlfY291bnQpCiByYXlfeDEgPSB1c2VyZGF0YSgiaTE2Iiwg
-cmF5X2NvdW50KQogcmF5X2R4ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIHJheV9keSA9
-IHVzZXJkYXRhKCJmNjQiLCByYXlfY291bnQpCiAKIC0tIFByZWNvbXB1dGVkIHBpeGVsIGNlbnRl
-cnMgZm9yIGNhbWVyYS1zcGFjZSByYXkgb2Zmc2V0cyAoZWxpbWluYXRlcyBwZXItZnJhbWUgY29t
-cHV0YXRpb24pCiByYXlfcHhfY2VudGVyID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIAog
-LS0gSW5pdGlhbGl6ZSB3aXRoIGRlZmF1bHRzCiBmb3IgaT0wLHJheV9jb3VudC0xIGRvCiAgIHJh
-eV96OnNldChpLCA5OTkpCiAgIHJheV94MDpzZXQoaSwgMCkKICAgcmF5X3gxOnNldChpLCAwKQog
-ICByYXlfZHg6c2V0KGksIDApCiAgIHJheV9keTpzZXQoaSwgMCkKIGVuZAogCiAtLSByYnVmOiB1
-c2Ugc2VwYXJhdGUgdXNlcmRhdGEgYXJyYXlzIGZvciB0aWxlIGFuZCB0eCAoYXZvaWQgbmVzdGVk
-IHN0cnVjdHVyZXMpCiByYnVmX3RpbGUgPSB1c2VyZGF0YSgiaTE2IiwgcmF5X2NvdW50KQogcmJ1
-Zl90eCA9IHVzZXJkYXRhKCJmNjQiLCByYXlfY291bnQpCiBmb3IgaT0wLHJheV9jb3VudC0xIGRv
-CiAgIHJidWZfdGlsZTpzZXQoaSwgMCkKICAgcmJ1Zl90eDpzZXQoaSwgMCkKIGVuZAogCiAtLSBm
-b2cgc3RhdGUgZm9yIGh5c3RlcmVzaXMKIGxhc3RfZm9nX3o9MAogCiAtLSBwcm9qZWN0aW9uIGNv
-bnN0YW50IGRlZmluZWQgaW4gY29uZmlnLmx1YQogCiAtLSBmbG9vciBhbmQgcm9vZiBzdGF0ZQog
-Zmxvb3I9e3R5cD1wbGFuZXR5cHNbMV0seD0wLHk9MH0KIHJvb2Y9e3R5cD1wbGFuZXR5cHNbM10s
-eD0wLHk9MH0KIAogLS0gZ2VuZXJhdGUgZHVuZ2Vvbgogc3RhcnRfcG9zLGdlbl9zdGF0cz1nZW5l
-cmF0ZV9kdW5nZW9uKCkKIAogLS0gbW9kZTogM2Qgb3IgMmQgbWFwCiB2aWV3X21vZGU9IjNkIiAt
-LSBvciAiMmQiIGZvciBtaW5pbWFwCiAKIC0tIGRlYnVnIG1vZGUgZm9yIHJheSBjYXN0aW5nCiBk
+bHVkZSJzcmMvZHVuZ2Vvbl9nZW4ubHVhIgppbmNsdWRlInRlc3RzL2R1bmdlb25faGFybmVzcy5s
+dWEiCgpsb2NhbCBzY2VuZXM9e30KbG9jYWwgc2NlbmVfc3RhdGU9e30KbG9jYWwgY3VycmVudF9z
+Y2VuZT1uaWwKCmxvY2FsIGZ1bmN0aW9uIGdldF9zY2VuZV9zdGF0ZShuYW1lKQogc2NlbmVfc3Rh
+dGVbbmFtZV09c2NlbmVfc3RhdGVbbmFtZV0gb3Ige30KIHJldHVybiBzY2VuZV9zdGF0ZVtuYW1l
+XQplbmQKCmxvY2FsIGZ1bmN0aW9uIHN3aXRjaF9zY2VuZShuYW1lLHBhcmFtcykKIGxvY2FsIHNj
+ZW5lPXNjZW5lc1tuYW1lXQogaWYgbm90IHNjZW5lIHRoZW4KICBwcmludGgoIndhcm5pbmc6IHVu
+a25vd24gc2NlbmUgIi4udG9zdHJpbmcobmFtZSkpCiAgcmV0dXJuCiBlbmQKIGlmIGN1cnJlbnRf
+c2NlbmUgYW5kIHNjZW5lc1tjdXJyZW50X3NjZW5lXSBhbmQgc2NlbmVzW2N1cnJlbnRfc2NlbmVd
+LmxlYXZlIHRoZW4KICBzY2VuZXNbY3VycmVudF9zY2VuZV0ubGVhdmUoZ2V0X3NjZW5lX3N0YXRl
+KGN1cnJlbnRfc2NlbmUpKQogZW5kCiBjdXJyZW50X3NjZW5lPW5hbWUKIGxvY2FsIHN0YXRlPWdl
+dF9zY2VuZV9zdGF0ZShuYW1lKQogaWYgc2NlbmUuZW50ZXIgdGhlbgogIHNjZW5lLmVudGVyKHN0
+YXRlLHBhcmFtcyBvciB7fSkKIGVuZAplbmQKCmxvY2FsIGZ1bmN0aW9uIHNjZW5lX3VwZGF0ZSgp
+CiBpZiBjdXJyZW50X3NjZW5lIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0gYW5kIHNjZW5lc1tj
+dXJyZW50X3NjZW5lXS51cGRhdGUgdGhlbgogIHNjZW5lc1tjdXJyZW50X3NjZW5lXS51cGRhdGUo
+Z2V0X3NjZW5lX3N0YXRlKGN1cnJlbnRfc2NlbmUpKQogZW5kCmVuZAoKbG9jYWwgZnVuY3Rpb24g
+c2NlbmVfZHJhdygpCiBpZiBjdXJyZW50X3NjZW5lIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0g
+YW5kIHNjZW5lc1tjdXJyZW50X3NjZW5lXS5kcmF3IHRoZW4KICBzY2VuZXNbY3VycmVudF9zY2Vu
+ZV0uZHJhdyhnZXRfc2NlbmVfc3RhdGUoY3VycmVudF9zY2VuZSkpCiBlbHNlCiAgY2xzKDApCiBl
+bmQKZW5kCgotLSBjb25zdGFudHMKcGxheWVyX2NvbGxpc2lvbl9yYWRpdXM9MC4xNQoKZnVuY3Rp
+b24gX2luaXQoKQogd2luZG93KHNjcmVlbl93aWR0aCxzY3JlZW5faGVpZ2h0KQogCiAtLSBwaW4g
+bWFza3MgdG8gZGVmYXVsdHMgZm9yIHNpbmdsZSBjb2xvdXItdGFibGUgZmFzdCBwYXRoCiBwb2tl
+KDB4NTUwOCwweDNmKSBwb2tlKDB4NTUwOSwweDNmKSBwb2tlKDB4NTUwYSwweDNmKSBwb2tlKDB4
+NTUwYiwweDAwKQogCiAtLSB0aWxlIDAgZHJhd2luZyBzdGF0ZTogdmVyaWZpZWQgbm90IHJlcXVp
+cmVkOyBsZWF2ZSAweDVmMzYgYXQgZGVmYXVsdCAobm8gZXhwbGljaXQgcG9rZSkKIC0tIHNzcHIo
+KSB1c2FnZSB2ZXJpZmllZDogTm9uZSBpbiBwcm9kdWN0aW9uIGNvZGUgKG9ubHkgaW4gc2FtcGxl
+IGZpbGVzKQogLS0gUGVyIFBpY290cm9uIGd1aWRlbGluZXM6IGJsaXQoKSBpcyBmYXN0ZXI7IEhV
+RC9taW5pbWFwIHVzZSBkaXJlY3QgZHJhd2luZwogLS0gY29uZmlndXJhdGlvbiBndWFyZDogcHJl
+dmVudCBmb2cgcG9wcGluZyBiZXlvbmQgZmFyLXBsYW5lCiBhc3NlcnQoZmFyX3BsYW5lPj1mb2df
+ZmFyKzEsImNvbmZpZyBlcnJvcjogZmFyX3BsYW5lIG11c3QgYmUgPj0gZm9nX2ZhciArIDEiKQog
+CiAtLSBkZWZlbnNpdmUgZGVmYXVsdHMgaWYgY29uZmlnIGluY2x1ZGUgZmFpbGVkIHRvIHNldCB0
+aGVtIGZvciBhbnkgcmVhc29uCiBpZiBub3Qgb2JqZ3JpZF9zaXplIHRoZW4gb2JqZ3JpZF9zaXpl
+PTUgZW5kCiBpZiBub3Qgb2JqZ3JpZF9hcnJheV9zaXplIHRoZW4gb2JqZ3JpZF9hcnJheV9zaXpl
+PTI2IGVuZAogCiAtLSBmcmFtZSBjb3VudGVyIGZvciBhaSB0aW1pbmcKIGZyYW1lX2N0PTAKIAog
+LS0gcGxheWVyIHN0YXRlCiBwbGF5ZXI9ewogIHg9NjQseT02NCwKICBhPTAsCiAgc3BkPXBsYXll
+cl9tb3ZlX3NwZWVkLAogIGtleXM9e30sCiAgaHA9MTAwCiB9CiAKIC0tIGludGVyYWN0aW9uIHN0
+YXRlCiBpbnRlcmFjdGlvbl9hY3RpdmU9ZmFsc2UKIGN1cnJlbnRfaW50ZXJhY3Q9bmlsCiAKIC0t
+IGNvbWJhdCBzdGF0ZQogaW5fY29tYmF0PWZhbHNlCiBjdXJyZW50X3RhcmdldD1uaWwKIAogLS0g
+dHJhcCBtZXNzYWdlIHRpbWVyCiB0cmFwX21zZ190aW1lcj0wCiAKIC0tIGNhbWVyYQogY2FtPXtw
+bGF5ZXIueCxwbGF5ZXIueX0KIAogLS0gbWFwIGFic3RyYWN0aW9uIHdpdGggdXNlcmRhdGEgbGF5
+ZXJzCiBtYXA9e30KIG1hcC53YWxscz11c2VyZGF0YSgiaTE2IiwxMjgsMTI4KQogbWFwLmRvb3Jz
+PXVzZXJkYXRhKCJpMTYiLDEyOCwxMjgpCiBtYXAuZmxvb3JzPXVzZXJkYXRhKCJpMTYiLDEyOCwx
+MjgpCiAKIC0tIGhlbHBlcjogZ2V0IHdhbGwgdGlsZQotLSBQdXJwb3NlOiBSZXRyaWV2ZSB3YWxs
+IHRpbGUgSUQgYXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFyYW1ldGVyczogeCwgeSAoZ3JpZCBjb29y
+ZGluYXRlcyAwLTEyNykKIC0tIFJldHVybnM6IHRpbGUgSUQgKDA9ZW1wdHksID4wPXdhbGwvZG9v
+ci9leGl0KQogZnVuY3Rpb24gZ2V0X3dhbGwoeCx5KQogaWYgeD49MCBhbmQgeDwxMjggYW5kIHk_
+PTAgYW5kIHk8MTI4IHRoZW4KICByZXR1cm4gbWFwLndhbGxzOmdldCh4LHkpIG9yIDAKIGVuZAog
+cmV0dXJuIDAKIGVuZAogCiAtLSBoZWxwZXI6IHNldCB3YWxsIHRpbGUKIGZ1bmN0aW9uIHNldF93
+YWxsKHgseSx2YWwpCiAgaWYgeD49MCBhbmQgeDwxMjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4K
+CQltYXAud2FsbHM6c2V0KHgseSx2YWwgb3IgMCkKICBlbmQKIGVuZAogCiAtLSBoZWxwZXI6IGdl
+dCBkb29yIHRpbGUKIGZ1bmN0aW9uIGdldF9kb29yKHgseSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBh
+bmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4gbWFwLmRvb3JzOmdldCh4LHkpIG9yIDAK
+ICBlbmQKICByZXR1cm4gMAogZW5kCiAKIC0tIGhlbHBlcjogc2V0IGRvb3IgdGlsZQogZnVuY3Rp
+b24gc2V0X2Rvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwx
+MjggdGhlbgogICBtYXAuZG9vcnM6c2V0KHgseSx2YWwgb3IgMCkKICBlbmQKIGVuZAoKIC0tIGhl
+bHBlcjogZ2V0IGZsb29yIHRpbGUKIC0tIFB1cnBvc2U6IFJldHJpZXZlIGZsb29yIHR5cGUgSUQg
+YXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFyYW1ldGVyczogeCwgeSAoZ3JpZCBjb29yZGluYXRlcyAw
+LTEyNykKIC0tIFJldHVybnM6IGZsb29yIHR5cGUgSUQgKDA9dXNlIGdsb2JhbCBkZWZhdWx0LCAx
+LTg9c3BlY2lmaWMgZmxvb3IgdHlwZSBmcm9tIHBsYW5ldHlwcykKIC0tIE5vdGVzOiBGbG9vciB0
+eXBlIElEcyBtYXAgdG8gaW5kaWNlcyBpbiB0aGUgcGxhbmV0eXBzIHRhYmxlIGRlZmluZWQgaW4g
+Y29uZmlnLmx1YQogZnVuY3Rpb24gZ2V0X2Zsb29yKHgseSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBh
+bmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4gbWFwLmZsb29yczpnZXQoeCx5KSBvciAw
+CiAgZW5kCiAgcmV0dXJuIDAKIGVuZAoKIC0tIGhlbHBlcjogc2V0IGZsb29yIHRpbGUKIC0tIFB1
+cnBvc2U6IFN0b3JlIHBlci1jZWxsIGZsb29yIHR5cGUgSURzIGZvciB2YXJpZWQgZmxvb3IgdGV4
+dHVyZXMKIC0tIFBhcmFtZXRlcnM6IHgsIHkgKGdyaWQgY29vcmRpbmF0ZXMgMC0xMjcpLCB2YWwg
+KGZsb29yIHR5cGUgSUQgMC04KQogLS0gTm90ZXM6IDA9dXNlIGdsb2JhbCBkZWZhdWx0IGZsb29y
+IHR5cGUsIDEtOD1zcGVjaWZpYyBmbG9vciB0eXBlIGZyb20gcGxhbmV0eXBzCiBmdW5jdGlvbiBz
+ZXRfZmxvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwxMjgg
+dGhlbgogICAtLSBub3JtYWxpemUgdmFsIHRvIHZhbGlkIHJhbmdlIDAtOAogICBpZiB0eXBlKHZh
+bCl_PSJudW1iZXIiIG9yIHZhbD09bmlsIHRoZW4KICAgIHZhbD0wCiAgIGVsc2VpZiB2YWw8MCB0
+aGVuCiAgICB2YWw9MAogICBlbHNlaWYgdmFsPjggdGhlbgogICAgdmFsPTgKICAgZW5kCiAgIG1h
+cC5mbG9vcnM6c2V0KHgseSx2YWwpCiAgZW5kCiBlbmQKIAogZG9vcmdyaWQ9e30KIGZvciBpPTAs
+MTI3IGRvCiAgZG9vcmdyaWRbaV09e30KICBmb3Igaj0wLDEyNyBkbwogICBkb29yZ3JpZFtpXVtq
+XT1uaWwKICBlbmQKIGVuZAogCiAtLSBpbml0aWFsaXplIGZsb29yIGRhdGEKIGZvciBpPTAsMTI3
+IGRvCiAgZm9yIGo9MCwxMjcgZG8KICAgc2V0X2Zsb29yKGksaiwwKQogIGVuZAogZW5kCiAgCiBk
+b29ycz17fQogb2JqZWN0cz17fQogYW5pbWF0ZWRfb2JqZWN0cz17fQogCi0tIHotYnVmZmVyIGFu
+ZCBmcmFtZS1zdGFtcCBhcyB0eXBlZCB1c2VyZGF0YSBmb3Igc3BlZWQKLS0gemJ1ZjogcGVyLWNv
+bHVtbiBkZXB0aCB2YWx1ZXMgKG9uZSB6IHBlciBzY3JlZW4geCk7IHpzdGFtcDogZnJhbWUtc3Rh
+bXAgdG8gYXZvaWQgcGVyLWZyYW1lIGNsZWFycwogemJ1Zj11c2VyZGF0YSgiZjY0Iiwgc2NyZWVu
+X3dpZHRoKQogenN0YW1wPXVzZXJkYXRhKCJpMzIiLCBzY3JlZW5fd2lkdGgpCiBmb3IgaT0wLHNj
+cmVlbl93aWR0aC0xIGRvCiAgLS0gaW5pdGlhbGl6ZSBzdGFtcHMgdG8gMDsgeiB2YWx1ZXMgYXJl
+IGNvbnNpZGVyZWQgaW52YWxpZCB1bnRpbCBzdGFtcGVkCiAgenN0YW1wOnNldChpLCAwKQogZW5k
+CiAKIC0tIGR5bmFtaWMgYnVkZ2V0cwogYWN0aXZlX3JheV9jb3VudD1yYXlfY291bnQKIHJvd19z
+dHJpZGVfZHluYW1pYz1yb3dfc3RyaWRlCiAKIC0tIENvbnZlcnQgdG8gdXNlcmRhdGEgZm9yIDI0
+eCBwZXJmb3JtYW5jZSBnYWluIChQaWNvdHJvbiBvcHRpbWl6YXRpb24gZ3VpZGVsaW5lKQogcmF5
+X3ogPSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQogcmF5X3gwID0gdXNlcmRhdGEoImkxNiIs
+IHJheV9jb3VudCkKIHJheV94MSA9IHVzZXJkYXRhKCJpMTYiLCByYXlfY291bnQpCiByYXlfZHgg
+PSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQogcmF5X2R5ID0gdXNlcmRhdGEoImY2NCIsIHJh
+eV9jb3VudCkKIHJheV9oaXR4ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIHJheV9oaXR5
+ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIAogLS0gUHJlY29tcHV0ZWQgcGl4ZWwgY2Vu
+dGVycyBmb3IgY2FtZXJhLXNwYWNlIHJheSBvZmZzZXRzIChlbGltaW5hdGVzIHBlci1mcmFtZSBj
+b21wdXRhdGlvbikKIHJheV9weF9jZW50ZXIgPSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQog
+CiAtLSBJbml0aWFsaXplIHdpdGggZGVmYXVsdHMKIGZvciBpPTAscmF5X2NvdW50LTEgZG8KICAg
+cmF5X3o6c2V0KGksIDk5OSkKICAgcmF5X3gwOnNldChpLCAwKQogICByYXlfeDE6c2V0KGksIDAp
+CiAgIHJheV9keDpzZXQoaSwgMCkKICAgcmF5X2R5OnNldChpLCAwKQogZW5kCiAKIC0tIHJidWY6
+IHVzZSBzZXBhcmF0ZSB1c2VyZGF0YSBhcnJheXMgZm9yIHRpbGUgYW5kIHR4IChhdm9pZCBuZXN0
+ZWQgc3RydWN0dXJlcykKIHJidWZfdGlsZSA9IHVzZXJkYXRhKCJpMTYiLCByYXlfY291bnQpCiBy
+YnVmX3R4ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIGZvciBpPTAscmF5X2NvdW50LTEg
+ZG8KICAgcmJ1Zl90aWxlOnNldChpLCAwKQogICByYnVmX3R4OnNldChpLCAwKQogZW5kCiAKIC0t
+IGZvZyBzdGF0ZSBmb3IgaHlzdGVyZXNpcwogbGFzdF9mb2dfej0wCiAKIC0tIHByb2plY3Rpb24g
+Y29uc3RhbnQgZGVmaW5lZCBpbiBjb25maWcubHVhCiAKIC0tIGZsb29yIGFuZCByb29mIHN0YXRl
+CiBmbG9vcj17dHlwPXBsYW5ldHlwc1sxXSx4PTAseT0wfQogcm9vZj17dHlwPXBsYW5ldHlwc1sz
+XSx4PTAseT0wfQogCiBnZW5fc3RhdHM9e3Jvb21zPTAsb2JqZWN0cz0wLHNlZWQ9MCxoaXN0b3J5
+PXt9fQogc3RhcnRfcG9zPXt4PXBsYXllci54LHk9cGxheWVyLnl9CiAtLSBtb2RlOiAzZCBvciAy
+ZCBtYXAKIHZpZXdfbW9kZT0iM2QiCiAKIC0tIGRlYnVnIG1vZGUgZm9yIHJheSBjYXN0aW5nCiBk
 ZWJ1Z19tb2RlPWZhbHNlCnNob3dfZGlhZ25vc3RpY3M9ZmFsc2UKZW5hYmxlX2RpYWdub3N0aWNz
 X2xvZ2dpbmc9ZmFsc2UgIC0tIFBlcm1hbmVudGx5IGRpc2FibGVkIGZvciBwcm9kdWN0aW9uIHBl
 cmZvcm1hbmNlCi0tIE9wdGlvbmFsOiByZS1lbmFibGUgYSBub24tcmVuZGVyIENQVSBnb3Zlcm5v
@@ -2718,481 +3438,616 @@ ciAoc2FtcGxlcyBDUFUgb3V0c2lkZSBfZHJhdygpKQplbmFibGVfbm9ucmVuZGVyX2dvdmVybm9y
 PWZhbHNlCnJlY2VudF9jcHU9MAogCiAtLSBwZXJmb3JtYW5jZSB2YWxpZGF0aW9uIG1vZGU6IGRp
 c2FibGVzIENQVSBnb3Zlcm5vciB0byBzdGFiaWxpemUgbWVhc3VyZW1lbnRzCiBwZXJmX3ZhbGlk
 YXRpb249ZmFsc2UKIAogLS0gZGlhZ25vc3RpYyBjb3VudGVycyBmb3IgcGVyZm9ybWFuY2UgdHJh
-Y2tpbmcKIGRpYWdfZGRhX3N0ZXBzX3RvdGFsPTAKIGRpYWdfZGRhX2Vhcmx5X291dHM9MAogZGlh
-Z19mb2dfc3dpdGNoZXM9MAogZGlhZ193YWxsX3RsaW5lX3N1Ym1pdHM9MAogZGlhZ193YWxsX3Nh
-bXBsZXM9MAogZGlhZ193YWxsX3BpeGVscz0wCiBkaWFnX2Zsb29yX3Jvd3M9MAogZGlhZ19mbG9v
-cl9kcmF3X2NhbGxzPTAKIGRpYWdfc3ByaXRlX2NvbHVtbnM9MAogZGlhZ19mcmFtZV9jb3VudD0w
-CiAKIC0tIHRlc3QgZG9vciBtb2RlCiB0ZXN0X2Rvb3JfbW9kZT1mYWxzZQoKIC0tIGNyZWF0ZSB0
-aW50ZWQgZXJyb3IgdGV4dHVyZXMgZm9yIGRpZmZlcmVudCBvYmplY3QgdHlwZXMgKGNoZWNrZXJi
-b2FyZCBwYXR0ZXJuKQogLS0gd2FsbHM6IG1hZ2VudGEvcGluayAoOC8xNCksIGZsb29yOiBibHVl
-L2N5YW4gKDEyLzEzKSwgY2VpbGluZzogZ3JlZW4vZGFyayBncmVlbiAoMTEvMykKIC0tIHNwcml0
-ZXM6IHllbGxvdy9vcmFuZ2UgKDEwLzkpLCBwcm9wczogcmVkL2Jyb3duICg4LzQpCiBlcnJvcl90
-ZXh0dXJlcyA9IHsKICB3YWxsID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKIGRvb3IgPSB1c2Vy
-ZGF0YSgidTgiLCAzMiwgMzIpLAogIGZsb29yID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKICBj
-ZWlsaW5nID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKICBzcHJpdGUgPSB1c2VyZGF0YSgidTgi
-LCAzMiwgMzIpLAogIGRlZmF1bHQgPSB1c2VyZGF0YSgidTgiLCAzMiwgMzIpCiB9CiAKIC0tIGdl
-bmVyYXRlIHRpbnRlZCBjaGVja2VyYm9hcmRzIGZvciBlYWNoIHR5cGUKIGxvY2FsIHRpbnRzID0g
-ewogIHdhbGwgPSB7OCwgMTR9LCAgICAgIC0tIG1hZ2VudGEvcGluawogZG9vciA9IHsyLCA2fSwg
-ICAgICAgLS0gcHVycGxlL2JsdWUgKGRpc3RpbmN0IGZyb20gd2FsbHMpCiAgZmxvb3IgPSB7MTIs
-IDEzfSwgICAgLS0gYmx1ZS9jeWFuCiAgY2VpbGluZyA9IHsxMSwgM30sICAgLS0gZ3JlZW4vZGFy
-ayBncmVlbgogIHNwcml0ZSA9IHsxMCwgOX0sICAgIC0tIHllbGxvdy9vcmFuZ2UKICBkZWZhdWx0
-ID0gezgsIDE0fSAgICAtLSBtYWdlbnRhL3BpbmsgKGZhbGxiYWNrKQogfQogCiBmb3IgdHlwZV9u
-YW1lLCBjb2xvcnMgaW4gcGFpcnModGludHMpIGRvCiAgZm9yIHk9MCwzMSBkbwogICBmb3IgeD0w
-LDMxIGRvCiAgICBsb2NhbCBjb2xvciA9ICgoZmxyKHgvNCkgKyBmbHIoeS80KSkgJSAyID09IDAp
-IGFuZCBjb2xvcnNbMV0gb3IgY29sb3JzWzJdCiAgICBlcnJvcl90ZXh0dXJlc1t0eXBlX25hbWVd
-OnNldCh4LCB5LCBjb2xvcikKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gbWFpbnRhaW4gYmFja3dh
-cmQgY29tcGF0aWJpbGl0eSB3aXRoIHNpbmdsZSBlcnJvcl90ZXh0dXJlCiBlcnJvcl90ZXh0dXJl
-ID0gZXJyb3JfdGV4dHVyZXMuZGVmYXVsdAoKIC0tIHJlc2VydmUgc3ByaXRlIGluZGV4ZXMgZm9y
-IGVycm9yIHRleHR1cmVzIChiYXRjaGluZyBwcmVmZXJzIHNwcml0ZSBpbmRleGVzKQogRVJST1Jf
-SURYID0geyB3YWxsPTgwMDAsIGRvb3I9ODAwMSwgZmxvb3I9ODAwMiwgY2VpbGluZz04MDAzLCBz
-cHJpdGU9ODAwNCwgZGVmYXVsdD04MDA1IH0KIGZvciBuYW1lLCB1ZCBpbiBwYWlycyhlcnJvcl90
-ZXh0dXJlcykgZG8KICBsb2NhbCBpZHggPSBFUlJPUl9JRFhbbmFtZV0gb3IgRVJST1JfSURYLmRl
-ZmF1bHQKICBzZXRfc3ByKGlkeCwgdWQpCiBlbmQKIAogLS0gUHJlbG9hZCB0ZXh0dXJlIGNhY2hl
-IGZvciBjb21tb25seS11c2VkIHNwcml0ZXMgKDAtMjAwKQogLS0gUG9wdWxhdGUgdGV4X2NhY2hl
-IGRpcmVjdGx5IHVzaW5nIGdldF9zcHIoKSB0byBhdm9pZCB3YXJuaW5ncwogcHJpbnRoKCJwcmVs
-b2FkaW5nIHRleHR1cmUgY2FjaGUuLi4iKQogbG9jYWwgcHJlbG9hZF9zdGFydCA9IHRpbWUoKQog
-Zm9yIGk9MCwyMDAgZG8KICBsb2NhbCBzcmM9Z2V0X3NwciBhbmQgZ2V0X3NwcihpKQogIGlmIHNy
-YyBhbmQgY2FjaGVfdGV4IHRoZW4KICAgY2FjaGVfdGV4KGksIHNyYywgZmFsc2UpCiAgZW5kCiBl
-bmQKIGxvY2FsIHByZWxvYWRfdGltZSA9ICh0aW1lKCkgLSBwcmVsb2FkX3N0YXJ0KSAqIDEwMDAK
-IHByaW50aCgidGV4dHVyZSBjYWNoZSBwcmVsb2FkZWQ6ICIuLnByZWxvYWRfdGltZS4uIm1zIikK
-IC0tIFRyaWdnZXIgR0MgYWZ0ZXIgcHJlbG9hZGluZyAoUGljb3Ryb24gZ3VpZGVsaW5lOiBzdGF0
-KDApIGR1cmluZyBwYXVzZXMgb25seSkKIHN0YXQoMCkKIAogLS0gbG9nZ2luZyBoZWxwZXI6IGNv
-bnNvbGUgKyByaW5nIGJ1ZmZlciBmb3Igb3B0aW9uYWwgb24tc2NyZWVuIGVjaG8KIGxvZ19saW5l
-cyA9IHt9CiBmdW5jdGlvbiBsb2coc3RyKQogIHByaW50aChzdHIpCiAgYWRkKGxvZ19saW5lcywg
-c3RyKQogIGlmICNsb2dfbGluZXMgPiAyMDAgdGhlbiBkZWxpKGxvZ19saW5lcywgMSkgZW5kCiBl
-bmQKCiAtLSB2YWxpZGF0ZSBhbGwgY29uZmlndXJlZCBzcHJpdGVzIGV4aXN0IChjb21tZW50IG91
-dCBmb3IgcHJvZHVjdGlvbikKIHZhbGlkYXRlX3Nwcml0ZV9jb25maWd1cmF0aW9uKCkKCiBwcmlu
-dGgoInBpY290cm9uIHJheWNhc3QgZW5naW5lIHYxLjAiKQplbmQKCi0tIHZhbGlkYXRlIHNwcml0
-ZSBjb25maWd1cmF0aW9uIGF0IHN0YXJ0dXAgKG9wdGlvbmFsLCBjYW4gYmUgZGlzYWJsZWQgZm9y
-IHBlcmZvcm1hbmNlKQpmdW5jdGlvbiB2YWxpZGF0ZV9zcHJpdGVfY29uZmlndXJhdGlvbigpCiAt
-LSBjaGVjayBlbmVteSBzcHJpdGVzCiBmb3IgZW5lbXkgaW4gYWxsKGVuZW15X3R5cGVzKSBkbwog
-IGlmIG5vdCBnZXRfc3ByKGVuZW15LnNwcml0ZSkgdGhlbgogICBwcmludGgoIldBUk5JTkc6IGVu
-ZW15IHNwcml0ZSAiLi5lbmVteS5zcHJpdGUuLiIgKCIuLmVuZW15Lm5hbWUuLiIpIG5vdCBmb3Vu
-ZCBpbiBHRlggZmlsZXMiKQogIGVuZAogZW5kCiAKIC0tIGNoZWNrIGRlY29yYXRpb24gc3ByaXRl
-cwogZm9yIGRlYyBpbiBhbGwoZGVjb3JhdGlvbl90eXBlcykgZG8KICBpZiBub3QgZ2V0X3Nwcihk
-ZWMuc3ByaXRlKSB0aGVuCiAgIHByaW50aCgiV0FSTklORzogZGVjb3JhdGlvbiBzcHJpdGUgIi4u
-ZGVjLnNwcml0ZS4uIiAoIi4uZGVjLm5hbWUuLiIpIG5vdCBmb3VuZCBpbiBHRlggZmlsZXMiKQog
-IGVuZAogZW5kCiAKIC0tIGNoZWNrIHdhbGwgdGV4dHVyZSBzcHJpdGVzCiBmb3IgdGV4c2V0IGlu
-IGFsbCh0ZXhzZXRzKSBkbwogIGZvciB2YXJpYW50IGluIGFsbCh0ZXhzZXQudmFyaWFudHMpIGRv
-CiAgIGlmIG5vdCBnZXRfc3ByKHZhcmlhbnQpIHRoZW4KICAgIHByaW50aCgiV0FSTklORzogd2Fs
-bCB0ZXh0dXJlIHNwcml0ZSAiLi52YXJpYW50Li4iIG5vdCBmb3VuZCBpbiBHRlggZmlsZXMiKQog
-ICBlbmQKICBlbmQKIGVuZAogCiAtLSBjaGVjayBmbG9vci9jZWlsaW5nIHNwcml0ZXMKIGZvciB0
-eXAgaW4gYWxsKHBsYW5ldHlwcykgZG8KICBpZiBub3QgZ2V0X3Nwcih0eXAudGV4KSB0aGVuCiAg
-IHByaW50aCgiV0FSTklORzogZmxvb3IvY2VpbGluZyBzcHJpdGUgIi4udHlwLnRleC4uIiBub3Qg
-Zm91bmQgaW4gR0ZYIGZpbGVzIikKICBlbmQKIGVuZAplbmQKCmZ1bmN0aW9uIF91cGRhdGUoKQog
-LS0gaW5jcmVtZW50IGZyYW1lIGNvdW50ZXIKIGZyYW1lX2N0Kz0xCiAKIC0tIG9wdGlvbmFsOiBz
-YW1wbGUgQ1BVIG91dHNpZGUgcmVuZGVyIGZyYW1lIChldmVyeSAzMCBmcmFtZXMpIGZvciBub24t
-cmVuZGVyIGdvdmVybm9yCiBpZiBlbmFibGVfbm9ucmVuZGVyX2dvdmVybm9yIGFuZCAoZnJhbWVf
-Y3QlMzA9PTApIHRoZW4KICByZWNlbnRfY3B1PXN0YXQoMSkgb3IgMAogZW5kCiAKIC0tIGNvbWJh
-dCBnYXRpbmc6IHNraXAgbm9ybWFsIHVwZGF0ZXMgd2hlbiBpbiBjb21iYXQKIGlmIGluX2NvbWJh
-dCB0aGVuCiAgdXBkYXRlX2NvbWJhdCgpCiAgcmV0dXJuCiBlbmQKIAogdXBkYXRlX2lucHV0KCkK
-IHVwZGF0ZV9kb29ycygpCiAKIC0tIHVwZGF0ZSBucGMgYWkgKHJhdGUgbGltaXRlZCwgZGV0ZXJt
-aW5pc3RpYyBmcmFtZSBjaGVjaykKIGlmIGZyYW1lX2N0JWFpX3VwZGF0ZV9yYXRlPT0wIHRoZW4K
-ICB1cGRhdGVfbnBjX2FpKCkKIGVuZAogCiBjYW09e3BsYXllci54LHBsYXllci55fQogCiAtLSB1
-cGRhdGUgZmxvb3IvY2VpbGluZyBzY3JvbGxpbmcKIGZsb29yLngrPWZsb29yLnR5cC54dmVsIG9y
-IDAKIGZsb29yLnkrPWZsb29yLnR5cC55dmVsIG9yIDAKIHJvb2YueCs9cm9vZi50eXAueHZlbCBv
-ciAwCiByb29mLnkrPXJvb2YudHlwLnl2ZWwgb3IgMAogCiAtLSB1cGRhdGUgb2JqZWN0IGFuaW1h
-dGlvbnMKIGZvciBvYiBpbiBhbGwoYW5pbWF0ZWRfb2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5k
-IG9iLnR5cC5mcmFtZWN0IHRoZW4KICAgb2IuZnJhbWUrPW9iLnR5cC5hbmltc3BkCiAgIGlmIG9i
-LmFuaW1sb29wIHRoZW4KICAgIG9iLmZyYW1lPW9iLmZyYW1lJW9iLnR5cC5mcmFtZWN0CiAgIGVs
-c2UKICAgIG9iLmZyYW1lPW1pbihvYi5mcmFtZSxvYi50eXAuZnJhbWVjdC0xKQogICBlbmQKICBl
-bmQKIGVuZAogCiAtLSB0b2dnbGUgdmlldyBtb2RlIChkZWJ1ZyBvbmx5KQogaWYgZGVidWdfbW9k
-ZSBhbmQgKGtleXAoIngiKSBvciBidG5wKDUpKSB0aGVuCiAgdmlld19tb2RlPXZpZXdfbW9kZT09
-IjNkIiBhbmQgIjJkIiBvciAiM2QiCiBlbmQKIAogLS0gZGVidWcgbW9kZSB0b2dnbGUgKG1vdmVk
-IGZyb20gYnRucCg0KSB0byBhdm9pZCBjb25mbGljdCkKIGlmIGtleXAoInRhYiIpIHRoZW4KICBk
-ZWJ1Z19tb2RlPW5vdCBkZWJ1Z19tb2RlCiBlbmQKIAogLS0gZGlhZ25vc3RpY3Mgb3ZlcmxheSBy
-ZW1vdmVkOyBtZXJnZWQgaW50byBkZWJ1ZyBwYW5lbCAoVGFiKQogCiAtLSB0b2dnbGUgZGlhZ25v
-c3RpY3MgbG9nZ2luZyAoY29udHJvbGxlciBidXR0b24gMTIpCiBpZiBidG5wKDEyKSB0aGVuCiAg
-ZW5hYmxlX2RpYWdub3N0aWNzX2xvZ2dpbmc9bm90IGVuYWJsZV9kaWFnbm9zdGljc19sb2dnaW5n
-CiAgcHJpbnRoKCJEaWFnbm9zdGljcyBsb2dnaW5nOiAiLi50b3N0cmluZyhlbmFibGVfZGlhZ25v
-c3RpY3NfbG9nZ2luZykpCiBlbmQKIAogLS0gZGVjcmVtZW50IHRyYXAgbWVzc2FnZSB0aW1lcgog
-aWYgdHJhcF9tc2dfdGltZXI_MCB0aGVuCiAgdHJhcF9tc2dfdGltZXItPTEKIGVuZAogCiAtLSB0
-b2dnbGUgdGVzdCBkb29yIG1vZGUgKHdoZW4gbm90IGluIDJkIG1hcCB2aWV3KQogaWYgdmlld19t
-b2RlPT0iM2QiIGFuZCAoa2V5cCgidiIpIG9yIGJ0bnAoMTUpKSB0aGVuCiAgdGVzdF9kb29yX21v
-ZGU9bm90IHRlc3RfZG9vcl9tb2RlCiBlbmQKIAogLS0gY3ljbGUgdGVzdCBkb29yIG9wZW4gdmFs
-dWUgKDAuMCB0byAxLjApCiBpZiB0ZXN0X2Rvb3JfbW9kZSB0aGVuCiAgaWYga2V5cCgiYyIpIHRo
-ZW4KICAgdGVzdF9kb29yX29wZW49KHRlc3RfZG9vcl9vcGVuIG9yIDApKzAuMQogICBpZiB0ZXN0
-X2Rvb3Jfb3Blbj4xIHRoZW4gdGVzdF9kb29yX29wZW49MCBlbmQKICBlbmQKICBpZiBrZXlwKCJk
-IikgdGhlbgogICB0ZXN0X2Rvb3Jfb3Blbj0odGVzdF9kb29yX29wZW4gb3IgMCktMC4xCiAgIGlm
-IHRlc3RfZG9vcl9vcGVuPDAgdGhlbiB0ZXN0X2Rvb3Jfb3Blbj0xIGVuZAogIGVuZAogZW5kCiAK
-IC0tIGN5Y2xlIGZsb29yIHR5cGUgKGZvciB0ZXN0aW5nKSB3aGVuIG5vdCBpbiBkb29yIHRlc3Qg
-bW9kZQogaWYgbm90IHRlc3RfZG9vcl9tb2RlIGFuZCBrZXlwKCJjIikgdGhlbgogIGxvY2FsIGN1
-cnJlbnRfaWR4PTEKICBmb3IgaT0xLCNwbGFuZXR5cHMgZG8KICAgaWYgcGxhbmV0eXBzW2ldLnRl
-eD09Zmxvb3IudHlwLnRleCB0aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQK
-ICBlbmQKICBmbG9vci50eXA9cGxhbmV0eXBzWyhjdXJyZW50X2lkeCAlICNwbGFuZXR5cHMpKzFd
-CiAgZmxvb3IueCxmbG9vci55PTAsMAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBj
-eWNsaW5nIGZsb29yIHR5cGVzIChjYW4gYmUgZGlzYWJsZWQgaW4gcHJvZHVjdGlvbikKICBpZiBj
-bGVhcl90ZXh0dXJlX2NhY2hlcyB0aGVuIGNsZWFyX3RleHR1cmVfY2FjaGVzKCkgZW5kCiBlbmQK
-IAogLS0gY3ljbGUgcm9vZiB0eXBlIChmb3IgdGVzdGluZykgd2hlbiBub3QgaW4gZG9vciB0ZXN0
-IG1vZGUKIGlmIG5vdCB0ZXN0X2Rvb3JfbW9kZSBhbmQga2V5cCgiZCIpIHRoZW4KICBsb2NhbCBj
-dXJyZW50X2lkeD0xCiAgZm9yIGk9MSwjcGxhbmV0eXBzIGRvCiAgIGlmIHBsYW5ldHlwc1tpXS50
-ZXg9PXJvb2YudHlwLnRleCB0aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQK
-ICBlbmQKICByb29mLnR5cD1wbGFuZXR5cHNbKGN1cnJlbnRfaWR4ICUgI3BsYW5ldHlwcykrMV0K
-ICByb29mLngscm9vZi55PTAsMAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBjeWNs
-aW5nIHJvb2YgdHlwZXMgKGNhbiBiZSBkaXNhYmxlZCBpbiBwcm9kdWN0aW9uKQogIGlmIGNsZWFy
-X3RleHR1cmVfY2FjaGVzIHRoZW4gY2xlYXJfdGV4dHVyZV9jYWNoZXMoKSBlbmQKIGVuZAogCiAt
-LSBkZWJ1ZyByYXkgY2FzdGluZwogIGlmIGRlYnVnX21vZGUgdGhlbgogICBsb2NhbCBzYSxjYT1z
-aW4ocGxheWVyLmEpLGNvcyhwbGF5ZXIuYSkKICAgbG9jYWwgeixoeCxoeSx0aWxlLHR4PXJheWNh
-c3QocGxheWVyLngscGxheWVyLnksY2Esc2Esc2EsY2EpCiAgIHByaW50aCgiZGVidWc6IHo9Ii4u
-KGZscih6KjEwMCkvMTAwKS4uIiBoeD0iLi4oZmxyKGh4KjEwMCkvMTAwKS4uIiBoeT0iLi4oZmxy
-KGh5KjEwMCkvMTAwKS4uIiB0aWxlPSIuLnRpbGUuLiIgdHg9Ii4uKGZscih0eCoxMDApLzEwMCkp
-CiAgIGxvY2FsIG9iLGRpc3Q9aGl0c2NhbihwbGF5ZXIueCxwbGF5ZXIueSxjYSxzYSkKICAgaWYg
-b2IgdGhlbgogICAgcHJpbnRoKCJkZWJ1Zzogb2JqIGZvdW5kIGF0IGRpc3Q9Ii4uKGZscihkaXN0
-KjEwMCkvMTAwKS4uIiBraW5kPSIuLihvYi5raW5kIG9yICJ1bmtub3duIikpCiAgIGVsc2UKICAg
-IHByaW50aCgiZGVidWc6IG5vIG9iaiBoaXQiKQogICBlbmQKICBlbmQKZW5kCgpmdW5jdGlvbiBf
-ZHJhdygpCiBjbGlwKDAsMCxzY3JlZW5fd2lkdGgsc2NyZWVuX2hlaWdodCkKIGNscygwKQogCiBs
-b2NhbCBmcmFtZV9zdGFydD10aW1lKCkKIAogZGlhZ19mcmFtZV9jb3VudCs9MQogCi0tIEVuc3Vy
-ZSBhZGFwdGl2ZSBjb250cm9scyBhcmUgaW5pdGlhbGl6ZWQgb25jZQppZiBub3QgYWN0aXZlX3Jh
-eV9jb3VudCB0aGVuIGFjdGl2ZV9yYXlfY291bnQ9cmF5X2NvdW50IGVuZAppZiBub3Qgcm93X3N0
-cmlkZV9keW5hbWljIHRoZW4gcm93X3N0cmlkZV9keW5hbWljPXJvd19zdHJpZGUgZW5kCgpsb2Nh
-bCBmdW5jdGlvbiBhZGp1c3RfcmF5X2J1ZGdldChjcHVfc2FtcGxlKQogbG9jYWwgbWluX3JheXM9
-bWF4KDQ4LCBmbHIocmF5X2NvdW50KjAuMjUpKQogaWYgY3B1X3NhbXBsZT4wLjkwIHRoZW4KICBh
-Y3RpdmVfcmF5X2NvdW50PW1heChtaW5fcmF5cywgYWN0aXZlX3JheV9jb3VudC0xNikKIGVsc2Vp
-ZiBjcHVfc2FtcGxlPDAuNzAgdGhlbgogIGFjdGl2ZV9yYXlfY291bnQ9bWluKHJheV9jb3VudCwg
-YWN0aXZlX3JheV9jb3VudCs4KQogZW5kCmVuZAoKLS0gTGlnaHR3ZWlnaHQgQ1BVIHNhbXBsZXIg
-aW4gX2RyYXcoKSAoZXZlcnkgNjAgZnJhbWVzKSBmb3IgYWRhcHRpdmUgcXVhbGl0eQppZiBub3Qg
-cGVyZl92YWxpZGF0aW9uIGFuZCAoZGlhZ19mcmFtZV9jb3VudCAlIDYwID09IDApIHRoZW4KIGxv
-Y2FsIGNwdSA9IHN0YXQoMSkgb3IgMAogaWYgbm90IGVuYWJsZV9ub25yZW5kZXJfZ292ZXJub3Ig
-dGhlbgogIGFkanVzdF9yYXlfYnVkZ2V0KGNwdSkKIGVuZAplbmQKCi0tIE9wdGlvbmFsIG5vbi1y
-ZW5kZXIgZ292ZXJub3I6IHVzZXMgQ1BVIHNhbXBsZWQgaW4gX3VwZGF0ZSgpLCBuZXZlciBjYWxs
-cyBzdGF0KDEpIGhlcmUKaWYgZW5hYmxlX25vbnJlbmRlcl9nb3Zlcm5vciB0aGVuCiBhZGp1c3Rf
-cmF5X2J1ZGdldChyZWNlbnRfY3B1IG9yIDApCmVuZAogCiAtLSB6LWJ1ZmZlciBoZWxwZXJzICh1
-c2UgZnJhbWUtc3RhbXAsIGRlZmluZWQgb25jZSkKIGlmIG5vdCB6cmVhZCB0aGVuCiAgZnVuY3Rp
-b24genJlYWQoeCkKICAgLS0geCBpcyAwLWJhc2VkOyByZXR1cm4gOTk5IHVubGVzcyBzdGFtcGVk
-IHRoaXMgZnJhbWUKICAgbG9jYWwgc3RhbXA9enN0YW1wOmdldCh4KSBvciAwCiAgIGlmIHN0YW1w
-PT1kaWFnX2ZyYW1lX2NvdW50IHRoZW4KICAgIGxvY2FsIHo9emJ1ZjpnZXQoeCkKICAgIHJldHVy
-biB6IG9yIDk5OQogICBlbmQKICAgcmV0dXJuIDk5OQogIGVuZAogIGZ1bmN0aW9uIHp3cml0ZSh4
-LHopCiAgIHpidWY6c2V0KHgseikKICAgenN0YW1wOnNldCh4LGRpYWdfZnJhbWVfY291bnQpCiAg
-ZW5kCiBlbmQKIAogLS0gY2FjaGUgc2luL2NvcyBmb3IgZW50aXJlIGZyYW1lIHRvIGF2b2lkIHJl
-Y29tcHV0YXRpb24KIHNhX2NhY2hlZD1zaW4ocGxheWVyLmEpCiBjYV9jYWNoZWQ9Y29zKHBsYXll
-ci5hKQogCiBpZiB2aWV3X21vZGU9PSIzZCIgdGhlbgogIHJheWNhc3Rfc2NlbmUoKQogIGxvY2Fs
-IHRfcmF5Y2FzdD10aW1lKCkKICByZW5kZXJfZmxvb3JfY2VpbGluZygpICAtLSBOb3cgaW5jbHVk
-ZXMgd2FsbCByZW5kZXJpbmcKICBsb2NhbCB0X2Zsb29yX3dhbGxzPXRpbWUoKQogIHJlbmRlcl9z
-cHJpdGVzKCkKICBsb2NhbCB0X3Nwcml0ZXM9dGltZSgpCiAgCiAgbG9jYWwgbXNfcmF5Y2FzdD0o
-dF9yYXljYXN0LWZyYW1lX3N0YXJ0KSoxMDAwCiAgbG9jYWwgbXNfZmxvb3Jfd2FsbHM9KHRfZmxv
-b3Jfd2FsbHMtdF9yYXljYXN0KSoxMDAwCiAgbG9jYWwgbXNfc3ByaXRlcz0odF9zcHJpdGVzLXRf
-Zmxvb3Jfd2FsbHMpKjEwMDAKICBsb2NhbCBmcmFtZV9tcz0odF9zcHJpdGVzLWZyYW1lX3N0YXJ0
-KSoxMDAwCiAgCiAgLS0gaHVkCiAgcHJpbnQoInBvczoiLi5mbHIocGxheWVyLngpLi4iLCIuLmZs
-cihwbGF5ZXIueSksMiwyLDcpCiAgcHJpbnQoImFuZzoiLi4oZmxyKHBsYXllci5hKjEwMCkvMTAw
-KSwyLDEwLDcpCiAgcHJpbnQoImZwczoiLi5zdGF0KDcpLDIsMTgsNykKICBwcmludCgiaHA6Ii4u
-cGxheWVyLmhwLDIsMjYsNykKICBsb2NhbCBmcmFtZV9tc19jb2w9KGZyYW1lX21zPDMyIGFuZCAx
-MSkgb3IgKGZyYW1lX21zPDQwIGFuZCAxMCkgb3IgOAogIHByaW50KCJmcmFtZV9tczoiLi4oZmxy
-KGZyYW1lX21zKjEwKS8xMCkuLiJtcyIsMiw0MixmcmFtZV9tc19jb2wpCiAgaWYgZGVidWdfbW9k
-ZSB0aGVuCiAgIHByaW50KCJyYXljYXN0OiIuLihmbHIobXNfcmF5Y2FzdCoxMCkvMTApLi4ibXMi
-LDIsNTAsNykKICAgcHJpbnQoImZsb29yK3dhbGxzOiIuLihmbHIobXNfZmxvb3Jfd2FsbHMqMTAp
-LzEwKS4uIm1zIiwyLDU4LDcpCiAgIHByaW50KCJzcHJpdGVzOiIuLihmbHIobXNfc3ByaXRlcyox
-MCkvMTApLi4ibXMiLDIsNjYsNykKICAgcHJpbnQoIlt4XSB0b2dnbGUgbWFwIiwyLDM0LDcpCiAg
-ZW5kCiAgCiAgLS0gaW50ZXJhY3Rpb24gcHJvbXB0CiAgaWYgaW50ZXJhY3Rpb25fYWN0aXZlIGFu
-ZCBjdXJyZW50X2ludGVyYWN0IHRoZW4KICAgcHJpbnQoIltFXS9aOiBpbnRlcmFjdCIsc2NyZWVu
-X2NlbnRlcl94LTQwLHNjcmVlbl9oZWlnaHQtMjAsMTEpCiAgZW5kCiAgCiAgLS0gdHJhcCBtZXNz
-YWdlCiAgaWYgdHJhcF9tc2dfdGltZXI_MCB0aGVuCiAgIHByaW50KCJ0cmFwIHNwcnVuZyEiLHNj
-cmVlbl9jZW50ZXJfeC0zMCxzY3JlZW5fY2VudGVyX3ksOCkKICBlbmQKICAKIC0tW1sgREVCVUcg
-UEFORUwgUkVNT1ZFRCBGT1IgUFJPRFVDVElPTiBQRVJGT1JNQU5DRQogaWYgZGVidWdfbW9kZSB0
-aGVuCiAgLS0gcmVtb3ZlZAogZW5kCiBdXQogIAogLS1bWyBQRVJJT0RJQyBMT0dHSU5HIFJFTU9W
-RUQgRk9SIFBST0RVQ1RJT04gUEVSRk9STUFOQ0UKIGlmIGVuYWJsZV9kaWFnbm9zdGljc19sb2dn
-aW5nIGFuZCBkaWFnX2ZyYW1lX2NvdW50JTYwPT0wIHRoZW4KICAtLSByZW1vdmVkCiBlbmQKIF1d
-CiAgCiAgLS0gbWluaW1hcCBIVUQgb3ZlcmxheQogIGRyYXdfbWluaW1hcF9odWQoKQogZWxzZQog
-IGRyYXdfbWluaW1hcCgpCiBlbmQKIAogLS0gY29tYmF0IG92ZXJsYXkKIGlmIGluX2NvbWJhdCB0
-aGVuCiAgcmVjdGZpbGwoMCxzY3JlZW5faGVpZ2h0LTQwLHNjcmVlbl93aWR0aCxzY3JlZW5faGVp
-Z2h0LDApCiAgcHJpbnQoImVudGVyaW5nIGNvbWJhdC4uLiIsc2NyZWVuX2NlbnRlcl94LTQwLHNj
-cmVlbl9jZW50ZXJfeSw4KQogIHByaW50KCJbZW50ZXJdIGV4aXQgKHRlbXApIixzY3JlZW5fY2Vu
-dGVyX3gtNDAsc2NyZWVuX2NlbnRlcl95KzEwLDcpCiBlbmQKIAogLS0gcmVzdG9yZSBwYWxldHRl
-IGZyb20gZm9nIHJlbWFwcGluZyAoc2luZ2xlIHJlc3RvcmUgcGVyIGZyYW1lKQogcGFsKCkKIC0t
-IHJlc2V0IGZvZyBzdGF0ZSBzbyBmaXJzdCBzZXRfZm9nIGFwcGxpZXMgbWFwcGluZyBuZXh0IGZy
-YW1lCiBsYXN0X2ZvZ19sZXZlbD0tMQogcHJldl9wYWw9e30KZW5kCgotLSBkcmF3IDJkIG1pbmlt
-YXAgZm9yIHRlc3RpbmcKLS0gUHVycG9zZTogUmVuZGVyIDJEIHRvcC1kb3duIGRlYnVnIHZpZXcg
-b2YgZHVuZ2VvbgotLSBBbGdvcml0aG06IFNjYWxlIDEyOMOXMTI4IG1hcCB0byAyNTbDlzI1NiBw
-aXhlbHMgKHNjYWxlPTIpCi0tIERpc3BsYXlzOiBXYWxscywgcm9vbXMsIGRvb3JzLCBvYmplY3Rz
-LCBwbGF5ZXIgcG9zaXRpb24gYW5kIGZhY2luZwotLSBOb3RlczogVG9nZ2xlZCB3aXRoIFggYnV0
-dG9uLCB1c2VmdWwgZm9yIGRlYnVnZ2luZyBnZW5lcmF0aW9uCmZ1bmN0aW9uIGRyYXdfbWluaW1h
-cCgpCiBsb2NhbCBzY2FsZT0yCiBsb2NhbCBveCxveT0xMCwxMAogCiAtLSBiYXRjaCBhbGwgdGls
-ZSBkcmF3aW5nIHRvIHJlZHVjZSBkcmF3IGNhbGwgY291bnQKIHJiYXRjaF9yZXNldCgpCiAKIC0t
-IGRyYXcgd2FsbHMgZnJvbSBtYXAud2FsbHMgdXNlcmRhdGEgd2l0aCBmbG9vciBkYXRhIHRvIGRp
-c3Rpbmd1aXNoIGNvcnJpZG9ycyBmcm9tIHZvaWQKIGZvciB4PTAsMTI3IGRvCiAgZm9yIHk9MCwx
-MjcgZG8KICAgbG9jYWwgd2FsbD1nZXRfd2FsbCh4LHkpCiAgIGxvY2FsIGZsb29yX3ZhbD1nZXRf
-Zmxvb3IoeCx5KQogICBsb2NhbCBjb2xvcgogICBpZiB3YWxsPjAgdGhlbgogICAgLS0gd2FsbCB0
-aWxlCiAgICBjb2xvcj01CiAgIGVsc2VpZiBmbG9vcl92YWw_MCB0aGVuCiAgICAtLSBjYXJ2ZWQg
-Y29ycmlkb3Ivcm9vbSBmbG9vciAoZmxvb3IgdHlwZSBzZXQgZHVyaW5nIGdlbmVyYXRpb24pCiAg
-ICBjb2xvcj02CiAgIGVsc2UKICAgIC0tIHVuY2FydmVkIHZvaWQgKHdhbGw9MCwgZmxvb3I9MCkK
-ICAgIGNvbG9yPTEKICAgZW5kCiAgIHJiYXRjaF9wdXNoKG94K3gqc2NhbGUsb3kreSpzY2FsZSxv
-eCt4KnNjYWxlK3NjYWxlLTEsb3kreSpzY2FsZStzY2FsZS0xLGNvbG9yKQogIGVuZAogZW5kCiAK
-IHJiYXRjaF9zdWJtaXQoKQogCiAtLSBkcmF3IHJvb21zCiBmb3Igbm9kZSBpbiBhbGwoZ2VuX25v
-ZGVzKSBkbwogIGxvY2FsIHI9bm9kZS5yZWN0CiAgcmVjdChveCtyWzFdKnNjYWxlLG95K3JbMl0q
-c2NhbGUsb3grclszXSpzY2FsZSxveStyWzRdKnNjYWxlLDExKQogZW5kCiAKIC0tIGJhdGNoIGRv
-b3IgZHJhd2luZwogcmJhdGNoX3Jlc2V0KCkKIGZvciBkb29yIGluIGFsbChkb29ycykgZG8KICBs
-b2NhbCBjPWRvb3IuZHR5cGU9PWRvb3JfbG9ja2VkIGFuZCA4IG9yIDEyCiAgcmJhdGNoX3B1c2go
-b3grZG9vci54KnNjYWxlLG95K2Rvb3IueSpzY2FsZSxveCtkb29yLngqc2NhbGUrc2NhbGUtMSxv
-eStkb29yLnkqc2NhbGUrc2NhbGUtMSxjKQogZW5kCiByYmF0Y2hfc3VibWl0KCkKIAogLS0gZHJh
-dyBvYmplY3RzCiBmb3Igb2IgaW4gYWxsKG9iamVjdHMpIGRvCiAgbG9jYWwgYz03CiAgaWYgb2Iu
-dHlwIGFuZCBvYi50eXAua2luZD09Imhvc3RpbGVfbnBjIiB0aGVuIGM9OAogIGVsc2VpZiBvYi50
-eXAgYW5kIG9iLnR5cC5raW5kPT0iZGlyZWN0X3BpY2t1cCIgdGhlbgogICBpZiBvYi50eXAuc3Vi
-dHlwZT09ImhlYXJ0IiB0aGVuIGM9MTQKICAgZWxzZWlmIG9iLnR5cC5zdWJ0eXBlPT0ia2V5IiB0
-aGVuIGM9OQogICBlbmQKICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVyYWN0
-YWJsZSIgdGhlbgogICBpZiBvYi50eXAuc3VidHlwZT09ImV4aXQiIHRoZW4gYz0xMiBlbmQKICBl
-bHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImRlY29yYXRpdmUiIHRoZW4gYz0xMwogIGVu
-ZAogIGxvY2FsIHg9b2IucG9zWzFdCiAgbG9jYWwgeT1vYi5wb3NbMl0KICBjaXJjZmlsbChveCt4
-KnNjYWxlLG95K3kqc2NhbGUsMSxjKQogZW5kCiAKIC0tIGRyYXcgcGxheWVyCiBsb2NhbCBweCxw
-eT1veCtwbGF5ZXIueCpzY2FsZSxveStwbGF5ZXIueSpzY2FsZQogY2lyY2ZpbGwocHgscHksMiwx
-MCkKIGxvY2FsIHNhLGNhPXNpbihwbGF5ZXIuYSksY29zKHBsYXllci5hKQogbGluZShweCxweSxw
-eCtjYSo2LHB5K3NhKjYsMTApCiAKIC0tIHN0YXRzCiBwcmludCgiMmQgbWFwIHZpZXciLDEwLDIs
-NykKIHByaW50KCJyb29tczogIi4uZ2VuX3N0YXRzLnJvb21zLDEwLDEwLDcpCiBwcmludCgib2Jq
-ZWN0czogIi4uZ2VuX3N0YXRzLm9iamVjdHMsMTAsMTgsNykKIHByaW50KCJzZWVkOiAiLi5nZW5f
-c3RhdHMuc2VlZCwxMCwyNiw3KQogaWYgZGVidWdfbW9kZSB0aGVuCiAgcHJpbnQoIlt4XSB0b2dn
-bGUgM2QiLDEwLDM0LDcpCiBlbmQKZW5kCgotLSBkcmF3IGh1ZCBtaW5pbWFwIG92ZXJsYXkKLS0g
-UHVycG9zZTogUmVuZGVyIHNjcm9sbGluZyB2aWV3cG9ydCBtaW5pbWFwIGluIHRvcC1yaWdodCBj
-b3JuZXIgZHVyaW5nIDNEIHZpZXcKLS0gQWxnb3JpdGhtOiBQbGF5ZXItY2VudGVyZWQgY2FtZXJh
-IHdpdGggY2xpcHBlZCBkcmF3aW5nIG9mIHZpc2libGUgdGlsZXMgb25seQotLSBEaXNwbGF5czog
-V2FsbHMsIGZsb29ycywgZG9vcnMsIG9iamVjdHMsIHBsYXllciAoYXV0by1zY3JvbGxzIGFzIHBs
-YXllciBtb3ZlcykKLS0gTm90ZXM6IEZpeGVkIDEyMMOXNjhweCB2aWV3cG9ydCBhdCB0b3Atcmln
-aHQsIHNjYWxlPTIsIG9ubHkgZHJhd3MgdmlzaWJsZSB0aWxlIHJhbmdlCmZ1bmN0aW9uIGRyYXdf
-bWluaW1hcF9odWQoKQogbG9jYWwgaHVkX3c9Y2VpbChzY3JlZW5fd2lkdGgqMC4yNSkKIGxvY2Fs
-IGh1ZF9oPWNlaWwoc2NyZWVuX2hlaWdodCowLjI1KQogbG9jYWwgaHVkX3g9c2NyZWVuX3dpZHRo
-LWh1ZF93LTgKIGxvY2FsIGh1ZF95PTgKIGxvY2FsIHNjYWxlPTIKIAogLS0gY2FtZXJhIG9mZnNl
-dCB0byBjZW50ZXIgcGxheWVyIGluIHZpZXdwb3J0CiBsb2NhbCBjYW1feD1wbGF5ZXIueCpzY2Fs
-ZS1odWRfdy8yCiBsb2NhbCBjYW1feT1wbGF5ZXIueSpzY2FsZS1odWRfaC8yCiAKIC0tIGNhbGN1
-bGF0ZSB2aXNpYmxlIHRpbGUgcmFuZ2UKIGxvY2FsIHhfbWluPW1heCgwLGZscihjYW1feC9zY2Fs
-ZSkpCiBsb2NhbCB4X21heD1taW4oMTI3LGZscigoY2FtX3graHVkX3cpL3NjYWxlKSkKIGxvY2Fs
-IHlfbWluPW1heCgwLGZscihjYW1feS9zY2FsZSkpCiBsb2NhbCB5X21heD1taW4oMTI3LGZscigo
-Y2FtX3kraHVkX2gpL3NjYWxlKSkKIAogLS0gc2V0IGNsaXAgcmVnaW9uCiBjbGlwKGh1ZF94LGh1
-ZF95LGh1ZF93LGh1ZF9oKQogCiAtLSBkcmF3IGJhY2tncm91bmQKIHJlY3RmaWxsKGh1ZF94LGh1
-ZF95LGh1ZF94K2h1ZF93LTEsaHVkX3kraHVkX2gtMSwwKQogCiAtLSBiYXRjaCBtYXAgdGlsZXMg
-KG9ubHkgdmlzaWJsZSByYW5nZSkKIHJiYXRjaF9yZXNldCgpCiBmb3IgeD14X21pbix4X21heCBk
-bwogIGZvciB5PXlfbWluLHlfbWF4IGRvCiAgIGxvY2FsIHN4PWh1ZF94Kyh4KnNjYWxlLWNhbV94
-KQogICBsb2NhbCBzeT1odWRfeSsoeSpzY2FsZS1jYW1feSkKICAgCiAgIC0tIGFkZGl0aW9uYWwg
-Ym91bmRzIGNoZWNrCiAgIGlmIHN4Pj1odWRfeCBhbmQgc3g8aHVkX3graHVkX3cgYW5kIHN5Pj1o
-dWRfeSBhbmQgc3k8aHVkX3kraHVkX2ggdGhlbgogICAgbG9jYWwgd2FsbD1nZXRfd2FsbCh4LHkp
-CiAgICBsb2NhbCBmbG9vcl92YWw9Z2V0X2Zsb29yKHgseSkKICAgIGxvY2FsIGNvbG9yCiAgICAK
-ICAgIGlmIHdhbGw_MCB0aGVuCiAgICAgY29sb3I9NQogICAgZWxzZWlmIGZsb29yX3ZhbD4wIHRo
-ZW4KICAgICBjb2xvcj02CiAgICBlbHNlCiAgICAgY29sb3I9MQogICAgZW5kCiAgICAKICAgIHJi
-YXRjaF9wdXNoKHN4LHN5LHN4K3NjYWxlLTEsc3krc2NhbGUtMSxjb2xvcikKICAgZW5kCiAgZW5k
-CiBlbmQKIHJiYXRjaF9zdWJtaXQoKQogCiAtLSBiYXRjaCBkb29yIGRyYXdpbmcgdmlhIHNwYXRp
-YWwgcXVlcnkgb3ZlciB2aXNpYmxlIHRpbGVzCiByYmF0Y2hfcmVzZXQoKQogZm9yIHg9eF9taW4s
-eF9tYXggZG8KICBmb3IgeT15X21pbix5X21heCBkbwogICBsb2NhbCBkb29yPWRvb3JncmlkW3hd
-IGFuZCBkb29yZ3JpZFt4XVt5XSBvciBuaWwKICAgaWYgZG9vciB0aGVuCiAgICBsb2NhbCBzeD1o
-dWRfeCsoeCpzY2FsZS1jYW1feCkKICAgIGxvY2FsIHN5PWh1ZF95Kyh5KnNjYWxlLWNhbV95KQog
-ICAgaWYgc3g_PWh1ZF94IGFuZCBzeDxodWRfeCtodWRfdyBhbmQgc3k_PWh1ZF95IGFuZCBzeTxo
-dWRfeStodWRfaCB0aGVuCiAgICAgbG9jYWwgYz1kb29yLmR0eXBlPT1kb29yX2xvY2tlZCBhbmQg
-OCBvciAxMgogICAgIHJiYXRjaF9wdXNoKHN4LHN5LHN4K3NjYWxlLTEsc3krc2NhbGUtMSxjKQog
-ICAgZW5kCiAgIGVuZAogIGVuZAogZW5kCiByYmF0Y2hfc3VibWl0KCkKIAogLS0gZHJhdyBvYmpl
-Y3RzIHZpYSBmbGF0IGFycmF5IGl0ZXJhdGlvbiB3aXRoaW4gdmlld3BvcnQgYm91bmRzCiBmb3Ig
-b2IgaW4gYWxsKG9iamVjdHMpIGRvCiAgaWYgb2IucG9zIHRoZW4KICAgbG9jYWwgc3g9aHVkX3gr
-KG9iLnBvc1sxXSpzY2FsZS1jYW1feCkKICAgbG9jYWwgc3k9aHVkX3krKG9iLnBvc1syXSpzY2Fs
-ZS1jYW1feSkKICAgaWYgc3g_PWh1ZF94IGFuZCBzeDxodWRfeCtodWRfdyBhbmQgc3k_PWh1ZF95
-IGFuZCBzeTxodWRfeStodWRfaCB0aGVuCiAgICBsb2NhbCBjPTcKICAgIGlmIG9iLnR5cCBhbmQg
-b2IudHlwLmtpbmQ9PSJob3N0aWxlX25wYyIgdGhlbiBjPTgKICAgIGVsc2VpZiBvYi50eXAgYW5k
-IG9iLnR5cC5raW5kPT0iZGlyZWN0X3BpY2t1cCIgdGhlbgogICAgIGlmIG9iLnR5cC5zdWJ0eXBl
-PT0iaGVhcnQiIHRoZW4gYz0xNAogICAgIGVsc2VpZiBvYi50eXAuc3VidHlwZT09ImtleSIgdGhl
-biBjPTkKICAgICBlbmQKICAgIGVsc2VpZiBvYi50eXAgYW5kIG9iLnR5cC5raW5kPT0iaW50ZXJh
-Y3RhYmxlIiB0aGVuCiAgICAgaWYgb2IudHlwLnN1YnR5cGU9PSJleGl0IiB0aGVuIGM9MTIgZW5k
-CiAgICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImRlY29yYXRpdmUiIHRoZW4gYz0x
-MwogICAgZW5kCiAgICBjaXJjZmlsbChzeCxzeSwxLGMpCiAgIGVuZAogIGVuZAogZW5kCiAKIC0t
-IGRyYXcgcGxheWVyIChhbHdheXMgY2VudGVyZWQgYnkgY2FtZXJhIGRlc2lnbikKIGxvY2FsIHB4
-PWh1ZF94KyhwbGF5ZXIueCpzY2FsZS1jYW1feCkKIGxvY2FsIHB5PWh1ZF95KyhwbGF5ZXIueSpz
-Y2FsZS1jYW1feSkKIGNpcmNmaWxsKHB4LHB5LDIsMTApCiBsaW5lKHB4LHB5LHB4K2NhX2NhY2hl
-ZCo2LHB5K3NhX2NhY2hlZCo2LDEwKQogCiAtLSBvcHRpb25hbCBmcmFtZQogcmVjdChodWRfeCxo
-dWRfeSxodWRfeCtodWRfdy0xLGh1ZF95K2h1ZF9oLTEsNykKIAogLS0gcmVzZXQgY2xpcAogY2xp
-cCgpCmVuZAoKLS0gdW5pZmllZCBjb2xsaXNpb24gY2hlY2sgZm9yIHdhbGxzLCBkb29ycywgYW5k
-IG9iamVjdHMKLS0gUHVycG9zZTogVW5pZmllZCBjb2xsaXNpb24gZGV0ZWN0aW9uIGZvciB3YWxs
-cywgZG9vcnMsIGFuZCBvYmplY3RzCi0tIFBhcmFtZXRlcnM6IHB4LCBweSAod29ybGQgcG9zaXRp
-b24pLCByYWRpdXMgKGNvbGxpc2lvbiByYWRpdXMpLCBvcGVuZG9vcnMgKGF1dG8tb3BlbiBkb29y
-cyksIGlzcGxheWVyIChlbmFibGUga2V5IGNoZWNraW5nKQotLSBSZXR1cm5zOiBib29sZWFuICh0
-cnVlIGlmIGNvbGxpc2lvbiBkZXRlY3RlZCkKLS0gQWxnb3JpdGhtOiBHcmlkLWJhc2VkIHdhbGwg
-Y2hlY2sgKyBzcGF0aWFsIHBhcnRpdGlvbmluZyBmb3Igb2JqZWN0cwotLSBTaWRlIGVmZmVjdHM6
-IE9wZW5zIGRvb3JzLCBwcmV2ZW50cyBkb29yIGNsb3Npbmcgd2hlbiBwbGF5ZXIgaW5zaWRlCmZ1
-bmN0aW9uIGlzY29sKHB4LHB5LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpCiBsb2NhbCBjb2w9
-ZmFsc2UKIG9wZW5kb29ycz1vcGVuZG9vcnMgb3IgZmFsc2UKIGlzcGxheWVyPWlzcGxheWVyIG9y
-IGZhbHNlCiAKIC0tIGNoZWNrIGdyaWQgY2VsbHMgYXJvdW5kIHBvc2l0aW9uCiBmb3IgeD1mbHIo
-cHgtcmFkaXVzKSxmbHIocHgrcmFkaXVzKSBkbwogIGZvciB5PWZscihweS1yYWRpdXMpLGZscihw
-eStyYWRpdXMpIGRvCiAgIC0tIGJvdW5kcyBjaGVjawogICBpZiB4PDAgb3IgeD49MTI4IG9yIHk8
-MCBvciB5Pj0xMjggdGhlbgogICAgY29sPXRydWUKICAgIGJyZWFrCiAgIGVsc2UKICAgIGxvY2Fs
-IHRpbGU9Z2V0X3dhbGwoeCx5KQogICAgCiAgICAtLSBjaGVjayBpZiBkb29yIHRpbGUKICAgIGlm
-IHRpbGU9PWRvb3Jfbm9ybWFsIG9yIHRpbGU9PWRvb3JfbG9ja2VkIG9yIHRpbGU9PWRvb3Jfc3Rh
-eV9vcGVuIHRoZW4KICAgICBsb2NhbCBkb29yPWRvb3JncmlkW3hdW3ldCiAgICAgaWYgZG9vciB0
-aGVuCiAgICAgIGlmIGRvb3Iub3Blbj09MSB0aGVuCiAgICAgICAtLSBmdWxseSBvcGVuOiBwcmV2
-ZW50IGNsb3NpbmcKICAgICAgIGRvb3Iub3BlbmluZz10cnVlCiAgICAgIGVsc2UKICAgICAgIC0t
-IGRvb3IgcGFydGlhbGx5IG9wZW4gb3IgY2xvc2VkOiBjb2xsaXNpb24gZGV0ZWN0ZWQKICAgICAg
-IGNvbD10cnVlCiAgICAgICAtLSBoYW5kbGUgdW5sb2NraW5nL29wZW5pbmcgYmVmb3JlIGV4aXRp
-bmcgaW5uZXIgbG9vcAogICAgICAgaWYgb3BlbmRvb3JzIHRoZW4KICAgICAgICBpZiBkb29yLmtl
-eW51bSB0aGVuCiAgICAgICAgIC0tIGNoZWNrIGludmVudG9yeSBmb3Iga2V5CiAgICAgICAgIGlm
-IGlzcGxheWVyIHRoZW4KICAgICAgICAgIGZvciBpLGl0ZW0gaW4gaXBhaXJzKHBsYXllci5rZXlz
-KSBkbwogICAgICAgICAgIGlmIGl0ZW0ua2V5bnVtPT1kb29yLmtleW51bSB0aGVuCiAgICAgICAg
-ICAgIC0tIHJlbW92ZSBrZXkKICAgICAgICAgICAgZGVsaShwbGF5ZXIua2V5cyxpKQogICAgICAg
-ICAgICBkb29yLmtleW51bT1uaWwKICAgICAgICAgICAgZG9vci5vcGVuaW5nPXRydWUKICAgICAg
-ICAgICAgLS0ga2VlcCBjb2w9dHJ1ZSwgZG9uJ3QgY2xlYXIgaW1tZWRpYXRlbHkKICAgICAgICAg
-ICAgYnJlYWsKICAgICAgICAgICBlbmQKICAgICAgICAgIGVuZAogICAgICAgICBlbmQKICAgICAg
-ICBlbHNlCiAgICAgICAgIC0tIHVubG9ja2VkCiAgICAgICAgIGRvb3Iub3BlbmluZz10cnVlCiAg
+Y2tpbmcgKHJlZnJlc2hlZCBlYWNoIGZyYW1lKQogZGlhZ19mcmFtZV9jb3VudD0wCiBkaWFnX3dh
+bGxfY29sdW1ucz0wCiBkaWFnX3dhbGxfbG9kX2NvbHVtbnM9MAogZGlhZ19mbG9vcl9yb3dzPTAK
+IGRpYWdfZmxvb3JfYmF0Y2hlcz0wCiBkaWFnX3Nwcml0ZV9jb2x1bW5zPTAKIGRpYWdfc3ByaXRl
+X2ltcG9zdG9yX2NvbHVtbnM9MAogZGlhZ19hY3RpdmVfcmF5cz1yYXlfY291bnQKIGxhc3RfY3B1
+X3NhbXBsZT0wCiAKIC0tIHRlc3QgZG9vciBtb2RlCiB0ZXN0X2Rvb3JfbW9kZT1mYWxzZQoKIC0t
+IGNyZWF0ZSB0aW50ZWQgZXJyb3IgdGV4dHVyZXMgZm9yIGRpZmZlcmVudCBvYmplY3QgdHlwZXMg
+KGNoZWNrZXJib2FyZCBwYXR0ZXJuKQogLS0gd2FsbHM6IG1hZ2VudGEvcGluayAoOC8xNCksIGZs
+b29yOiBibHVlL2N5YW4gKDEyLzEzKSwgY2VpbGluZzogZ3JlZW4vZGFyayBncmVlbiAoMTEvMykK
+IC0tIHNwcml0ZXM6IHllbGxvdy9vcmFuZ2UgKDEwLzkpLCBwcm9wczogcmVkL2Jyb3duICg4LzQp
+CiBlcnJvcl90ZXh0dXJlcyA9IHsKICB3YWxsID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKIGRv
+b3IgPSB1c2VyZGF0YSgidTgiLCAzMiwgMzIpLAogIGZsb29yID0gdXNlcmRhdGEoInU4IiwgMzIs
+IDMyKSwKICBjZWlsaW5nID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKICBzcHJpdGUgPSB1c2Vy
+ZGF0YSgidTgiLCAzMiwgMzIpLAogIGRlZmF1bHQgPSB1c2VyZGF0YSgidTgiLCAzMiwgMzIpCiB9
+CiAKIC0tIGdlbmVyYXRlIHRpbnRlZCBjaGVja2VyYm9hcmRzIGZvciBlYWNoIHR5cGUKIGxvY2Fs
+IHRpbnRzID0gewogIHdhbGwgPSB7OCwgMTR9LCAgICAgIC0tIG1hZ2VudGEvcGluawogZG9vciA9
+IHsyLCA2fSwgICAgICAgLS0gcHVycGxlL2JsdWUgKGRpc3RpbmN0IGZyb20gd2FsbHMpCiAgZmxv
+b3IgPSB7MTIsIDEzfSwgICAgLS0gYmx1ZS9jeWFuCiAgY2VpbGluZyA9IHsxMSwgM30sICAgLS0g
+Z3JlZW4vZGFyayBncmVlbgogIHNwcml0ZSA9IHsxMCwgOX0sICAgIC0tIHllbGxvdy9vcmFuZ2UK
+ICBkZWZhdWx0ID0gezgsIDE0fSAgICAtLSBtYWdlbnRhL3BpbmsgKGZhbGxiYWNrKQogfQogCiBm
+b3IgdHlwZV9uYW1lLCBjb2xvcnMgaW4gcGFpcnModGludHMpIGRvCiAgZm9yIHk9MCwzMSBkbwog
+ICBmb3IgeD0wLDMxIGRvCiAgICBsb2NhbCBjb2xvciA9ICgoZmxyKHgvNCkgKyBmbHIoeS80KSkg
+JSAyID09IDApIGFuZCBjb2xvcnNbMV0gb3IgY29sb3JzWzJdCiAgICBlcnJvcl90ZXh0dXJlc1t0
+eXBlX25hbWVdOnNldCh4LCB5LCBjb2xvcikKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gbWFpbnRh
+aW4gYmFja3dhcmQgY29tcGF0aWJpbGl0eSB3aXRoIHNpbmdsZSBlcnJvcl90ZXh0dXJlCiBlcnJv
+cl90ZXh0dXJlID0gZXJyb3JfdGV4dHVyZXMuZGVmYXVsdAoKIC0tIHJlc2VydmUgc3ByaXRlIGlu
+ZGV4ZXMgZm9yIGVycm9yIHRleHR1cmVzIChiYXRjaGluZyBwcmVmZXJzIHNwcml0ZSBpbmRleGVz
+KQogRVJST1JfSURYID0geyB3YWxsPTgwMDAsIGRvb3I9ODAwMSwgZmxvb3I9ODAwMiwgY2VpbGlu
+Zz04MDAzLCBzcHJpdGU9ODAwNCwgZGVmYXVsdD04MDA1IH0KIGZvciBuYW1lLCB1ZCBpbiBwYWly
+cyhlcnJvcl90ZXh0dXJlcykgZG8KICBsb2NhbCBpZHggPSBFUlJPUl9JRFhbbmFtZV0gb3IgRVJS
+T1JfSURYLmRlZmF1bHQKICBzZXRfc3ByKGlkeCwgdWQpCiBlbmQKIAogLS0gUHJlbG9hZCB0ZXh0
+dXJlIGNhY2hlIGZvciBjb21tb25seS11c2VkIHNwcml0ZXMgKDAtMjAwKQogLS0gUG9wdWxhdGUg
+dGV4X2NhY2hlIGRpcmVjdGx5IHVzaW5nIGdldF9zcHIoKSB0byBhdm9pZCB3YXJuaW5ncwogcHJp
+bnRoKCJwcmVsb2FkaW5nIHRleHR1cmUgY2FjaGUuLi4iKQogbG9jYWwgcHJlbG9hZF9zdGFydCA9
+IHRpbWUoKQogZm9yIGk9MCwyMDAgZG8KICBsb2NhbCBzcmM9Z2V0X3NwciBhbmQgZ2V0X3Nwcihp
+KQogIGlmIHNyYyBhbmQgY2FjaGVfdGV4IHRoZW4KICAgY2FjaGVfdGV4KGksIHNyYywgZmFsc2Up
+CiAgZW5kCiBlbmQKIGxvY2FsIHByZWxvYWRfdGltZSA9ICh0aW1lKCkgLSBwcmVsb2FkX3N0YXJ0
+KSAqIDEwMDAKIHByaW50aCgidGV4dHVyZSBjYWNoZSBwcmVsb2FkZWQ6ICIuLnByZWxvYWRfdGlt
+ZS4uIm1zIikKIC0tIFRyaWdnZXIgR0MgYWZ0ZXIgcHJlbG9hZGluZyAoUGljb3Ryb24gZ3VpZGVs
+aW5lOiBzdGF0KDApIGR1cmluZyBwYXVzZXMgb25seSkKIHN0YXQoMCkKIAogLS0gbG9nZ2luZyBo
+ZWxwZXI6IGNvbnNvbGUgKyByaW5nIGJ1ZmZlciBmb3Igb3B0aW9uYWwgb24tc2NyZWVuIGVjaG8K
+IGxvZ19saW5lcyA9IHt9CiBmdW5jdGlvbiBsb2coc3RyKQogIHByaW50aChzdHIpCiAgYWRkKGxv
+Z19saW5lcywgc3RyKQogIGlmICNsb2dfbGluZXMgPiAyMDAgdGhlbiBkZWxpKGxvZ19saW5lcywg
+MSkgZW5kCiBlbmQKCiAtLSB2YWxpZGF0ZSBhbGwgY29uZmlndXJlZCBzcHJpdGVzIGV4aXN0IChj
+b21tZW50IG91dCBmb3IgcHJvZHVjdGlvbikKIHZhbGlkYXRlX3Nwcml0ZV9jb25maWd1cmF0aW9u
+KCkKCiBwcmludGgoInBpY290cm9uIHJheWNhc3QgZW5naW5lIHYxLjAiKQogc3dpdGNoX3NjZW5l
+KCJtZW51IikKZW5kCgotLSB2YWxpZGF0ZSBzcHJpdGUgY29uZmlndXJhdGlvbiBhdCBzdGFydHVw
+IChvcHRpb25hbCwgY2FuIGJlIGRpc2FibGVkIGZvciBwZXJmb3JtYW5jZSkKZnVuY3Rpb24gdmFs
+aWRhdGVfc3ByaXRlX2NvbmZpZ3VyYXRpb24oKQogLS0gY2hlY2sgZW5lbXkgc3ByaXRlcwogZm9y
+IGVuZW15IGluIGFsbChlbmVteV90eXBlcykgZG8KICBpZiBub3QgZ2V0X3NwcihlbmVteS5zcHJp
+dGUpIHRoZW4KICAgcHJpbnRoKCJXQVJOSU5HOiBlbmVteSBzcHJpdGUgIi4uZW5lbXkuc3ByaXRl
+Li4iICgiLi5lbmVteS5uYW1lLi4iKSBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICBlbmQKIGVu
+ZAogCiAtLSBjaGVjayBkZWNvcmF0aW9uIHNwcml0ZXMKIGZvciBkZWMgaW4gYWxsKGRlY29yYXRp
+b25fdHlwZXMpIGRvCiAgaWYgbm90IGdldF9zcHIoZGVjLnNwcml0ZSkgdGhlbgogICBwcmludGgo
+IldBUk5JTkc6IGRlY29yYXRpb24gc3ByaXRlICIuLmRlYy5zcHJpdGUuLiIgKCIuLmRlYy5uYW1l
+Li4iKSBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICBlbmQKIGVuZAogCiAtLSBjaGVjayB3YWxs
+IHRleHR1cmUgc3ByaXRlcwogZm9yIHRleHNldCBpbiBhbGwodGV4c2V0cykgZG8KICBmb3IgdmFy
+aWFudCBpbiBhbGwodGV4c2V0LnZhcmlhbnRzKSBkbwogICBpZiBub3QgZ2V0X3Nwcih2YXJpYW50
+KSB0aGVuCiAgICBwcmludGgoIldBUk5JTkc6IHdhbGwgdGV4dHVyZSBzcHJpdGUgIi4udmFyaWFu
+dC4uIiBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gY2hl
+Y2sgZmxvb3IvY2VpbGluZyBzcHJpdGVzCiBmb3IgdHlwIGluIGFsbChwbGFuZXR5cHMpIGRvCiAg
+aWYgbm90IGdldF9zcHIodHlwLnRleCkgdGhlbgogICBwcmludGgoIldBUk5JTkc6IGZsb29yL2Nl
+aWxpbmcgc3ByaXRlICIuLnR5cC50ZXguLiIgbm90IGZvdW5kIGluIEdGWCBmaWxlcyIpCiAgZW5k
+CiBlbmQKZW5kCgpmdW5jdGlvbiB1cGRhdGVfZ2FtZXBsYXkoKQogLS0gaW5jcmVtZW50IGZyYW1l
+IGNvdW50ZXIKIGZyYW1lX2N0Kz0xCiAKIC0tIG9wdGlvbmFsOiBzYW1wbGUgQ1BVIG91dHNpZGUg
+cmVuZGVyIGZyYW1lIChldmVyeSAzMCBmcmFtZXMpIGZvciBub24tcmVuZGVyIGdvdmVybm9yCiBp
+ZiBlbmFibGVfbm9ucmVuZGVyX2dvdmVybm9yIGFuZCAoZnJhbWVfY3QlMzA9PTApIHRoZW4KICBy
+ZWNlbnRfY3B1PXN0YXQoMSkgb3IgMAogZW5kCiAKIC0tIGNvbWJhdCBnYXRpbmc6IHNraXAgbm9y
+bWFsIHVwZGF0ZXMgd2hlbiBpbiBjb21iYXQKIGlmIGluX2NvbWJhdCB0aGVuCiAgdXBkYXRlX2Nv
+bWJhdCgpCiAgcmV0dXJuCiBlbmQKIAogdXBkYXRlX2lucHV0KCkKIHVwZGF0ZV9kb29ycygpCiAK
+IC0tIHVwZGF0ZSBucGMgYWkgKHJhdGUgbGltaXRlZCwgZGV0ZXJtaW5pc3RpYyBmcmFtZSBjaGVj
+aykKIGlmIGZyYW1lX2N0JWFpX3VwZGF0ZV9yYXRlPT0wIHRoZW4KICB1cGRhdGVfbnBjX2FpKCkK
+IGVuZAogCiBjYW09e3BsYXllci54LHBsYXllci55fQogCiAtLSB1cGRhdGUgZmxvb3IvY2VpbGlu
+ZyBzY3JvbGxpbmcKIGZsb29yLngrPWZsb29yLnR5cC54dmVsIG9yIDAKIGZsb29yLnkrPWZsb29y
+LnR5cC55dmVsIG9yIDAKIHJvb2YueCs9cm9vZi50eXAueHZlbCBvciAwCiByb29mLnkrPXJvb2Yu
+dHlwLnl2ZWwgb3IgMAogCiAtLSB1cGRhdGUgb2JqZWN0IGFuaW1hdGlvbnMKIGZvciBvYiBpbiBh
+bGwoYW5pbWF0ZWRfb2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5kIG9iLnR5cC5mcmFtZWN0IHRo
+ZW4KICAgb2IuZnJhbWUrPW9iLnR5cC5hbmltc3BkCiAgIGlmIG9iLmFuaW1sb29wIHRoZW4KICAg
+IG9iLmZyYW1lPW9iLmZyYW1lJW9iLnR5cC5mcmFtZWN0CiAgIGVsc2UKICAgIG9iLmZyYW1lPW1p
+bihvYi5mcmFtZSxvYi50eXAuZnJhbWVjdC0xKQogICBlbmQKICBlbmQKIGVuZAogCiAtLSB0b2dn
+bGUgdmlldyBtb2RlIChkZWJ1ZyBvbmx5KQogaWYgZGVidWdfbW9kZSBhbmQgKGtleXAoIngiKSBv
+ciBidG5wKDUpKSB0aGVuCiAgdmlld19tb2RlPXZpZXdfbW9kZT09IjNkIiBhbmQgIjJkIiBvciAi
+M2QiCiBlbmQKIAogLS0gZGVidWcgbW9kZSB0b2dnbGUgKG1vdmVkIGZyb20gYnRucCg0KSB0byBh
+dm9pZCBjb25mbGljdCkKIGlmIGtleXAoInRhYiIpIHRoZW4KICBkZWJ1Z19tb2RlPW5vdCBkZWJ1
+Z19tb2RlCiBlbmQKIAogLS0gZGlhZ25vc3RpY3Mgb3ZlcmxheSByZW1vdmVkOyBtZXJnZWQgaW50
+byBkZWJ1ZyBwYW5lbCAoVGFiKQogCiAtLSB0b2dnbGUgZGlhZ25vc3RpY3MgbG9nZ2luZyAoY29u
+dHJvbGxlciBidXR0b24gMTIpCiBpZiBidG5wKDEyKSB0aGVuCiAgZW5hYmxlX2RpYWdub3N0aWNz
+X2xvZ2dpbmc9bm90IGVuYWJsZV9kaWFnbm9zdGljc19sb2dnaW5nCiAgcHJpbnRoKCJEaWFnbm9z
+dGljcyBsb2dnaW5nOiAiLi50b3N0cmluZyhlbmFibGVfZGlhZ25vc3RpY3NfbG9nZ2luZykpCiBl
+bmQKIAogLS0gZGVjcmVtZW50IHRyYXAgbWVzc2FnZSB0aW1lcgogaWYgdHJhcF9tc2dfdGltZXI_
+MCB0aGVuCiAgdHJhcF9tc2dfdGltZXItPTEKIGVuZAogCiAtLSB0b2dnbGUgdGVzdCBkb29yIG1v
+ZGUgKHdoZW4gbm90IGluIDJkIG1hcCB2aWV3KQogaWYgdmlld19tb2RlPT0iM2QiIGFuZCAoa2V5
+cCgidiIpIG9yIGJ0bnAoMTUpKSB0aGVuCiAgdGVzdF9kb29yX21vZGU9bm90IHRlc3RfZG9vcl9t
+b2RlCiBlbmQKIAogLS0gY3ljbGUgdGVzdCBkb29yIG9wZW4gdmFsdWUgKDAuMCB0byAxLjApCiBp
+ZiB0ZXN0X2Rvb3JfbW9kZSB0aGVuCiAgaWYga2V5cCgiYyIpIHRoZW4KICAgdGVzdF9kb29yX29w
+ZW49KHRlc3RfZG9vcl9vcGVuIG9yIDApKzAuMQogICBpZiB0ZXN0X2Rvb3Jfb3Blbj4xIHRoZW4g
+dGVzdF9kb29yX29wZW49MCBlbmQKICBlbmQKICBpZiBrZXlwKCJkIikgdGhlbgogICB0ZXN0X2Rv
+b3Jfb3Blbj0odGVzdF9kb29yX29wZW4gb3IgMCktMC4xCiAgIGlmIHRlc3RfZG9vcl9vcGVuPDAg
+dGhlbiB0ZXN0X2Rvb3Jfb3Blbj0xIGVuZAogIGVuZAogZW5kCiAKIC0tIGN5Y2xlIGZsb29yIHR5
+cGUgKGZvciB0ZXN0aW5nKSB3aGVuIG5vdCBpbiBkb29yIHRlc3QgbW9kZQogaWYgbm90IHRlc3Rf
+ZG9vcl9tb2RlIGFuZCBrZXlwKCJjIikgdGhlbgogIGxvY2FsIGN1cnJlbnRfaWR4PTEKICBmb3Ig
+aT0xLCNwbGFuZXR5cHMgZG8KICAgaWYgcGxhbmV0eXBzW2ldLnRleD09Zmxvb3IudHlwLnRleCB0
+aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQKICBlbmQKICBmbG9vci50eXA9
+cGxhbmV0eXBzWyhjdXJyZW50X2lkeCAlICNwbGFuZXR5cHMpKzFdCiAgZmxvb3IueCxmbG9vci55
+PTAsMAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBjeWNsaW5nIGZsb29yIHR5cGVz
+IChjYW4gYmUgZGlzYWJsZWQgaW4gcHJvZHVjdGlvbikKICBpZiBjbGVhcl90ZXh0dXJlX2NhY2hl
+cyB0aGVuIGNsZWFyX3RleHR1cmVfY2FjaGVzKCkgZW5kCiBlbmQKIAogLS0gY3ljbGUgcm9vZiB0
+eXBlIChmb3IgdGVzdGluZykgd2hlbiBub3QgaW4gZG9vciB0ZXN0IG1vZGUKIGlmIG5vdCB0ZXN0
+X2Rvb3JfbW9kZSBhbmQga2V5cCgiZCIpIHRoZW4KICBsb2NhbCBjdXJyZW50X2lkeD0xCiAgZm9y
+IGk9MSwjcGxhbmV0eXBzIGRvCiAgIGlmIHBsYW5ldHlwc1tpXS50ZXg9PXJvb2YudHlwLnRleCB0
+aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQKICBlbmQKICByb29mLnR5cD1w
+bGFuZXR5cHNbKGN1cnJlbnRfaWR4ICUgI3BsYW5ldHlwcykrMV0KICByb29mLngscm9vZi55PTAs
+MAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBjeWNsaW5nIHJvb2YgdHlwZXMgKGNh
+biBiZSBkaXNhYmxlZCBpbiBwcm9kdWN0aW9uKQogIGlmIGNsZWFyX3RleHR1cmVfY2FjaGVzIHRo
+ZW4gY2xlYXJfdGV4dHVyZV9jYWNoZXMoKSBlbmQKIGVuZAogCiAtLSBkZWJ1ZyByYXkgY2FzdGlu
+ZwogIGlmIGRlYnVnX21vZGUgdGhlbgogICBsb2NhbCBzYSxjYT1zaW4ocGxheWVyLmEpLGNvcyhw
+bGF5ZXIuYSkKICAgbG9jYWwgeixoeCxoeSx0aWxlLHR4PXJheWNhc3QocGxheWVyLngscGxheWVy
+LnksY2Esc2Esc2EsY2EpCiAgIHByaW50aCgiZGVidWc6IHo9Ii4uKGZscih6KjEwMCkvMTAwKS4u
+IiBoeD0iLi4oZmxyKGh4KjEwMCkvMTAwKS4uIiBoeT0iLi4oZmxyKGh5KjEwMCkvMTAwKS4uIiB0
+aWxlPSIuLnRpbGUuLiIgdHg9Ii4uKGZscih0eCoxMDApLzEwMCkpCiAgIGxvY2FsIG9iLGRpc3Q9
+aGl0c2NhbihwbGF5ZXIueCxwbGF5ZXIueSxjYSxzYSkKICAgaWYgb2IgdGhlbgogICAgcHJpbnRo
+KCJkZWJ1Zzogb2JqIGZvdW5kIGF0IGRpc3Q9Ii4uKGZscihkaXN0KjEwMCkvMTAwKS4uIiBraW5k
+PSIuLihvYi5raW5kIG9yICJ1bmtub3duIikpCiAgIGVsc2UKICAgIHByaW50aCgiZGVidWc6IG5v
+IG9iaiBoaXQiKQogICBlbmQKICBlbmQKZW5kCgpmdW5jdGlvbiBkcmF3X2dhbWVwbGF5KCkKIGNs
+aXAoMCwwLHNjcmVlbl93aWR0aCxzY3JlZW5faGVpZ2h0KQogY2xzKDApCiAKIGxvY2FsIGZyYW1l
+X3N0YXJ0PXRpbWUoKQogCiBkaWFnX2ZyYW1lX2NvdW50Kz0xCiAKLS0gcmVzZXQgcGVyLWZyYW1l
+IGRpYWdub3N0aWNzCmRpYWdfd2FsbF9jb2x1bW5zPTAKZGlhZ193YWxsX2xvZF9jb2x1bW5zPTAK
+ZGlhZ19mbG9vcl9yb3dzPTAKZGlhZ19mbG9vcl9iYXRjaGVzPTAKZGlhZ19zcHJpdGVfY29sdW1u
+cz0wCmRpYWdfc3ByaXRlX2ltcG9zdG9yX2NvbHVtbnM9MAoKLS0gRW5zdXJlIGFkYXB0aXZlIGNv
+bnRyb2xzIGFyZSBpbml0aWFsaXplZCBvbmNlCmlmIG5vdCBhY3RpdmVfcmF5X2NvdW50IHRoZW4g
+YWN0aXZlX3JheV9jb3VudD1yYXlfY291bnQgZW5kCmlmIG5vdCByb3dfc3RyaWRlX2R5bmFtaWMg
+dGhlbiByb3dfc3RyaWRlX2R5bmFtaWM9cm93X3N0cmlkZSBlbmQKCmxvY2FsIGZ1bmN0aW9uIGFk
+anVzdF9yYXlfYnVkZ2V0KGNwdV9zYW1wbGUpCiBsb2NhbCBtaW5fcmF5cz1tYXgoNDgsIGZscihy
+YXlfY291bnQqMC4yNSkpCiBpZiBjcHVfc2FtcGxlPjAuOTAgdGhlbgogIGFjdGl2ZV9yYXlfY291
+bnQ9bWF4KG1pbl9yYXlzLCBhY3RpdmVfcmF5X2NvdW50LTE2KQogZWxzZWlmIGNwdV9zYW1wbGU8
+MC43MCB0aGVuCiAgYWN0aXZlX3JheV9jb3VudD1taW4ocmF5X2NvdW50LCBhY3RpdmVfcmF5X2Nv
+dW50KzgpCiBlbmQKZW5kCgotLSBDb250aW51b3VzIENQVSBzYW1wbGluZyBmb3IgYWRhcHRpdmUg
+YnVkZ2V0CmxvY2FsIGNwdV9zYW1wbGUgPSBzdGF0KDEpIG9yIGxhc3RfY3B1X3NhbXBsZSBvciAw
+CmlmIG5vdCBwZXJmX3ZhbGlkYXRpb24gYW5kIG5vdCBlbmFibGVfbm9ucmVuZGVyX2dvdmVybm9y
+IHRoZW4KIGFkanVzdF9yYXlfYnVkZ2V0KGNwdV9zYW1wbGUpCmVuZAoKLS0gT3B0aW9uYWwgbm9u
+LXJlbmRlciBnb3Zlcm5vcjogdXNlcyBDUFUgc2FtcGxlZCBpbiBfdXBkYXRlKCkKaWYgZW5hYmxl
+X25vbnJlbmRlcl9nb3Zlcm5vciB0aGVuCiBhZGp1c3RfcmF5X2J1ZGdldChyZWNlbnRfY3B1IG9y
+IGNwdV9zYW1wbGUpCmVuZApsYXN0X2NwdV9zYW1wbGU9Y3B1X3NhbXBsZQpkaWFnX2FjdGl2ZV9y
+YXlzPWFjdGl2ZV9yYXlfY291bnQKIAogLS0gei1idWZmZXIgaGVscGVycyAodXNlIGZyYW1lLXN0
+YW1wLCBkZWZpbmVkIG9uY2UpCiBpZiBub3QgenJlYWQgdGhlbgogIGZ1bmN0aW9uIHpyZWFkKHgp
+CiAgIC0tIHggaXMgMC1iYXNlZDsgcmV0dXJuIDk5OSB1bmxlc3Mgc3RhbXBlZCB0aGlzIGZyYW1l
+CiAgIGxvY2FsIHN0YW1wPXpzdGFtcDpnZXQoeCkgb3IgMAogICBpZiBzdGFtcD09ZGlhZ19mcmFt
+ZV9jb3VudCB0aGVuCiAgICBsb2NhbCB6PXpidWY6Z2V0KHgpCiAgICByZXR1cm4geiBvciA5OTkK
+ICAgZW5kCiAgIHJldHVybiA5OTkKICBlbmQKICBmdW5jdGlvbiB6d3JpdGUoeCx6KQogICB6YnVm
+OnNldCh4LHopCiAgIHpzdGFtcDpzZXQoeCxkaWFnX2ZyYW1lX2NvdW50KQogIGVuZAogZW5kCiAK
+IC0tIGNhY2hlIHNpbi9jb3MgZm9yIGVudGlyZSBmcmFtZSB0byBhdm9pZCByZWNvbXB1dGF0aW9u
+CiBzYV9jYWNoZWQ9c2luKHBsYXllci5hKQogY2FfY2FjaGVkPWNvcyhwbGF5ZXIuYSkKIAogaWYg
+dmlld19tb2RlPT0iM2QiIHRoZW4KICByYXljYXN0X3NjZW5lKCkKICBsb2NhbCB0X3JheWNhc3Q9
+dGltZSgpCiAgcmVuZGVyX2Zsb29yX2NlaWxpbmcoKSAgLS0gTm93IGluY2x1ZGVzIHdhbGwgcmVu
+ZGVyaW5nCiAgbG9jYWwgdF9mbG9vcl93YWxscz10aW1lKCkKICByZW5kZXJfc3ByaXRlcygpCiAg
+bG9jYWwgdF9zcHJpdGVzPXRpbWUoKQogIAogIGxvY2FsIG1zX3JheWNhc3Q9KHRfcmF5Y2FzdC1m
+cmFtZV9zdGFydCkqMTAwMAogIGxvY2FsIG1zX2Zsb29yX3dhbGxzPSh0X2Zsb29yX3dhbGxzLXRf
+cmF5Y2FzdCkqMTAwMAogIGxvY2FsIG1zX3Nwcml0ZXM9KHRfc3ByaXRlcy10X2Zsb29yX3dhbGxz
+KSoxMDAwCiAgbG9jYWwgZnJhbWVfbXM9KHRfc3ByaXRlcy1mcmFtZV9zdGFydCkqMTAwMAogIAog
+IC0tIGh1ZCAobWluaW1hbCkKICBwcmludCgicG9zOiIuLmZscihwbGF5ZXIueCkuLiIsIi4uZmxy
+KHBsYXllci55KSwyLDIsNykKICBwcmludCgiYW5nOiIuLihmbHIocGxheWVyLmEqMTAwKS8xMDAp
+LDIsMTAsNykKICBwcmludCgiZnBzOiIuLnN0YXQoNyksMiwxOCw3KQogIHByaW50KCJocDoiLi5w
+bGF5ZXIuaHAsMiwyNiw3KQogIAogIC0tIGludGVyYWN0aW9uIHByb21wdAogIGlmIGludGVyYWN0
+aW9uX2FjdGl2ZSBhbmQgY3VycmVudF9pbnRlcmFjdCB0aGVuCiAgIHByaW50KCJbRV0vWjogaW50
+ZXJhY3QiLHNjcmVlbl9jZW50ZXJfeC00MCxzY3JlZW5faGVpZ2h0LTIwLDExKQogIGVuZAogIAog
+IC0tIHRyYXAgbWVzc2FnZQogIGlmIHRyYXBfbXNnX3RpbWVyPjAgdGhlbgogICBwcmludCgidHJh
+cCBzcHJ1bmchIixzY3JlZW5fY2VudGVyX3gtMzAsc2NyZWVuX2NlbnRlcl95LDgpCiAgZW5kCiAg
+CiAtLVtbIERFQlVHIFBBTkVMIFJFTU9WRUQgRk9SIFBST0RVQ1RJT04gUEVSRk9STUFOQ0UKIGlm
+IGRlYnVnX21vZGUgdGhlbgogIC0tIHJlbW92ZWQKIGVuZAogXV0KICAKIC0tW1sgUEVSSU9ESUMg
+TE9HR0lORyBSRU1PVkVEIEZPUiBQUk9EVUNUSU9OIFBFUkZPUk1BTkNFCiBpZiBlbmFibGVfZGlh
+Z25vc3RpY3NfbG9nZ2luZyBhbmQgZGlhZ19mcmFtZV9jb3VudCU2MD09MCB0aGVuCiAgLS0gcmVt
+b3ZlZAogZW5kCiBdXQogIAogIC0tIG1pbmltYXAgSFVEIG92ZXJsYXkKICBkcmF3X21pbmltYXBf
+aHVkKCkKIGVsc2UKICBkcmF3X21pbmltYXAoKQogZW5kCiAKIC0tIGNvbWJhdCBvdmVybGF5CiBp
+ZiBpbl9jb21iYXQgdGhlbgogIHJlY3RmaWxsKDAsc2NyZWVuX2hlaWdodC00MCxzY3JlZW5fd2lk
+dGgsc2NyZWVuX2hlaWdodCwwKQogIHByaW50KCJlbnRlcmluZyBjb21iYXQuLi4iLHNjcmVlbl9j
+ZW50ZXJfeC00MCxzY3JlZW5fY2VudGVyX3ksOCkKICBwcmludCgiW2VudGVyXSBleGl0ICh0ZW1w
+KSIsc2NyZWVuX2NlbnRlcl94LTQwLHNjcmVlbl9jZW50ZXJfeSsxMCw3KQogZW5kCiAKIC0tIHJl
+c3RvcmUgcGFsZXR0ZSBmcm9tIGZvZyByZW1hcHBpbmcgKHNpbmdsZSByZXN0b3JlIHBlciBmcmFt
+ZSkKIHBhbCgpCiAtLSByZXNldCBmb2cgc3RhdGUgc28gZmlyc3Qgc2V0X2ZvZyBhcHBsaWVzIG1h
+cHBpbmcgbmV4dCBmcmFtZQogbGFzdF9mb2dfbGV2ZWw9LTEKIHByZXZfcGFsPXt9CgppZiBkZWJ1
+Z19tb2RlIHRoZW4KIGRyYXdfZGlhZ25vc3RpY3NfcGFuZWwoZnJhbWVfbXMsIGNwdV9zYW1wbGUp
+CiBlbmQKZW5kCgpmdW5jdGlvbiBkcmF3X2RpYWdub3N0aWNzX3BhbmVsKGZyYW1lX21zLCBjcHVf
+c2FtcGxlKQogZnJhbWVfbXMgPSBmcmFtZV9tcyBvciAwCiBjcHVfc2FtcGxlID0gY3B1X3NhbXBs
+ZSBvciBsYXN0X2NwdV9zYW1wbGUgb3IgMAogbG9jYWwgY3B1X3BjdD1mbHIoY3B1X3NhbXBsZSox
+MDAwKzAuNSkvMTAKIGxvY2FsIGZyYW1lX21zX2ZtdD1mbHIoZnJhbWVfbXMqMTArMC41KS8xMAog
+bG9jYWwgcmF5c190ZXh0PShkaWFnX2FjdGl2ZV9yYXlzIG9yIGFjdGl2ZV9yYXlfY291bnQgb3Ig
+MCkgLi4gIi8iIC4uIHJheV9jb3VudAogbG9jYWwgd2FsbF90ZXg9ZGlhZ193YWxsX2NvbHVtbnMg
+b3IgMAogbG9jYWwgd2FsbF9sb2Q9ZGlhZ193YWxsX2xvZF9jb2x1bW5zIG9yIDAKIGxvY2FsIHdh
+bGxfdG90YWw9d2FsbF90ZXgrd2FsbF9sb2QKIGxvY2FsIGxvZF9wY3Q9d2FsbF90b3RhbD4wIGFu
+ZCBmbHIoKHdhbGxfbG9kL3dhbGxfdG90YWwpKjEwMCswLjUpIG9yIDAKIGxvY2FsIGxpbmVzPXsK
+ICB7dGV4dD0iZGlhZzogbWV0cmljcyIsY29sb3I9MTF9LAogIHt0ZXh0PSJmcmFtZV9tczogIi4u
+ZnJhbWVfbXNfZm10LGNvbG9yPTExfSwKICB7dGV4dD0iY3B1JTogIi4uY3B1X3BjdCxjb2xvcj0g
+Y3B1X3BjdD45MCBhbmQgOCBvciAoY3B1X3BjdD43MCBhbmQgMTAgb3IgMTEpfSwKICB7dGV4dD0i
+cmF5czogIi4ucmF5c190ZXh0LGNvbG9yPTd9LAogIHt0ZXh0PSJyb3dfc3RyaWRlOiAiLi4ocm93
+X3N0cmlkZV9keW5hbWljIG9yIHJvd19zdHJpZGUpLGNvbG9yPTd9LAogIHt0ZXh0PSJmbG9vciBy
+b3dzOiAiLi4oZGlhZ19mbG9vcl9yb3dzIG9yIDApLGNvbG9yPTd9LAogIHt0ZXh0PSJmbG9vciBk
+cmF3czogIi4uKGRpYWdfZmxvb3JfYmF0Y2hlcyBvciAwKSxjb2xvcj03fSwKICB7dGV4dD0id2Fs
+bCB0ZXg6ICIuLndhbGxfdGV4LGNvbG9yPTd9LAogIHt0ZXh0PSJ3YWxsIGxvZDogIi4ud2FsbF9s
+b2QuLiIgKCIuLmxvZF9wY3QuLiIlKSIsY29sb3I9N30sCiAge3RleHQ9InNwcml0ZSB0ZXg6ICIu
+LihkaWFnX3Nwcml0ZV9jb2x1bW5zIG9yIDApLGNvbG9yPTd9LAogIHt0ZXh0PSJzcHJpdGUgbG9k
+OiAiLi4oZGlhZ19zcHJpdGVfaW1wb3N0b3JfY29sdW1ucyBvciAwKSxjb2xvcj03fQogfQogbG9j
+YWwgbWF4X2xlbj0wCiBmb3IgZW50cnkgaW4gYWxsKGxpbmVzKSBkbwogIGlmICNlbnRyeS50ZXh0
+Pm1heF9sZW4gdGhlbiBtYXhfbGVuPSNlbnRyeS50ZXh0IGVuZAogZW5kCiBsb2NhbCBwYW5lbF94
+PTQKIGxvY2FsIHBhbmVsX3k9ODAKIGxvY2FsIHBhbmVsX3c9bWF4X2xlbio0KzYKIGxvY2FsIHBh
+bmVsX2g9I2xpbmVzKjgrNgogcmVjdGZpbGwocGFuZWxfeC0yLHBhbmVsX3ktMixwYW5lbF94K3Bh
+bmVsX3cscGFuZWxfeStwYW5lbF9oLDEpCiByZWN0KHBhbmVsX3gtMyxwYW5lbF95LTMscGFuZWxf
+eCtwYW5lbF93KzEscGFuZWxfeStwYW5lbF9oKzEsNykKIGZvciBpPTEsI2xpbmVzIGRvCiAgbG9j
+YWwgZW50cnk9bGluZXNbaV0KICBwcmludChlbnRyeS50ZXh0LHBhbmVsX3gscGFuZWxfeSsoaS0x
+KSo4LGVudHJ5LmNvbG9yKQogZW5kCmVuZAoKbG9jYWwgZnVuY3Rpb24gZ2VuZXJhdGVfbGFiX2R1
+bmdlb24oc3RhdGUsc2VlZCkKIGxvY2FsIHRhcmdldF9zZWVkPXNlZWQgb3IgKDErZmxyKHJuZCg5
+OTk5OTkpKSkKIGlmIHRhcmdldF9zZWVkPDEgdGhlbiB0YXJnZXRfc2VlZD0xIGVuZAogc3RhcnRf
+cG9zLGdlbl9zdGF0cz1nZW5lcmF0ZV9kdW5nZW9uKHtzZWVkPXRhcmdldF9zZWVkfSkKIHN0YXRl
+LnNlZWQ9Z2VuX3N0YXRzLnNlZWQKIHN0YXRlLmdlbl9zdGF0cz1nZW5fc3RhdHMKIHN0YXRlLmhp
+c3Rvcnk9Z2VuX3N0YXRzLmhpc3Rvcnkgb3Ige30KIHN0YXRlLmhpc3RvcnlfY3Vyc29yPW1heCgw
+LCNzdGF0ZS5oaXN0b3J5LTIwKQogc3RhdGUuaGFybmVzc19yZXN1bHQ9c3RhdGUuaGFybmVzc19y
+ZXN1bHQgb3IgbmlsCiB2aWV3X21vZGU9IjJkIgplbmQKCmxvY2FsIGZ1bmN0aW9uIGRyYXdfbGFi
+X21hcChzdGF0ZSkKIGxvY2FsIHNjYWxlPTMKIGxvY2FsIG94PTgKIGxvY2FsIG95PTgKIGxvY2Fs
+IG1hcF9weD1tYXBfc2l6ZSpzY2FsZQogcmVjdGZpbGwoMCwwLHNjcmVlbl93aWR0aC0xLHNjcmVl
+bl9oZWlnaHQtMSwwKQogcmVjdGZpbGwob3gtMixveS0yLG94K21hcF9weCsxLG95K21hcF9weCsx
+LDEpCiBmb3IgeD0wLG1hcF9zaXplLTEgZG8KICBmb3IgeT0wLG1hcF9zaXplLTEgZG8KICAgbG9j
+YWwgd2FsbD1nZXRfd2FsbCh4LHkpCiAgIGxvY2FsIGZsb29yX3ZhbD1nZXRfZmxvb3IoeCx5KQog
+ICBsb2NhbCBjb2xvcgogICBpZiB3YWxsPjAgdGhlbgogICAgY29sb3I9NQogICBlbHNlaWYgZmxv
+b3JfdmFsPjAgdGhlbgogICAgY29sb3I9NgogICBlbHNlCiAgICBjb2xvcj0wCiAgIGVuZAogICBy
+ZWN0ZmlsbChveCt4KnNjYWxlLG95K3kqc2NhbGUsb3greCpzY2FsZStzY2FsZS0xLG95K3kqc2Nh
+bGUrc2NhbGUtMSxjb2xvcikKICBlbmQKIGVuZAogZm9yIG5vZGUgaW4gYWxsKGdlbl9ub2Rlcykg
+ZG8KICBsb2NhbCByPW5vZGUucmVjdAogIHJlY3Qob3grclsxXSpzY2FsZSxveStyWzJdKnNjYWxl
+LG94K3JbM10qc2NhbGUsb3krcls0XSpzY2FsZSwxMSkKIGVuZAogZm9yIGVkZ2UgaW4gYWxsKGdl
+bl9lZGdlcykgZG8KICBsb2NhbCBjPWVkZ2UubG9ja2VkIGFuZCA4IG9yIDEyCiAgbG9jYWwgeDE9
+b3grZWRnZS5uMS5taWR4KnNjYWxlCiAgbG9jYWwgeTE9b3krZWRnZS5uMS5taWR5KnNjYWxlCiAg
+bG9jYWwgeDI9b3grZWRnZS5uMi5taWR4KnNjYWxlCiAgbG9jYWwgeTI9b3krZWRnZS5uMi5taWR5
+KnNjYWxlCiAgbGluZSh4MSx5MSx4Mix5MixjKQogIGlmIGVkZ2UuYjEgdGhlbgogICByZWN0Zmls
+bChveCtlZGdlLmIxLngqc2NhbGUsb3krZWRnZS5iMS55KnNjYWxlLG94K2VkZ2UuYjEueCpzY2Fs
+ZStzY2FsZS0xLG95K2VkZ2UuYjEueSpzY2FsZStzY2FsZS0xLGMpCiAgZW5kCiAgaWYgZWRnZS5i
+MiB0aGVuCiAgIHJlY3RmaWxsKG94K2VkZ2UuYjIueCpzY2FsZSxveStlZGdlLmIyLnkqc2NhbGUs
+b3grZWRnZS5iMi54KnNjYWxlK3NjYWxlLTEsb3krZWRnZS5iMi55KnNjYWxlK3NjYWxlLTEsYykK
+ICBlbmQKIGVuZAogZm9yIGRvb3IgaW4gYWxsKGRvb3JzKSBkbwogIGxvY2FsIGM9ZG9vci5kdHlw
+ZT09ZG9vcl9sb2NrZWQgYW5kIDggb3IgMTAKICByZWN0ZmlsbChveCtkb29yLngqc2NhbGUsb3kr
+ZG9vci55KnNjYWxlLG94K2Rvb3IueCpzY2FsZStzY2FsZS0xLG95K2Rvb3IueSpzY2FsZStzY2Fs
+ZS0xLGMpCiBlbmQKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi5wb3MgdGhlbgog
+ICBsb2NhbCBjeD1veCtvYi5wb3NbMV0qc2NhbGUKICAgbG9jYWwgY3k9b3krb2IucG9zWzJdKnNj
+YWxlCiAgIGxvY2FsIGNvbG9yPTcKICAgaWYgb2IudHlwPT1vYmpfdHlwZXMua2V5IHRoZW4gY29s
+b3I9OQogICBlbHNlaWYgb2IudHlwPT1vYmpfdHlwZXMuaG9zdGlsZV9ucGMgdGhlbiBjb2xvcj04
+CiAgIGVsc2VpZiBvYi50eXA9PW9ial90eXBlcy5ub25faG9zdGlsZV9ucGMgdGhlbiBjb2xvcj0x
+MwogICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVyYWN0YWJsZSIgdGhlbiBj
+b2xvcj0xMgogICBlbmQKICAgY2lyY2ZpbGwoY3gsY3ksMSxjb2xvcikKICBlbmQKIGVuZAogcHJp
+bnQoInNlZWQ6Ii4uKHN0YXRlLnNlZWQgb3IgIj8iKSxveCttYXBfcHgrOCxveSw3KQogcHJpbnQo
+InJvb21zOiIuLigjZ2VuX25vZGVzIG9yIDApLG94K21hcF9weCs4LG95KzgsNykKIGxvY2FsIGxv
+Y2tlZF9jb3VudD0wCiBpZiBnZW5fbG9ja2VkX2VkZ2VzIHRoZW4KICBmb3IgZSBpbiBhbGwoZ2Vu
+X2xvY2tlZF9lZGdlcykgZG8KICAgaWYgZS5sb2NrZWQgdGhlbiBsb2NrZWRfY291bnQrPTEgZW5k
+CiAgZW5kCiBlbmQKIHByaW50KCJsb2NrZWQgZWRnZXM6Ii4ubG9ja2VkX2NvdW50LG94K21hcF9w
+eCs4LG95KzE2LDcpCiBwcmludCgiW3pdIHJhbmRvbSAgW3hdIHJlcGxheSAgW_KGkC-ihpJdIHNl
+ZWQgIFtoXSBoYXJuZXNzICBbai9rXSBsb2cgIFttXSBtZW51Iiw4LHNjcmVlbl9oZWlnaHQtMTYs
+NykKZW5kCgpsb2NhbCBmdW5jdGlvbiBkcmF3X2xhYl9oaXN0b3J5KHN0YXRlKQogbG9jYWwgaGlz
+dG9yeT1zdGF0ZS5oaXN0b3J5IG9yIHt9CiBsb2NhbCBjdXJzb3I9c3RhdGUuaGlzdG9yeV9jdXJz
+b3Igb3IgMAogbG9jYWwgbGluZXM9MTUKIGxvY2FsIHN0YXJ0PW1heCgxLCNoaXN0b3J5LWxpbmVz
+KzEpCiBjdXJzb3I9bWF4KDAsbWluKGN1cnNvciwjaGlzdG9yeS1saW5lcykpCiBsb2NhbCB5PTI0
+CiBwcmludCgiZ2VuZXJhdGlvbiBsb2c6IixzY3JlZW5fd2lkdGgtMTQwLHksMTEpCiB5Kz04CiBm
+b3IgaT1jdXJzb3IrMSxtaW4oI2hpc3RvcnksY3Vyc29yK2xpbmVzKSBkbwogIGxvY2FsIGxpbmU9
+aGlzdG9yeVtpXQogIGlmIGxpbmUgdGhlbgogICBwcmludChzdHJpbmcuc3ViKGxpbmUsMSwyOCks
+c2NyZWVuX3dpZHRoLTE0MCx5LDcpCiAgIHkrPTgKICBlbmQKIGVuZAogc3RhdGUuaGlzdG9yeV9j
+dXJzb3I9Y3Vyc29yCiBpZiAjaGlzdG9yeT5saW5lcyB0aGVuCiAgcHJpbnQoImxvZyBzY3JvbGwg
+W0ovS10iLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC0zMiw3KQogZW5kCiBpZiBzdGF0
+ZS5oYXJuZXNzX3Jlc3VsdCB0aGVuCiAgbG9jYWwgcmVzPXN0YXRlLmhhcm5lc3NfcmVzdWx0CiAg
+bG9jYWwgZmFpbHVyZXM9cmVzLmZhaWx1cmVzIG9yIDAKICBsb2NhbCBjb2xvcj1mYWlsdXJlcz4w
+IGFuZCA4IG9yIDExCiAgcHJpbnQoImhhcm5lc3M6ICIuLihyZXMudG90YWwgb3IgMCkuLiIgc2Vl
+ZHMiLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC00OCxjb2xvcikKICBwcmludCgiZmFp
+bHVyZXM6ICIuLmZhaWx1cmVzLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC00MCxjb2xv
+cikKIGVuZAplbmQKCnNjZW5lcy5tZW51PXsKIGVudGVyPWZ1bmN0aW9uKHN0YXRlKQogIHN0YXRl
+Lm9wdGlvbnM9eyJTdGFydCBHYW1lcGxheSIsIkR1bmdlb24gTGFiIn0KICBzdGF0ZS5pbmRleD1z
+dGF0ZS5pbmRleCBvciAxCiAgc3RhdGUubWVzc2FnZT0iIgogZW5kLAogdXBkYXRlPWZ1bmN0aW9u
+KHN0YXRlKQogIGxvY2FsIG1vdmVfdXA9YnRucCgyKSBvciBrZXlwKCJ1cCIpIG9yIGtleXAoInci
+KQogIGxvY2FsIG1vdmVfZG93bj1idG5wKDMpIG9yIGtleXAoImRvd24iKSBvciBrZXlwKCJzIikK
+ICBpZiBtb3ZlX3VwIHRoZW4KICAgc3RhdGUuaW5kZXg9bWF4KDEsc3RhdGUuaW5kZXgtMSkKICBl
+bHNlaWYgbW92ZV9kb3duIHRoZW4KICAgc3RhdGUuaW5kZXg9bWluKCNzdGF0ZS5vcHRpb25zLHN0
+YXRlLmluZGV4KzEpCiAgZW5kCgogIGxvY2FsIGNvbmZpcm09YnRucCg0KSBvciBidG5wKDUpIG9y
+IGtleXAoInoiKSBvciBrZXlwKCJ4Iikgb3Iga2V5cCgiZW50ZXIiKSBvciBrZXlwKCJyZXR1cm4i
+KQogIGlmIGNvbmZpcm0gdGhlbgogICBsb2NhbCBjaG9pY2U9c3RhdGUub3B0aW9uc1tzdGF0ZS5p
+bmRleF0KICAgaWYgY2hvaWNlPT0iU3RhcnQgR2FtZXBsYXkiIHRoZW4KICAgIHN3aXRjaF9zY2Vu
+ZSgiZ2FtZXBsYXkiLHt9KQogICBlbHNlaWYgY2hvaWNlPT0iRHVuZ2VvbiBMYWIiIHRoZW4KICAg
+IHN3aXRjaF9zY2VuZSgiZHVuZ2Vvbl9sYWIiLHt9KQogICBlbmQKICBlbmQKIGVuZCwKIGRyYXc9
+ZnVuY3Rpb24oc3RhdGUpCiAgY2xzKDApCiAgcHJpbnQoIlJheWNhc3QgRW5naW5lIixzY3JlZW5f
+Y2VudGVyX3gtNDgsNDAsMTEpCiAgcHJpbnQoIk1haW4gTWVudSIsc2NyZWVuX2NlbnRlcl94LTMy
+LDU2LDcpCiAgZm9yIGlkeCxvcHQgaW4gaXBhaXJzKHN0YXRlLm9wdGlvbnMpIGRvCiAgIGxvY2Fs
+IHk9ODArKGlkeC0xKSoxMgogICBsb2NhbCBjb2xvcj0oaWR4PT1zdGF0ZS5pbmRleCkgYW5kIDEw
+IG9yIDcKICAgcHJpbnQoKGlkeD09c3RhdGUuaW5kZXggYW5kICI_IiBvciAiICIpLi4iICIuLm9w
+dCxzY3JlZW5fY2VudGVyX3gtNDAseSxjb2xvcikKICBlbmQKICBwcmludCgiW1pdIGNvbmZpcm0g
+IFtVUC9ET1dOXSBuYXZpZ2F0ZSIsc2NyZWVuX2NlbnRlcl94LTY0LHNjcmVlbl9oZWlnaHQtMzIs
+NykKIGVuZAp9CgpzY2VuZXMuZ2FtZXBsYXk9ewogZW50ZXI9ZnVuY3Rpb24oc3RhdGUscGFyYW1z
+KQogIGxvY2FsIHNlZWQ9cGFyYW1zIGFuZCBwYXJhbXMuc2VlZAogIHN0YXJ0X3BvcyxnZW5fc3Rh
+dHM9Z2VuZXJhdGVfZHVuZ2Vvbih7c2VlZD1zZWVkfSkKICBwbGF5ZXIueD1zdGFydF9wb3MueAog
+IHBsYXllci55PXN0YXJ0X3Bvcy55CiAgdmlld19tb2RlPSIzZCIKICBzdGF0ZS5zZWVkPWdlbl9z
+dGF0cy5zZWVkCiBlbmQsCiB1cGRhdGU9ZnVuY3Rpb24oc3RhdGUpCiAgaWYga2V5cCgibSIpIHRo
+ZW4KICAgc3dpdGNoX3NjZW5lKCJtZW51IikKICAgcmV0dXJuCiAgZW5kCiAgdXBkYXRlX2dhbWVw
+bGF5KCkKIGVuZCwKIGRyYXc9ZnVuY3Rpb24oc3RhdGUpCiAgZHJhd19nYW1lcGxheSgpCiAgcHJp
+bnQoIltNXSBtZW51IixzY3JlZW5fd2lkdGgtNTYsc2NyZWVuX2hlaWdodC0xMCw3KQogZW5kCn0K
+CnNjZW5lcy5kdW5nZW9uX2xhYj17CiBlbnRlcj1mdW5jdGlvbihzdGF0ZSxwYXJhbXMpCiAgc3Rh
+dGUuc2VlZD1wYXJhbXMgYW5kIHBhcmFtcy5zZWVkCiAgZ2VuZXJhdGVfbGFiX2R1bmdlb24oc3Rh
+dGUsc3RhdGUuc2VlZCkKIGVuZCwKIHVwZGF0ZT1mdW5jdGlvbihzdGF0ZSkKICBpZiBrZXlwKCJt
+IikgdGhlbgogICBzd2l0Y2hfc2NlbmUoIm1lbnUiKQogICByZXR1cm4KICBlbmQKICBpZiBrZXlw
+KCJ6IikgdGhlbgogICBnZW5lcmF0ZV9sYWJfZHVuZ2VvbihzdGF0ZSxuaWwpCiAgZWxzZWlmIGtl
+eXAoIngiKSB0aGVuCiAgIGdlbmVyYXRlX2xhYl9kdW5nZW9uKHN0YXRlLHN0YXRlLnNlZWQpCiAg
+ZWxzZWlmIGtleXAoImxlZnQiKSBvciBidG5wKDApIHRoZW4KICAgbG9jYWwgc2VlZD0oc3RhdGUu
+c2VlZCBvciAxKS0xCiAgIGlmIHNlZWQ8MSB0aGVuIHNlZWQ9MSBlbmQKICAgZ2VuZXJhdGVfbGFi
+X2R1bmdlb24oc3RhdGUsc2VlZCkKICBlbHNlaWYga2V5cCgicmlnaHQiKSBvciBidG5wKDEpIHRo
+ZW4KICAgbG9jYWwgc2VlZD0oc3RhdGUuc2VlZCBvciAxKSsxCiAgIGdlbmVyYXRlX2xhYl9kdW5n
+ZW9uKHN0YXRlLHNlZWQpCiAgZWxzZWlmIGtleXAoImgiKSB0aGVuCiAgIGxvY2FsIHByZXZpb3Vz
+X3NlZWQ9c3RhdGUuc2VlZAogICBzdGF0ZS5oYXJuZXNzX3Jlc3VsdD1kdW5nZW9uX2hhcm5lc3Mu
+cnVuKCkKICAgZ2VuZXJhdGVfbGFiX2R1bmdlb24oc3RhdGUscHJldmlvdXNfc2VlZCkKICBlbHNl
+aWYga2V5cCgiaiIpIHRoZW4KICAgc3RhdGUuaGlzdG9yeV9jdXJzb3I9bWF4KDAsKHN0YXRlLmhp
+c3RvcnlfY3Vyc29yIG9yIDApLTMpCiAgZWxzZWlmIGtleXAoImsiKSB0aGVuCiAgIGxvY2FsIGhp
+c3Rvcnk9c3RhdGUuaGlzdG9yeSBvciB7fQogICBzdGF0ZS5oaXN0b3J5X2N1cnNvcj1taW4obWF4
+KDAsI2hpc3RvcnktMjApLChzdGF0ZS5oaXN0b3J5X2N1cnNvciBvciAwKSszKQogIGVuZAogZW5k
+LAogZHJhdz1mdW5jdGlvbihzdGF0ZSkKICBkcmF3X2xhYl9tYXAoc3RhdGUpCiAgZHJhd19sYWJf
+aGlzdG9yeShzdGF0ZSkKIGVuZAp9CgpmdW5jdGlvbiBfdXBkYXRlKCkKIHNjZW5lX3VwZGF0ZSgp
+CmVuZAoKZnVuY3Rpb24gX2RyYXcoKQogc2NlbmVfZHJhdygpCmVuZAoKLS0gZHJhdyAyZCBtaW5p
+bWFwIGZvciB0ZXN0aW5nCi0tIFB1cnBvc2U6IFJlbmRlciAyRCB0b3AtZG93biBkZWJ1ZyB2aWV3
+IG9mIGR1bmdlb24KLS0gQWxnb3JpdGhtOiBTY2FsZSAxMjjDlzEyOCBtYXAgdG8gMjU2w5cyNTYg
+cGl4ZWxzIChzY2FsZT0yKQotLSBEaXNwbGF5czogV2FsbHMsIHJvb21zLCBkb29ycywgb2JqZWN0
+cywgcGxheWVyIHBvc2l0aW9uIGFuZCBmYWNpbmcKLS0gTm90ZXM6IFRvZ2dsZWQgd2l0aCBYIGJ1
+dHRvbiwgdXNlZnVsIGZvciBkZWJ1Z2dpbmcgZ2VuZXJhdGlvbgpmdW5jdGlvbiBkcmF3X21pbmlt
+YXAoKQogbG9jYWwgc2NhbGU9MgogbG9jYWwgb3gsb3k9MTAsMTAKIAogLS0gYmF0Y2ggYWxsIHRp
+bGUgZHJhd2luZyB0byByZWR1Y2UgZHJhdyBjYWxsIGNvdW50CiByYmF0Y2hfcmVzZXQoKQogCiAt
+LSBkcmF3IHdhbGxzIGZyb20gbWFwLndhbGxzIHVzZXJkYXRhIHdpdGggZmxvb3IgZGF0YSB0byBk
+aXN0aW5ndWlzaCBjb3JyaWRvcnMgZnJvbSB2b2lkCiBmb3IgeD0wLDEyNyBkbwogIGZvciB5PTAs
+MTI3IGRvCiAgIGxvY2FsIHdhbGw9Z2V0X3dhbGwoeCx5KQogICBsb2NhbCBmbG9vcl92YWw9Z2V0
+X2Zsb29yKHgseSkKICAgbG9jYWwgY29sb3IKICAgaWYgd2FsbD4wIHRoZW4KICAgIC0tIHdhbGwg
+dGlsZQogICAgY29sb3I9NQogICBlbHNlaWYgZmxvb3JfdmFsPjAgdGhlbgogICAgLS0gY2FydmVk
+IGNvcnJpZG9yL3Jvb20gZmxvb3IgKGZsb29yIHR5cGUgc2V0IGR1cmluZyBnZW5lcmF0aW9uKQog
+ICAgY29sb3I9NgogICBlbHNlCiAgICAtLSB1bmNhcnZlZCB2b2lkICh3YWxsPTAsIGZsb29yPTAp
+CiAgICBjb2xvcj0xCiAgIGVuZAogICByYmF0Y2hfcHVzaChveCt4KnNjYWxlLG95K3kqc2NhbGUs
+b3greCpzY2FsZStzY2FsZS0xLG95K3kqc2NhbGUrc2NhbGUtMSxjb2xvcikKICBlbmQKIGVuZAog
+CiByYmF0Y2hfc3VibWl0KCkKIAogLS0gZHJhdyByb29tcwogZm9yIG5vZGUgaW4gYWxsKGdlbl9u
+b2RlcykgZG8KICBsb2NhbCByPW5vZGUucmVjdAogIHJlY3Qob3grclsxXSpzY2FsZSxveStyWzJd
+KnNjYWxlLG94K3JbM10qc2NhbGUsb3krcls0XSpzY2FsZSwxMSkKIGVuZAogCiAtLSBiYXRjaCBk
+b29yIGRyYXdpbmcKIHJiYXRjaF9yZXNldCgpCiBmb3IgZG9vciBpbiBhbGwoZG9vcnMpIGRvCiAg
+bG9jYWwgYz1kb29yLmR0eXBlPT1kb29yX2xvY2tlZCBhbmQgOCBvciAxMgogIHJiYXRjaF9wdXNo
+KG94K2Rvb3IueCpzY2FsZSxveStkb29yLnkqc2NhbGUsb3grZG9vci54KnNjYWxlK3NjYWxlLTEs
+b3krZG9vci55KnNjYWxlK3NjYWxlLTEsYykKIGVuZAogcmJhdGNoX3N1Ym1pdCgpCiAKIC0tIGRy
+YXcgb2JqZWN0cwogZm9yIG9iIGluIGFsbChvYmplY3RzKSBkbwogIGxvY2FsIGM9NwogIGlmIG9i
+LnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJob3N0aWxlX25wYyIgdGhlbiBjPTgKICBlbHNlaWYgb2Iu
+dHlwIGFuZCBvYi50eXAua2luZD09ImRpcmVjdF9waWNrdXAiIHRoZW4KICAgaWYgb2IudHlwLnN1
+YnR5cGU9PSJoZWFydCIgdGhlbiBjPTE0CiAgIGVsc2VpZiBvYi50eXAuc3VidHlwZT09ImtleSIg
+dGhlbiBjPTkKICAgZW5kCiAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJpbnRlcmFj
+dGFibGUiIHRoZW4KICAgaWYgb2IudHlwLnN1YnR5cGU9PSJleGl0IiB0aGVuIGM9MTIgZW5kCiAg
+ZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJkZWNvcmF0aXZlIiB0aGVuIGM9MTMKICBl
+bmQKICBsb2NhbCB4PW9iLnBvc1sxXQogIGxvY2FsIHk9b2IucG9zWzJdCiAgY2lyY2ZpbGwob3gr
+eCpzY2FsZSxveSt5KnNjYWxlLDEsYykKIGVuZAogCiAtLSBkcmF3IHBsYXllcgogbG9jYWwgcHgs
+cHk9b3grcGxheWVyLngqc2NhbGUsb3krcGxheWVyLnkqc2NhbGUKIGNpcmNmaWxsKHB4LHB5LDIs
+MTApCiBsb2NhbCBzYSxjYT1zaW4ocGxheWVyLmEpLGNvcyhwbGF5ZXIuYSkKIGxpbmUocHgscHks
+cHgrY2EqNixweStzYSo2LDEwKQogCiAtLSBzdGF0cwogcHJpbnQoIjJkIG1hcCB2aWV3IiwxMCwy
+LDcpCiBwcmludCgicm9vbXM6ICIuLmdlbl9zdGF0cy5yb29tcywxMCwxMCw3KQogcHJpbnQoIm9i
+amVjdHM6ICIuLmdlbl9zdGF0cy5vYmplY3RzLDEwLDE4LDcpCiBwcmludCgic2VlZDogIi4uZ2Vu
+X3N0YXRzLnNlZWQsMTAsMjYsNykKIGlmIGRlYnVnX21vZGUgdGhlbgogIHByaW50KCJbeF0gdG9n
+Z2xlIDNkIiwxMCwzNCw3KQogZW5kCmVuZAoKLS0gZHJhdyBodWQgbWluaW1hcCBvdmVybGF5Ci0t
+IFB1cnBvc2U6IFJlbmRlciBzY3JvbGxpbmcgdmlld3BvcnQgbWluaW1hcCBpbiB0b3AtcmlnaHQg
+Y29ybmVyIGR1cmluZyAzRCB2aWV3Ci0tIEFsZ29yaXRobTogUGxheWVyLWNlbnRlcmVkIGNhbWVy
+YSB3aXRoIGNsaXBwZWQgZHJhd2luZyBvZiB2aXNpYmxlIHRpbGVzIG9ubHkKLS0gRGlzcGxheXM6
+IFdhbGxzLCBmbG9vcnMsIGRvb3JzLCBvYmplY3RzLCBwbGF5ZXIgKGF1dG8tc2Nyb2xscyBhcyBw
+bGF5ZXIgbW92ZXMpCi0tIE5vdGVzOiBGaXhlZCAxMjDDlzY4cHggdmlld3BvcnQgYXQgdG9wLXJp
+Z2h0LCBzY2FsZT0yLCBvbmx5IGRyYXdzIHZpc2libGUgdGlsZSByYW5nZQpmdW5jdGlvbiBkcmF3
+X21pbmltYXBfaHVkKCkKIGxvY2FsIGh1ZF93PWNlaWwoc2NyZWVuX3dpZHRoKjAuMjUpCiBsb2Nh
+bCBodWRfaD1jZWlsKHNjcmVlbl9oZWlnaHQqMC4yNSkKIGxvY2FsIGh1ZF94PXNjcmVlbl93aWR0
+aC1odWRfdy04CiBsb2NhbCBodWRfeT04CiBsb2NhbCBzY2FsZT0yCiAKIC0tIGNhbWVyYSBvZmZz
+ZXQgdG8gY2VudGVyIHBsYXllciBpbiB2aWV3cG9ydAogbG9jYWwgY2FtX3g9cGxheWVyLngqc2Nh
+bGUtaHVkX3cvMgogbG9jYWwgY2FtX3k9cGxheWVyLnkqc2NhbGUtaHVkX2gvMgogCiAtLSBjYWxj
+dWxhdGUgdmlzaWJsZSB0aWxlIHJhbmdlCiBsb2NhbCB4X21pbj1tYXgoMCxmbHIoY2FtX3gvc2Nh
+bGUpKQogbG9jYWwgeF9tYXg9bWluKDEyNyxmbHIoKGNhbV94K2h1ZF93KS9zY2FsZSkpCiBsb2Nh
+bCB5X21pbj1tYXgoMCxmbHIoY2FtX3kvc2NhbGUpKQogbG9jYWwgeV9tYXg9bWluKDEyNyxmbHIo
+KGNhbV95K2h1ZF9oKS9zY2FsZSkpCiAKIC0tIHNldCBjbGlwIHJlZ2lvbgogY2xpcChodWRfeCxo
+dWRfeSxodWRfdyxodWRfaCkKIAogLS0gZHJhdyBiYWNrZ3JvdW5kCiByZWN0ZmlsbChodWRfeCxo
+dWRfeSxodWRfeCtodWRfdy0xLGh1ZF95K2h1ZF9oLTEsMCkKIAogLS0gYmF0Y2ggbWFwIHRpbGVz
+IChvbmx5IHZpc2libGUgcmFuZ2UpCiByYmF0Y2hfcmVzZXQoKQogZm9yIHg9eF9taW4seF9tYXgg
+ZG8KICBmb3IgeT15X21pbix5X21heCBkbwogICBsb2NhbCBzeD1odWRfeCsoeCpzY2FsZS1jYW1f
+eCkKICAgbG9jYWwgc3k9aHVkX3krKHkqc2NhbGUtY2FtX3kpCiAgIAogICAtLSBhZGRpdGlvbmFs
+IGJvdW5kcyBjaGVjawogICBpZiBzeD49aHVkX3ggYW5kIHN4PGh1ZF94K2h1ZF93IGFuZCBzeT49
+aHVkX3kgYW5kIHN5PGh1ZF95K2h1ZF9oIHRoZW4KICAgIGxvY2FsIHdhbGw9Z2V0X3dhbGwoeCx5
+KQogICAgbG9jYWwgZmxvb3JfdmFsPWdldF9mbG9vcih4LHkpCiAgICBsb2NhbCBjb2xvcgogICAg
+CiAgICBpZiB3YWxsPjAgdGhlbgogICAgIGNvbG9yPTUKICAgIGVsc2VpZiBmbG9vcl92YWw_MCB0
+aGVuCiAgICAgY29sb3I9NgogICAgZWxzZQogICAgIGNvbG9yPTEKICAgIGVuZAogICAgCiAgICBy
+YmF0Y2hfcHVzaChzeCxzeSxzeCtzY2FsZS0xLHN5K3NjYWxlLTEsY29sb3IpCiAgIGVuZAogIGVu
+ZAogZW5kCiByYmF0Y2hfc3VibWl0KCkKIAogLS0gYmF0Y2ggZG9vciBkcmF3aW5nIHZpYSBzcGF0
+aWFsIHF1ZXJ5IG92ZXIgdmlzaWJsZSB0aWxlcwogcmJhdGNoX3Jlc2V0KCkKIGZvciB4PXhfbWlu
+LHhfbWF4IGRvCiAgZm9yIHk9eV9taW4seV9tYXggZG8KICAgbG9jYWwgZG9vcj1kb29yZ3JpZFt4
+XSBhbmQgZG9vcmdyaWRbeF1beV0gb3IgbmlsCiAgIGlmIGRvb3IgdGhlbgogICAgbG9jYWwgc3g9
+aHVkX3grKHgqc2NhbGUtY2FtX3gpCiAgICBsb2NhbCBzeT1odWRfeSsoeSpzY2FsZS1jYW1feSkK
+ICAgIGlmIHN4Pj1odWRfeCBhbmQgc3g8aHVkX3graHVkX3cgYW5kIHN5Pj1odWRfeSBhbmQgc3k8
+aHVkX3kraHVkX2ggdGhlbgogICAgIGxvY2FsIGM9ZG9vci5kdHlwZT09ZG9vcl9sb2NrZWQgYW5k
+IDggb3IgMTIKICAgICByYmF0Y2hfcHVzaChzeCxzeSxzeCtzY2FsZS0xLHN5K3NjYWxlLTEsYykK
+ICAgIGVuZAogICBlbmQKICBlbmQKIGVuZAogcmJhdGNoX3N1Ym1pdCgpCiAKIC0tIGRyYXcgb2Jq
+ZWN0cyB2aWEgZmxhdCBhcnJheSBpdGVyYXRpb24gd2l0aGluIHZpZXdwb3J0IGJvdW5kcwogZm9y
+IG9iIGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9iLnBvcyB0aGVuCiAgIGxvY2FsIHN4PWh1ZF94
+KyhvYi5wb3NbMV0qc2NhbGUtY2FtX3gpCiAgIGxvY2FsIHN5PWh1ZF95KyhvYi5wb3NbMl0qc2Nh
+bGUtY2FtX3kpCiAgIGlmIHN4Pj1odWRfeCBhbmQgc3g8aHVkX3graHVkX3cgYW5kIHN5Pj1odWRf
+eSBhbmQgc3k8aHVkX3kraHVkX2ggdGhlbgogICAgbG9jYWwgYz03CiAgICBpZiBvYi50eXAgYW5k
+IG9iLnR5cC5raW5kPT0iaG9zdGlsZV9ucGMiIHRoZW4gYz04CiAgICBlbHNlaWYgb2IudHlwIGFu
+ZCBvYi50eXAua2luZD09ImRpcmVjdF9waWNrdXAiIHRoZW4KICAgICBpZiBvYi50eXAuc3VidHlw
+ZT09ImhlYXJ0IiB0aGVuIGM9MTQKICAgICBlbHNlaWYgb2IudHlwLnN1YnR5cGU9PSJrZXkiIHRo
+ZW4gYz05CiAgICAgZW5kCiAgICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVy
+YWN0YWJsZSIgdGhlbgogICAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0iZXhpdCIgdGhlbiBjPTEyIGVu
+ZAogICAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJkZWNvcmF0aXZlIiB0aGVuIGM9
+MTMKICAgIGVuZAogICAgY2lyY2ZpbGwoc3gsc3ksMSxjKQogICBlbmQKICBlbmQKIGVuZAogCiAt
+LSBkcmF3IHBsYXllciAoYWx3YXlzIGNlbnRlcmVkIGJ5IGNhbWVyYSBkZXNpZ24pCiBsb2NhbCBw
+eD1odWRfeCsocGxheWVyLngqc2NhbGUtY2FtX3gpCiBsb2NhbCBweT1odWRfeSsocGxheWVyLnkq
+c2NhbGUtY2FtX3kpCiBjaXJjZmlsbChweCxweSwyLDEwKQogbGluZShweCxweSxweCtjYV9jYWNo
+ZWQqNixweStzYV9jYWNoZWQqNiwxMCkKIAogLS0gb3B0aW9uYWwgZnJhbWUKIHJlY3QoaHVkX3gs
+aHVkX3ksaHVkX3graHVkX3ctMSxodWRfeStodWRfaC0xLDcpCiAKIC0tIHJlc2V0IGNsaXAKIGNs
+aXAoKQplbmQKCi0tIHVuaWZpZWQgY29sbGlzaW9uIGNoZWNrIGZvciB3YWxscywgZG9vcnMsIGFu
+ZCBvYmplY3RzCi0tIFB1cnBvc2U6IFVuaWZpZWQgY29sbGlzaW9uIGRldGVjdGlvbiBmb3Igd2Fs
+bHMsIGRvb3JzLCBhbmQgb2JqZWN0cwotLSBQYXJhbWV0ZXJzOiBweCwgcHkgKHdvcmxkIHBvc2l0
+aW9uKSwgcmFkaXVzIChjb2xsaXNpb24gcmFkaXVzKSwgb3BlbmRvb3JzIChhdXRvLW9wZW4gZG9v
+cnMpLCBpc3BsYXllciAoZW5hYmxlIGtleSBjaGVja2luZykKLS0gUmV0dXJuczogYm9vbGVhbiAo
+dHJ1ZSBpZiBjb2xsaXNpb24gZGV0ZWN0ZWQpCi0tIEFsZ29yaXRobTogR3JpZC1iYXNlZCB3YWxs
+IGNoZWNrICsgc3BhdGlhbCBwYXJ0aXRpb25pbmcgZm9yIG9iamVjdHMKLS0gU2lkZSBlZmZlY3Rz
+OiBPcGVucyBkb29ycywgcHJldmVudHMgZG9vciBjbG9zaW5nIHdoZW4gcGxheWVyIGluc2lkZQpm
+dW5jdGlvbiBpc2NvbChweCxweSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKQogbG9jYWwgY29s
+PWZhbHNlCiBvcGVuZG9vcnM9b3BlbmRvb3JzIG9yIGZhbHNlCiBpc3BsYXllcj1pc3BsYXllciBv
+ciBmYWxzZQogCiAtLSBjaGVjayBncmlkIGNlbGxzIGFyb3VuZCBwb3NpdGlvbgogZm9yIHg9Zmxy
+KHB4LXJhZGl1cyksZmxyKHB4K3JhZGl1cykgZG8KICBmb3IgeT1mbHIocHktcmFkaXVzKSxmbHIo
+cHkrcmFkaXVzKSBkbwogICAtLSBib3VuZHMgY2hlY2sKICAgaWYgeDwwIG9yIHg_PTEyOCBvciB5
+PDAgb3IgeT49MTI4IHRoZW4KICAgIGNvbD10cnVlCiAgICBicmVhawogICBlbHNlCiAgICBsb2Nh
+bCB0aWxlPWdldF93YWxsKHgseSkKICAgIAogICAgLS0gY2hlY2sgaWYgZG9vciB0aWxlCiAgICBp
+ZiB0aWxlPT1kb29yX25vcm1hbCBvciB0aWxlPT1kb29yX2xvY2tlZCBvciB0aWxlPT1kb29yX3N0
+YXlfb3BlbiB0aGVuCiAgICAgbG9jYWwgZG9vcj1kb29yZ3JpZFt4XVt5XQogICAgIGlmIGRvb3Ig
+dGhlbgogICAgICBpZiBkb29yLm9wZW49PTEgdGhlbgogICAgICAgLS0gZnVsbHkgb3BlbjogcHJl
+dmVudCBjbG9zaW5nCiAgICAgICBkb29yLm9wZW5pbmc9dHJ1ZQogICAgICBlbHNlCiAgICAgICAt
+LSBkb29yIHBhcnRpYWxseSBvcGVuIG9yIGNsb3NlZDogY29sbGlzaW9uIGRldGVjdGVkCiAgICAg
+ICBjb2w9dHJ1ZQogICAgICAgLS0gaGFuZGxlIHVubG9ja2luZy9vcGVuaW5nIGJlZm9yZSBleGl0
+aW5nIGlubmVyIGxvb3AKICAgICAgIGlmIG9wZW5kb29ycyB0aGVuCiAgICAgICAgaWYgZG9vci5r
+ZXludW0gdGhlbgogICAgICAgICAtLSBjaGVjayBpbnZlbnRvcnkgZm9yIGtleQogICAgICAgICBp
+ZiBpc3BsYXllciB0aGVuCiAgICAgICAgICBmb3IgaSxpdGVtIGluIGlwYWlycyhwbGF5ZXIua2V5
+cykgZG8KICAgICAgICAgICBpZiBpdGVtLmtleW51bT09ZG9vci5rZXludW0gdGhlbgogICAgICAg
+ICAgICAtLSByZW1vdmUga2V5CiAgICAgICAgICAgIGRlbGkocGxheWVyLmtleXMsaSkKICAgICAg
+ICAgICAgZG9vci5rZXludW09bmlsCiAgICAgICAgICAgIGRvb3Iub3BlbmluZz10cnVlCiAgICAg
 ICAgICAgIC0tIGtlZXAgY29sPXRydWUsIGRvbid0IGNsZWFyIGltbWVkaWF0ZWx5CiAgICAgICAg
-ZW5kCiAgICAgICBlbmQKICAgICAgIC0tIGVhcmx5IGV4aXQgZnJvbSBpbm5lciBsb29wIG9uIGNv
-bGxpc2lvbiAoYWZ0ZXIgb3BlbmRvb3JzIGhhbmRsaW5nKQogICAgICAgYnJlYWsKICAgICAgZW5k
-CiAgICAgZW5kCiAgICAtLSBjaGVjayBpZiBleGl0IHBvcnRhbAogICAgZWxzZWlmICh0aWxlPT1l
-eGl0X3N0YXJ0IG9yIHRpbGU9PWV4aXRfZW5kKSBhbmQgaXNwbGF5ZXIgdGhlbgogICAgIC0tIHBs
-YWNlaG9sZGVyIGZvciBsZXZlbCBjb21wbGV0aW9uCiAgICAtLSBjaGVjayBpZiB3YWxsCiAgICBl
-bHNlaWYgdGlsZT4wIHRoZW4KICAgICBjb2w9dHJ1ZQogICAgIGJyZWFrCiAgICBlbmQKICAgZW5k
-CiAgZW5kCiAgaWYgY29sIHRoZW4gYnJlYWsgZW5kCiBlbmQKIAogLS0gY2hlY2sgc29saWQgb2Jq
-ZWN0cyBhcm91bmQgcG9zaXRpb24gdmlhIGZsYXQgYXJyYXkgd2l0aCBlYXJseSBkaXN0YW5jZSBj
-dWxsCiBmb3Igb2IgaW4gYWxsKG9iamVjdHMpIGRvCiAgaWYgb2IudHlwIGFuZCBvYi50eXAuc29s
-aWQgYW5kIG9iLnBvcyB0aGVuCiAgIGxvY2FsIG94PW9iLnBvc1sxXS1weAogICBsb2NhbCBveT1v
-Yi5wb3NbMl0tcHkKICAgLS0gZWFybHkgYXhpcy1hbGlnbmVkIGN1bGwKICAgaWYgYWJzKG94KTwo
-cmFkaXVzKyhvYi50eXAudyBvciAwKSkgYW5kIGFicyhveSk8KHJhZGl1cysob2IudHlwLncgb3Ig
-MCkpIHRoZW4KICAgIGlmIG1heChhYnMob3gpLGFicyhveSkpPChvYi50eXAudyBvciAwKSB0aGVu
-CiAgICAgY29sPXRydWUKICAgICAtLSB0cmlnZ2VyIGludGVyYWN0aW9uIG9uIHNvbGlkIGNvbnRh
-Y3QgaWYgcGxheWVyCiAgICAgaWYgaXNwbGF5ZXIgdGhlbgogICAgICBjaGVja19pbnRlcmFjdGlv
-bnNfYXQocHgscHkpCiAgICAgZW5kCiAgICAgYnJlYWsKICAgIGVuZAogICBlbmQKICBlbmQKIGVu
-ZAogCiByZXR1cm4gY29sCmVuZAoKLS0gbW92ZW1lbnQgd3JhcHBlciB3aXRoIHNsaWRpbmcgY29s
-bGlzaW9uCi0tIFB1cnBvc2U6IE1vdmVtZW50IHdpdGggc2xpZGluZyBjb2xsaXNpb24gKHRyeSBk
-aWFnb25hbCwgdGhlbiBYLCB0aGVuIFkpCi0tIFBhcmFtZXRlcnM6IHBvcyAodGFibGUgd2l0aCB4
-LHkpLCB0YXJnZXRfeCwgdGFyZ2V0X3ksIHJhZGl1cywgb3BlbmRvb3JzLCBpc3BsYXllcgotLSBS
-ZXR1cm5zOiBib29sZWFuICh0cnVlIGlmIGFueSBtb3ZlbWVudCBzdWNjZWVkZWQpCi0tIEFsZ29y
-aXRobTogVGhyZWUtcGhhc2UgY29sbGlzaW9uIGNoZWNrIGZvciBzbW9vdGggd2FsbCBzbGlkaW5n
-CmZ1bmN0aW9uIHRyeW1vdmV0byhwb3MsdGFyZ2V0X3gsdGFyZ2V0X3kscmFkaXVzLG9wZW5kb29y
-cyxpc3BsYXllcikKIHJhZGl1cz1yYWRpdXMgb3IgcGxheWVyX2NvbGxpc2lvbl9yYWRpdXMKIG9w
-ZW5kb29ycz1vcGVuZG9vcnMgb3IgZmFsc2UKIGlzcGxheWVyPWlzcGxheWVyIG9yIGZhbHNlCiAK
-IC0tIHRyeSBkaXJlY3QgbW92ZW1lbnQKIGlmIG5vdCByYWRpdXMgb3Igbm90IGlzY29sKHRhcmdl
-dF94LHRhcmdldF95LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpIHRoZW4KICBwb3MueCxwb3Mu
-eT10YXJnZXRfeCx0YXJnZXRfeQogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHgtb25seSBt
-b3ZlbWVudAogaWYgYWJzKHBvcy54LXRhcmdldF94KT4wLjAxIGFuZCBub3QgaXNjb2wodGFyZ2V0
-X3gscG9zLnkscmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvcy54PXRhcmdldF94
-CiAgcmV0dXJuIHRydWUKIGVuZAogCiAtLSB0cnkgeS1vbmx5IG1vdmVtZW50CiBpZiBhYnMocG9z
-LnktdGFyZ2V0X3kpPjAuMDEgYW5kIG5vdCBpc2NvbChwb3MueCx0YXJnZXRfeSxyYWRpdXMsb3Bl
-bmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zLnk9dGFyZ2V0X3kKICByZXR1cm4gdHJ1ZQogZW5k
-CiAKIHJldHVybiBmYWxzZQplbmQKCi0tIG1vdmVtZW50IHdyYXBwZXIgZm9yIHBvc1sxXS9wb3Nb
-Ml0gYXJyYXkgcG9zaXRpb25zCmZ1bmN0aW9uIHRyeW1vdmV0b19wb3MocG9zX2FycmF5LHRhcmdl
-dF94LHRhcmdldF95LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpCiByYWRpdXM9cmFkaXVzIG9y
-IHBsYXllcl9jb2xsaXNpb25fcmFkaXVzCiBvcGVuZG9vcnM9b3BlbmRvb3JzIG9yIGZhbHNlCiBp
-c3BsYXllcj1pc3BsYXllciBvciBmYWxzZQogCiAtLSB0cnkgZGlyZWN0IG1vdmVtZW50CiBpZiBu
-b3QgcmFkaXVzIG9yIG5vdCBpc2NvbCh0YXJnZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3Jz
-LGlzcGxheWVyKSB0aGVuCiAgcG9zX2FycmF5WzFdLHBvc19hcnJheVsyXT10YXJnZXRfeCx0YXJn
-ZXRfeQogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHgtb25seSBtb3ZlbWVudAogaWYgYWJz
-KHBvc19hcnJheVsxXS10YXJnZXRfeCk_MC4wMSBhbmQgbm90IGlzY29sKHRhcmdldF94LHBvc19h
-cnJheVsyXSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zX2FycmF5WzFdPXRh
-cmdldF94CiAgcmV0dXJuIHRydWUKIGVuZAogCiAtLSB0cnkgeS1vbmx5IG1vdmVtZW50CiBpZiBh
-YnMocG9zX2FycmF5WzJdLXRhcmdldF95KT4wLjAxIGFuZCBub3QgaXNjb2wocG9zX2FycmF5WzFd
-LHRhcmdldF95LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpIHRoZW4KICBwb3NfYXJyYXlbMl09
-dGFyZ2V0X3kKICByZXR1cm4gdHJ1ZQogZW5kCiAKIHJldHVybiBmYWxzZQplbmQKCmZ1bmN0aW9u
-IHVwZGF0ZV9pbnB1dCgpCiBsb2NhbCBzYSxjYT1zaW4ocGxheWVyLmEpLGNvcyhwbGF5ZXIuYSkK
-IAogLS0gbW92ZW1lbnQKIC0tIGNvbWJpbmUga2V5cyB0byBhdm9pZCBkb3VibGUtcHJvY2Vzc2lu
-ZyBhbmQgZml4IGRpcmVjdGlvbjoKIC0tIHBvc2l0aXZlIHR1cm4gPSBsZWZ0LCBuZWdhdGl2ZSB0
-dXJuID0gcmlnaHQKIGxvY2FsIHR1cm49KGJ0bigwKSBhbmQgMSBvciAwKS0oYnRuKDEpIGFuZCAx
-IG9yIDApCiBpZiB0dXJufj0wIHRoZW4KICBwbGF5ZXIuYSs9dHVybipwbGF5ZXJfcm90YXRpb25f
-c3BlZWQKIGVuZAogaWYgYnRuKDIpIHRoZW4gLS0gdXAKICBsb2NhbCBueD1wbGF5ZXIueCtjYSpw
-bGF5ZXIuc3BkCiAgbG9jYWwgbnk9cGxheWVyLnkrc2EqcGxheWVyLnNwZAogIHRyeW1vdmV0byhw
-bGF5ZXIsbngsbnkscGxheWVyX2NvbGxpc2lvbl9yYWRpdXMsdHJ1ZSx0cnVlKQogZW5kCiBpZiBi
-dG4oMykgdGhlbiAtLSBkb3duCiAgbG9jYWwgbng9cGxheWVyLngtY2EqcGxheWVyLnNwZAogIGxv
-Y2FsIG55PXBsYXllci55LXNhKnBsYXllci5zcGQKICB0cnltb3ZldG8ocGxheWVyLG54LG55LHBs
-YXllcl9jb2xsaXNpb25fcmFkaXVzLHRydWUsdHJ1ZSkKIGVuZAogCiAtLSBjaGVjayBmb3IgaW50
-ZXJhY3Rpb25zIGV2ZXJ5IGZyYW1lCiBjaGVja19pbnRlcmFjdGlvbnMoKQogCiAtLSBpbnRlcmFj
-dGlvbiBpbnB1dDogRSBrZXkgb3IgWiBidXR0b24KIGlmIGtleXAoImUiKSBvciBidG5wKDQpIHRo
-ZW4KICBoYW5kbGVfaW50ZXJhY3QoKQogZW5kCmVuZAoKIAoKLS0gY2hlY2sgaW50ZXJhY3Rpb25z
-IGFyb3VuZCBwbGF5ZXIgcG9zaXRpb24KLS0gUHVycG9zZTogU2NhbiBuZWFyYnkgb2JqZWN0cyBm
-b3IgcHJveGltaXR5LWJhc2VkIGludGVyYWN0aW9ucwotLSBBbGdvcml0aG06IDPDlzMgb2JqZ3Jp
-ZCBjZWxsIHNjYW4gYXJvdW5kIHBsYXllcgotLSBTaWRlIGVmZmVjdHM6IEF1dG8tY29sbGVjdHMg
-cGlja3VwcywgdHJpZ2dlcnMgY29tYmF0LCBzZXRzIGludGVyYWN0aW9uIGZsYWdzCi0tIE5vdGVz
-OiBDYWxsZWQgZXZlcnkgZnJhbWUgaW4gX3VwZGF0ZSgpCmZ1bmN0aW9uIGNoZWNrX2ludGVyYWN0
-aW9ucygpCiBjaGVja19pbnRlcmFjdGlvbnNfYXQocGxheWVyLngscGxheWVyLnkpCmVuZAoKLS0g
-Y2hlY2sgaW50ZXJhY3Rpb25zIGF0IHNwZWNpZmljIHBvc2l0aW9uIChhdm9pZHMgcmVjdXJzaW9u
-KQpmdW5jdGlvbiBjaGVja19pbnRlcmFjdGlvbnNfYXQocHgscHkpCiAtLSBzY2FuIGFsbCBvYmpl
-Y3RzIHdpdGggZGlzdGFuY2UgY3VsbGluZwogbG9jYWwgY2xvc2VzdF9pbnRlcmFjdD1uaWwKIGxv
-Y2FsIGNsb3Nlc3RfZGlzdD05OTkKIAogZm9yIG9iIGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9i
-LnBvcyBhbmQgb2IudHlwIHRoZW4KICAgbG9jYWwgZHg9b2IucG9zWzFdLXB4CiAgIGxvY2FsIGR5
-PW9iLnBvc1syXS1weQogICBsb2NhbCBkaXN0PWFicyhkeCkrYWJzKGR5KQogICAKICAgLS0gZGly
-ZWN0IHBpY2t1cDogYXV0by1jb2xsZWN0CiAgIGlmIG9iLnR5cC5raW5kPT0iZGlyZWN0X3BpY2t1
-cCIgYW5kIGRpc3Q8aW50ZXJhY3Rpb25fcmFuZ2UgdGhlbgogICAgY29sbGVjdF9pdGVtKG9iKQog
-ICAgZGVsKG9iamVjdHMsb2IpCiAgICBpZiBvYi5hdXRvYW5pbSB0aGVuIGRlbChhbmltYXRlZF9v
-YmplY3RzLG9iKSBlbmQKICAgCiAgIC0tIGhvc3RpbGUgbnBjOiB0cmlnZ2VyIGNvbWJhdAogICBl
-bHNlaWYgb2IudHlwLmtpbmQ9PSJob3N0aWxlX25wYyIgYW5kIGRpc3Q8Y29tYmF0X3RyaWdnZXJf
-cmFuZ2UgdGhlbgogICAgaW5fY29tYmF0PXRydWUKICAgIGN1cnJlbnRfdGFyZ2V0PW9iCiAgIAog
-ICAtLSBpbnRlcmFjdGFibGU6IHNldCBmbGFnIGZvciBjbG9zZXN0CiAgIGVsc2VpZiBvYi50eXAu
-a2luZD09ImludGVyYWN0YWJsZSIgYW5kIGRpc3Q8aW50ZXJhY3Rpb25fcmFuZ2UgdGhlbgogICAg
-LS0gdHJhcDogaW1tZWRpYXRlIGVmZmVjdAogICAgaWYgb2IudHlwLnN1YnR5cGU9PSJ0cmFwIiB0
-aGVuCiAgICAgcGxheWVyLmhwPW1heCgwLHBsYXllci5ocC0xMCkKICAgICB0cmFwX21zZ190aW1l
-cj02MAogICAgIGRlbChvYmplY3RzLG9iKQogICAgIGlmIG9iLmF1dG9hbmltIHRoZW4gZGVsKGFu
-aW1hdGVkX29iamVjdHMsb2IpIGVuZAogICAgZWxzZWlmIGRpc3Q8Y2xvc2VzdF9kaXN0IHRoZW4K
-ICAgICBjbG9zZXN0X2ludGVyYWN0PW9iCiAgICAgY2xvc2VzdF9kaXN0PWRpc3QKICAgIGVuZAog
-ICBlbmQKICBlbmQKIGVuZAogCiAtLSB1cGRhdGUgaW50ZXJhY3Rpb24gc3RhdGUKIGlmIGNsb3Nl
-c3RfaW50ZXJhY3QgdGhlbgogIGludGVyYWN0aW9uX2FjdGl2ZT10cnVlCiAgY3VycmVudF9pbnRl
-cmFjdD1jbG9zZXN0X2ludGVyYWN0CiBlbHNlCiAgaW50ZXJhY3Rpb25fYWN0aXZlPWZhbHNlCiAg
-Y3VycmVudF9pbnRlcmFjdD1uaWwKIGVuZAplbmQKCi0tIGNvbGxlY3QgaXRlbSAocGlja3VwKQot
-LSBQdXJwb3NlOiBIYW5kbGUgcGlja3VwIGNvbGxlY3Rpb24gYW5kIGludmVudG9yeSB1cGRhdGVz
-Ci0tIFBhcmFtZXRlcnM6IG9iIChvYmplY3Qgd2l0aCB0eXAuc3VidHlwZSkKLS0gU2lkZSBlZmZl
-Y3RzOiBBZGRzIHRvIHBsYXllci5rZXlzLCBpbmNyZWFzZXMgcGxheWVyLmhwCi0tIE5vdGVzOiBD
-YWxsZWQgYnkgY2hlY2tfaW50ZXJhY3Rpb25zX2F0KCkgZm9yIGRpcmVjdF9waWNrdXAgb2JqZWN0
-cwpmdW5jdGlvbiBjb2xsZWN0X2l0ZW0ob2IpCiBpZiBvYi50eXAuc3VidHlwZT09ImtleSIgYW5k
-IG9iLmtleW51bSB0aGVuCiAgYWRkKHBsYXllci5rZXlzLHtrZXludW09b2Iua2V5bnVtfSkKICBw
-cmludGgoImNvbGxlY3RlZCBrZXkgIi4ub2Iua2V5bnVtKQogZWxzZWlmIG9iLnR5cC5zdWJ0eXBl
-PT0iaGVhcnQiIHRoZW4KICBwbGF5ZXIuaHA9bWluKDEwMCxwbGF5ZXIuaHArMjApCiAgcHJpbnRo
-KCJjb2xsZWN0ZWQgaGVhcnQiKQogZWxzZQogIHByaW50aCgiY29sbGVjdGVkIGl0ZW0iKQogZW5k
-CmVuZAoKLS0gaGFuZGxlIGludGVyYWN0aW9uIHdoZW4gcGxheWVyIHByZXNzZXMgRS9aCi0tIFB1
-cnBvc2U6IFByb2Nlc3MgcGxheWVyLWluaXRpYXRlZCBpbnRlcmFjdGlvbnMgKEUga2V5IC8gWiBi
-dXR0b24pCi0tIEFsZ29yaXRobTogU3dpdGNoIG9uIGN1cnJlbnRfaW50ZXJhY3QudHlwLnN1YnR5
-cGUKLS0gU2lkZSBlZmZlY3RzOiBPcGVucyBjaGVzdHMsIGFjdGl2YXRlcyBzaHJpbmVzLCByZWFk
-cyBub3RlcywgdHJpZ2dlcnMgZmxvb3IgdHJhbnNpdGlvbgotLSBOb3RlczogT25seSBydW5zIHdo
-ZW4gaW50ZXJhY3Rpb25fYWN0aXZlIGZsYWcgaXMgdHJ1ZQpmdW5jdGlvbiBoYW5kbGVfaW50ZXJh
-Y3QoKQogaWYgbm90IGludGVyYWN0aW9uX2FjdGl2ZSBvciBub3QgY3VycmVudF9pbnRlcmFjdCB0
-aGVuIHJldHVybiBlbmQKIAogbG9jYWwgc3VidHlwZT1jdXJyZW50X2ludGVyYWN0LnR5cCBhbmQg
-Y3VycmVudF9pbnRlcmFjdC50eXAuc3VidHlwZSBvciAidW5rbm93biIKIAogaWYgc3VidHlwZT09
-ImNoZXN0IiB0aGVuCiAgLS0gb3BlbiBjaGVzdCAocGxhY2Vob2xkZXIpCiAgcGxheWVyLmhwPW1p
-bigxMDAscGxheWVyLmhwKzEwKQogIHByaW50aCgib3BlbmVkIGNoZXN0IikKICBkZWwob2JqZWN0
-cyxjdXJyZW50X2ludGVyYWN0KQogIGlmIGN1cnJlbnRfaW50ZXJhY3QuYXV0b2FuaW0gdGhlbiBk
-ZWwoYW5pbWF0ZWRfb2JqZWN0cyxjdXJyZW50X2ludGVyYWN0KSBlbmQKICAKIGVsc2VpZiBzdWJ0
-eXBlPT0ic2hyaW5lIiB0aGVuCiAgLS0gYWN0aXZhdGUgc2hyaW5lIChwbGFjZWhvbGRlcikKICBw
-bGF5ZXIuaHA9MTAwCiAgcHJpbnRoKCJhY3RpdmF0ZWQgc2hyaW5lIikKICAKIGVsc2VpZiBzdWJ0
-eXBlPT0ibm90ZSIgdGhlbgogIC0tIHJlYWQgbm90ZSAocGxhY2Vob2xkZXIpCiAgcHJpbnRoKCJy
-ZWFkIG5vdGUiKQogIGRlbChvYmplY3RzLGN1cnJlbnRfaW50ZXJhY3QpCiAgaWYgY3VycmVudF9p
-bnRlcmFjdC5hdXRvYW5pbSB0aGVuIGRlbChhbmltYXRlZF9vYmplY3RzLGN1cnJlbnRfaW50ZXJh
-Y3QpIGVuZAogIAogZWxzZWlmIHN1YnR5cGU9PSJleGl0IiB0aGVuCiAgLS0gdHJpZ2dlciBuZXh0
-IGZsb29yCiAgcHJpbnRoKCJ1c2luZyBleGl0IHBvcnRhbCIpCiAgZ2VuZXJhdGVfbmV3X2Zsb29y
-KCkKICAKIGVuZAogCiAtLSBjbGVhciBpbnRlcmFjdGlvbiBzdGF0ZSBhZnRlciBoYW5kbGluZwog
-aW50ZXJhY3Rpb25fYWN0aXZlPWZhbHNlCiBjdXJyZW50X2ludGVyYWN0PW5pbAplbmQKCi0tIGdl
-bmVyYXRlIG5ldyBmbG9vciAocmVnZW5lcmF0ZSBkdW5nZW9uKQpmdW5jdGlvbiBnZW5lcmF0ZV9u
-ZXdfZmxvb3IoKQogLS0gaW5jcmVtZW50IGRpZmZpY3VsdHkKIGdlbl9wYXJhbXMuZGlmZmljdWx0
-eT1taW4oZ2VuX3BhcmFtcy5tYXhfZGlmZmljdWx0eSxnZW5fcGFyYW1zLmRpZmZpY3VsdHkrMSkK
-IAogLS0gY2xlYXIgZXhpc3Rpbmcgb2JqZWN0cwogb2JqZWN0cz17fQogYW5pbWF0ZWRfb2JqZWN0
-cz17fQogZG9vcnM9e30KIC0tIGFsc28gY2xlYXIgZG9vcmdyaWQgdG8gcHJldmVudCBzdGFsZSBy
-ZWZlcmVuY2VzCiBmb3IgaT0wLDEyNyBkbwogIGlmIGRvb3JncmlkW2ldIHRoZW4KICAgZm9yIGo9
-MCwxMjcgZG8KICAgIGRvb3JncmlkW2ldW2pdPW5pbAogICBlbmQKICBlbmQKIGVuZAogCiAtLSBy
-ZWdlbmVyYXRlIGR1bmdlb24KIHN0YXJ0X3BvcyxnZW5fc3RhdHM9Z2VuZXJhdGVfZHVuZ2Vvbigp
-Ci0tIFRyaWdnZXIgR0MgYWZ0ZXIgZHVuZ2VvbiBnZW5lcmF0aW9uIChQaWNvdHJvbiBndWlkZWxp
-bmU6IGF2b2lkIG1pZC1nYW1lcGxheSBzdHV0dGVyKQpzdGF0KDApCiAtLSBpbnZhbGlkYXRlIHBl
-cnNpc3RlbnQgcmVuZGVyIGNhY2hlcyBmb3IgbmV3IGZsb29yCi0tIFByb2R1Y3Rpb246IGNsZWFy
-IGNhY2hlIG9uIGxldmVsIGxvYWQgdG8gcHJldmVudCBzdGFsZSB0ZXh0dXJlIHJlZmVyZW5jZXMK
-aWYgY2xlYXJfdGV4dHVyZV9jYWNoZXMgdGhlbiBjbGVhcl90ZXh0dXJlX2NhY2hlcygpIGVuZAog
-CiBwcmludGgoImZsb29yIGNvbXBsZXRlISBkaWZmaWN1bHR5OiAiLi5nZW5fcGFyYW1zLmRpZmZp
-Y3VsdHkpCiAKIC0tIGxldmVsIGxvYWQgZGlhZ25vc3RpYyBzdW1tYXJ5CiBwcmludGgoIj09PSBM
-RVZFTCBMT0FEIERJQUdOT1NUSUNTID09PSIpCiBwcmludGgoIkZsb29yOiAiLi4oY3VycmVudF9m
-bG9vciBvciAidW5rbm93biIpKQogcHJpbnRoKCJEaWZmaWN1bHR5OiAiLi5nZW5fcGFyYW1zLmRp
-ZmZpY3VsdHkpCiBwcmludGgoIlJvb21zOiAiLi5nZW5fc3RhdHMucm9vbXMpCiBwcmludGgoIk9i
-amVjdHM6ICIuLmdlbl9zdGF0cy5vYmplY3RzKQogcHJpbnRoKCJTZWVkOiAiLi5nZW5fc3RhdHMu
-c2VlZCkKZW5kCgotLSB1cGRhdGUgY29tYmF0IChwbGFjZWhvbGRlcikKZnVuY3Rpb24gdXBkYXRl
-X2NvbWJhdCgpCiAtLSB0ZW1wIGV4aXQ6IHByZXNzIFEgb3IgRW50ZXIKIGlmIGtleXAoInEiKSBv
-ciBrZXlwKCJlbnRlciIpIHRoZW4KICBpbl9jb21iYXQ9ZmFsc2UKICBjdXJyZW50X3RhcmdldD1u
-aWwKICBwcmludGgoImV4aXRlZCBjb21iYXQiKQogZW5kCmVuZAoKLS0gdXBkYXRlIG5wYyBhaSAo
-YmFzaWMgcGF0cm9sIGFuZCBmb2xsb3cpCmZ1bmN0aW9uIHVwZGF0ZV9ucGNfYWkoKQogZm9yIG9i
-IGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJob3N0aWxl
-X25wYyIgYW5kIG9iLmFpX3R5cGUgdGhlbgogICBsb2NhbCBvbGRfeCxvbGRfeT1vYi5wb3NbMV0s
-b2IucG9zWzJdCiAgIAogICBpZiBvYi5haV90eXBlPT0icGF0cm9sIiB0aGVuCiAgICAtLSBwYXRy
-b2w6IGN5Y2xlIHRocm91Z2ggcGF0cm9sX3BvaW50cwogICAgaWYgb2IucGF0cm9sX3BvaW50cyBh
-bmQgI29iLnBhdHJvbF9wb2ludHM_MCB0aGVuCiAgICAgLS0gaW5pdGlhbGl6ZSBwYXRyb2xfaW5k
-ZXggaWYgbmlsIG9yIDAKICAgICBpZiBub3Qgb2IucGF0cm9sX2luZGV4IG9yIG9iLnBhdHJvbF9p
-bmRleD09MCB0aGVuCiAgICAgIG9iLnBhdHJvbF9pbmRleD0xCiAgICAgZW5kCiAgICAgCiAgICAg
-bG9jYWwgdGFyZ2V0PW9iLnBhdHJvbF9wb2ludHNbb2IucGF0cm9sX2luZGV4XQogICAgIGlmIHRh
-cmdldCB0aGVuCiAgICAgIGxvY2FsIGR4PXRhcmdldC54LW9iLnBvc1sxXQogICAgICBsb2NhbCBk
-eT10YXJnZXQueS1vYi5wb3NbMl0KICAgICAgbG9jYWwgZGlzdD1zcXJ0KGR4KmR4K2R5KmR5KQog
-ICAgICAKICAgICAgLS0gcmVhY2hlZCB3YXlwb2ludDogYWR2YW5jZSB0byBuZXh0CiAgICAgIGlm
-IGRpc3Q8MC4xIHRoZW4KICAgICAgIG9iLnBhdHJvbF9pbmRleD0ob2IucGF0cm9sX2luZGV4JSNv
-Yi5wYXRyb2xfcG9pbnRzKSsxCiAgICAgIGVsc2UKICAgICAgIC0tIG1vdmUgdG93YXJkIGN1cnJl
-bnQgd2F5cG9pbnQKICAgICAgIGlmIGRpc3Q_MCB0aGVuCiAgICAgICAgbG9jYWwgc3BkPW9iLnR5
-cC5wYXRyb2xfc3BlZWQgb3IgMC4wMwogICAgICAgIGxvY2FsIG54PW9iLnBvc1sxXStkeC9kaXN0
-KnNwZAogICAgICAgIGxvY2FsIG55PW9iLnBvc1syXStkeS9kaXN0KnNwZAogICAgICAgIHRyeW1v
-dmV0b19wb3Mob2IucG9zLG54LG55LG9iLnR5cC53IG9yIDAuNCxmYWxzZSxmYWxzZSkKICAgICAg
-IGVuZAogICAgICBlbmQKICAgICBlbmQKICAgIGVuZAogICAgCiAgIGVsc2VpZiBvYi5haV90eXBl
-PT0iZm9sbG93IiB0aGVuCiAgICAtLSBmb2xsb3c6IG1vdmUgdG93YXJkIHBsYXllciBpZiBpbiBy
-YW5nZQogICAgbG9jYWwgZHg9cGxheWVyLngtb2IucG9zWzFdCiAgICBsb2NhbCBkeT1wbGF5ZXIu
-eS1vYi5wb3NbMl0KICAgIGxvY2FsIGRpc3Q9c3FydChkeCpkeCtkeSpkeSkKICAgIGxvY2FsIGZv
-bGxvd19yYW5nZT1vYi50eXAuZm9sbG93X3JhbmdlIG9yIDIwCiAgICBpZiBkaXN0PGZvbGxvd19y
-YW5nZSBhbmQgZGlzdD4wLjEgdGhlbgogICAgIGxvY2FsIHNwZD1vYi50eXAuZm9sbG93X3NwZWVk
-IG9yIDAuMDUKICAgICBsb2NhbCBueD1vYi5wb3NbMV0rZHgvZGlzdCpzcGQKICAgICBsb2NhbCBu
-eT1vYi5wb3NbMl0rZHkvZGlzdCpzcGQKICAgICB0cnltb3ZldG9fcG9zKG9iLnBvcyxueCxueSxv
-Yi50eXAudyBvciAwLjQsZmFsc2UsZmFsc2UpCiAgICBlbmQKICAgZW5kCiAgZW5kCiBlbmQKZW5k
+ICAgIGJyZWFrCiAgICAgICAgICAgZW5kCiAgICAgICAgICBlbmQKICAgICAgICAgZW5kCiAgICAg
+ICAgZWxzZQogICAgICAgICAtLSB1bmxvY2tlZAogICAgICAgICBkb29yLm9wZW5pbmc9dHJ1ZQog
+ICAgICAgICAtLSBrZWVwIGNvbD10cnVlLCBkb24ndCBjbGVhciBpbW1lZGlhdGVseQogICAgICAg
+IGVuZAogICAgICAgZW5kCiAgICAgICAtLSBlYXJseSBleGl0IGZyb20gaW5uZXIgbG9vcCBvbiBj
+b2xsaXNpb24gKGFmdGVyIG9wZW5kb29ycyBoYW5kbGluZykKICAgICAgIGJyZWFrCiAgICAgIGVu
+ZAogICAgIGVuZAogICAgLS0gY2hlY2sgaWYgZXhpdCBwb3J0YWwKICAgIGVsc2VpZiAodGlsZT09
+ZXhpdF9zdGFydCBvciB0aWxlPT1leGl0X2VuZCkgYW5kIGlzcGxheWVyIHRoZW4KICAgICAtLSBw
+bGFjZWhvbGRlciBmb3IgbGV2ZWwgY29tcGxldGlvbgogICAgLS0gY2hlY2sgaWYgd2FsbAogICAg
+ZWxzZWlmIHRpbGU_MCB0aGVuCiAgICAgY29sPXRydWUKICAgICBicmVhawogICAgZW5kCiAgIGVu
+ZAogIGVuZAogIGlmIGNvbCB0aGVuIGJyZWFrIGVuZAogZW5kCiAKIC0tIGNoZWNrIHNvbGlkIG9i
+amVjdHMgYXJvdW5kIHBvc2l0aW9uIHZpYSBmbGF0IGFycmF5IHdpdGggZWFybHkgZGlzdGFuY2Ug
+Y3VsbAogZm9yIG9iIGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9iLnR5cCBhbmQgb2IudHlwLnNv
+bGlkIGFuZCBvYi5wb3MgdGhlbgogICBsb2NhbCBveD1vYi5wb3NbMV0tcHgKICAgbG9jYWwgb3k9
+b2IucG9zWzJdLXB5CiAgIC0tIGVhcmx5IGF4aXMtYWxpZ25lZCBjdWxsCiAgIGlmIGFicyhveCk8
+KHJhZGl1cysob2IudHlwLncgb3IgMCkpIGFuZCBhYnMob3kpPChyYWRpdXMrKG9iLnR5cC53IG9y
+IDApKSB0aGVuCiAgICBpZiBtYXgoYWJzKG94KSxhYnMob3kpKTwob2IudHlwLncgb3IgMCkgdGhl
+bgogICAgIGNvbD10cnVlCiAgICAgLS0gdHJpZ2dlciBpbnRlcmFjdGlvbiBvbiBzb2xpZCBjb250
+YWN0IGlmIHBsYXllcgogICAgIGlmIGlzcGxheWVyIHRoZW4KICAgICAgY2hlY2tfaW50ZXJhY3Rp
+b25zX2F0KHB4LHB5KQogICAgIGVuZAogICAgIGJyZWFrCiAgICBlbmQKICAgZW5kCiAgZW5kCiBl
+bmQKIAogcmV0dXJuIGNvbAplbmQKCi0tIG1vdmVtZW50IHdyYXBwZXIgd2l0aCBzbGlkaW5nIGNv
+bGxpc2lvbgotLSBQdXJwb3NlOiBNb3ZlbWVudCB3aXRoIHNsaWRpbmcgY29sbGlzaW9uICh0cnkg
+ZGlhZ29uYWwsIHRoZW4gWCwgdGhlbiBZKQotLSBQYXJhbWV0ZXJzOiBwb3MgKHRhYmxlIHdpdGgg
+eCx5KSwgdGFyZ2V0X3gsIHRhcmdldF95LCByYWRpdXMsIG9wZW5kb29ycywgaXNwbGF5ZXIKLS0g
+UmV0dXJuczogYm9vbGVhbiAodHJ1ZSBpZiBhbnkgbW92ZW1lbnQgc3VjY2VlZGVkKQotLSBBbGdv
+cml0aG06IFRocmVlLXBoYXNlIGNvbGxpc2lvbiBjaGVjayBmb3Igc21vb3RoIHdhbGwgc2xpZGlu
+ZwpmdW5jdGlvbiB0cnltb3ZldG8ocG9zLHRhcmdldF94LHRhcmdldF95LHJhZGl1cyxvcGVuZG9v
+cnMsaXNwbGF5ZXIpCiByYWRpdXM9cmFkaXVzIG9yIHBsYXllcl9jb2xsaXNpb25fcmFkaXVzCiBv
+cGVuZG9vcnM9b3BlbmRvb3JzIG9yIGZhbHNlCiBpc3BsYXllcj1pc3BsYXllciBvciBmYWxzZQog
+CiAtLSB0cnkgZGlyZWN0IG1vdmVtZW50CiBpZiBub3QgcmFkaXVzIG9yIG5vdCBpc2NvbCh0YXJn
+ZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zLngscG9z
+Lnk9dGFyZ2V0X3gsdGFyZ2V0X3kKICByZXR1cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB4LW9ubHkg
+bW92ZW1lbnQKIGlmIGFicyhwb3MueC10YXJnZXRfeCk_MC4wMSBhbmQgbm90IGlzY29sKHRhcmdl
+dF94LHBvcy55LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpIHRoZW4KICBwb3MueD10YXJnZXRf
+eAogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHktb25seSBtb3ZlbWVudAogaWYgYWJzKHBv
+cy55LXRhcmdldF95KT4wLjAxIGFuZCBub3QgaXNjb2wocG9zLngsdGFyZ2V0X3kscmFkaXVzLG9w
+ZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvcy55PXRhcmdldF95CiAgcmV0dXJuIHRydWUKIGVu
+ZAogCiByZXR1cm4gZmFsc2UKZW5kCgotLSBtb3ZlbWVudCB3cmFwcGVyIGZvciBwb3NbMV0vcG9z
+WzJdIGFycmF5IHBvc2l0aW9ucwpmdW5jdGlvbiB0cnltb3ZldG9fcG9zKHBvc19hcnJheSx0YXJn
+ZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKQogcmFkaXVzPXJhZGl1cyBv
+ciBwbGF5ZXJfY29sbGlzaW9uX3JhZGl1cwogb3BlbmRvb3JzPW9wZW5kb29ycyBvciBmYWxzZQog
+aXNwbGF5ZXI9aXNwbGF5ZXIgb3IgZmFsc2UKIAogLS0gdHJ5IGRpcmVjdCBtb3ZlbWVudAogaWYg
+bm90IHJhZGl1cyBvciBub3QgaXNjb2wodGFyZ2V0X3gsdGFyZ2V0X3kscmFkaXVzLG9wZW5kb29y
+cyxpc3BsYXllcikgdGhlbgogIHBvc19hcnJheVsxXSxwb3NfYXJyYXlbMl09dGFyZ2V0X3gsdGFy
+Z2V0X3kKICByZXR1cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB4LW9ubHkgbW92ZW1lbnQKIGlmIGFi
+cyhwb3NfYXJyYXlbMV0tdGFyZ2V0X3gpPjAuMDEgYW5kIG5vdCBpc2NvbCh0YXJnZXRfeCxwb3Nf
+YXJyYXlbMl0scmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvc19hcnJheVsxXT10
+YXJnZXRfeAogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHktb25seSBtb3ZlbWVudAogaWYg
+YWJzKHBvc19hcnJheVsyXS10YXJnZXRfeSk_MC4wMSBhbmQgbm90IGlzY29sKHBvc19hcnJheVsx
+XSx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zX2FycmF5WzJd
+PXRhcmdldF95CiAgcmV0dXJuIHRydWUKIGVuZAogCiByZXR1cm4gZmFsc2UKZW5kCgpmdW5jdGlv
+biB1cGRhdGVfaW5wdXQoKQogbG9jYWwgc2EsY2E9c2luKHBsYXllci5hKSxjb3MocGxheWVyLmEp
+CiAKIC0tIG1vdmVtZW50CiAtLSBjb21iaW5lIGtleXMgdG8gYXZvaWQgZG91YmxlLXByb2Nlc3Np
+bmcgYW5kIGZpeCBkaXJlY3Rpb246CiAtLSBwb3NpdGl2ZSB0dXJuID0gbGVmdCwgbmVnYXRpdmUg
+dHVybiA9IHJpZ2h0CiBsb2NhbCB0dXJuPShidG4oMCkgYW5kIDEgb3IgMCktKGJ0bigxKSBhbmQg
+MSBvciAwKQogaWYgdHVybn49MCB0aGVuCiAgcGxheWVyLmErPXR1cm4qcGxheWVyX3JvdGF0aW9u
+X3NwZWVkCiBlbmQKIGlmIGJ0bigyKSB0aGVuIC0tIHVwCiAgbG9jYWwgbng9cGxheWVyLngrY2Eq
+cGxheWVyLnNwZAogIGxvY2FsIG55PXBsYXllci55K3NhKnBsYXllci5zcGQKICB0cnltb3ZldG8o
+cGxheWVyLG54LG55LHBsYXllcl9jb2xsaXNpb25fcmFkaXVzLHRydWUsdHJ1ZSkKIGVuZAogaWYg
+YnRuKDMpIHRoZW4gLS0gZG93bgogIGxvY2FsIG54PXBsYXllci54LWNhKnBsYXllci5zcGQKICBs
+b2NhbCBueT1wbGF5ZXIueS1zYSpwbGF5ZXIuc3BkCiAgdHJ5bW92ZXRvKHBsYXllcixueCxueSxw
+bGF5ZXJfY29sbGlzaW9uX3JhZGl1cyx0cnVlLHRydWUpCiBlbmQKIAogLS0gY2hlY2sgZm9yIGlu
+dGVyYWN0aW9ucyBldmVyeSBmcmFtZQogY2hlY2tfaW50ZXJhY3Rpb25zKCkKIAogLS0gaW50ZXJh
+Y3Rpb24gaW5wdXQ6IEUga2V5IG9yIFogYnV0dG9uCiBpZiBrZXlwKCJlIikgb3IgYnRucCg0KSB0
+aGVuCiAgaGFuZGxlX2ludGVyYWN0KCkKIGVuZAplbmQKCiAKCi0tIGNoZWNrIGludGVyYWN0aW9u
+cyBhcm91bmQgcGxheWVyIHBvc2l0aW9uCi0tIFB1cnBvc2U6IFNjYW4gbmVhcmJ5IG9iamVjdHMg
+Zm9yIHByb3hpbWl0eS1iYXNlZCBpbnRlcmFjdGlvbnMKLS0gQWxnb3JpdGhtOiAzw5czIG9iamdy
+aWQgY2VsbCBzY2FuIGFyb3VuZCBwbGF5ZXIKLS0gU2lkZSBlZmZlY3RzOiBBdXRvLWNvbGxlY3Rz
+IHBpY2t1cHMsIHRyaWdnZXJzIGNvbWJhdCwgc2V0cyBpbnRlcmFjdGlvbiBmbGFncwotLSBOb3Rl
+czogQ2FsbGVkIGV2ZXJ5IGZyYW1lIGluIF91cGRhdGUoKQpmdW5jdGlvbiBjaGVja19pbnRlcmFj
+dGlvbnMoKQogY2hlY2tfaW50ZXJhY3Rpb25zX2F0KHBsYXllci54LHBsYXllci55KQplbmQKCi0t
+IGNoZWNrIGludGVyYWN0aW9ucyBhdCBzcGVjaWZpYyBwb3NpdGlvbiAoYXZvaWRzIHJlY3Vyc2lv
+bikKZnVuY3Rpb24gY2hlY2tfaW50ZXJhY3Rpb25zX2F0KHB4LHB5KQogLS0gc2NhbiBhbGwgb2Jq
+ZWN0cyB3aXRoIGRpc3RhbmNlIGN1bGxpbmcKIGxvY2FsIGNsb3Nlc3RfaW50ZXJhY3Q9bmlsCiBs
+b2NhbCBjbG9zZXN0X2Rpc3Q9OTk5CiAKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBv
+Yi5wb3MgYW5kIG9iLnR5cCB0aGVuCiAgIGxvY2FsIGR4PW9iLnBvc1sxXS1weAogICBsb2NhbCBk
+eT1vYi5wb3NbMl0tcHkKICAgbG9jYWwgZGlzdD1hYnMoZHgpK2FicyhkeSkKICAgCiAgIC0tIGRp
+cmVjdCBwaWNrdXA6IGF1dG8tY29sbGVjdAogICBpZiBvYi50eXAua2luZD09ImRpcmVjdF9waWNr
+dXAiIGFuZCBkaXN0PGludGVyYWN0aW9uX3JhbmdlIHRoZW4KICAgIGNvbGxlY3RfaXRlbShvYikK
+ICAgIGRlbChvYmplY3RzLG9iKQogICAgaWYgb2IuYXV0b2FuaW0gdGhlbiBkZWwoYW5pbWF0ZWRf
+b2JqZWN0cyxvYikgZW5kCiAgIAogICAtLSBob3N0aWxlIG5wYzogdHJpZ2dlciBjb21iYXQKICAg
+ZWxzZWlmIG9iLnR5cC5raW5kPT0iaG9zdGlsZV9ucGMiIGFuZCBkaXN0PGNvbWJhdF90cmlnZ2Vy
+X3JhbmdlIHRoZW4KICAgIGluX2NvbWJhdD10cnVlCiAgICBjdXJyZW50X3RhcmdldD1vYgogICAK
+ICAgLS0gaW50ZXJhY3RhYmxlOiBzZXQgZmxhZyBmb3IgY2xvc2VzdAogICBlbHNlaWYgb2IudHlw
+LmtpbmQ9PSJpbnRlcmFjdGFibGUiIGFuZCBkaXN0PGludGVyYWN0aW9uX3JhbmdlIHRoZW4KICAg
+IC0tIHRyYXA6IGltbWVkaWF0ZSBlZmZlY3QKICAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0idHJhcCIg
+dGhlbgogICAgIHBsYXllci5ocD1tYXgoMCxwbGF5ZXIuaHAtMTApCiAgICAgdHJhcF9tc2dfdGlt
+ZXI9NjAKICAgICBkZWwob2JqZWN0cyxvYikKICAgICBpZiBvYi5hdXRvYW5pbSB0aGVuIGRlbChh
+bmltYXRlZF9vYmplY3RzLG9iKSBlbmQKICAgIGVsc2VpZiBkaXN0PGNsb3Nlc3RfZGlzdCB0aGVu
+CiAgICAgY2xvc2VzdF9pbnRlcmFjdD1vYgogICAgIGNsb3Nlc3RfZGlzdD1kaXN0CiAgICBlbmQK
+ICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gdXBkYXRlIGludGVyYWN0aW9uIHN0YXRlCiBpZiBjbG9z
+ZXN0X2ludGVyYWN0IHRoZW4KICBpbnRlcmFjdGlvbl9hY3RpdmU9dHJ1ZQogIGN1cnJlbnRfaW50
+ZXJhY3Q9Y2xvc2VzdF9pbnRlcmFjdAogZWxzZQogIGludGVyYWN0aW9uX2FjdGl2ZT1mYWxzZQog
+IGN1cnJlbnRfaW50ZXJhY3Q9bmlsCiBlbmQKZW5kCgotLSBjb2xsZWN0IGl0ZW0gKHBpY2t1cCkK
+LS0gUHVycG9zZTogSGFuZGxlIHBpY2t1cCBjb2xsZWN0aW9uIGFuZCBpbnZlbnRvcnkgdXBkYXRl
+cwotLSBQYXJhbWV0ZXJzOiBvYiAob2JqZWN0IHdpdGggdHlwLnN1YnR5cGUpCi0tIFNpZGUgZWZm
+ZWN0czogQWRkcyB0byBwbGF5ZXIua2V5cywgaW5jcmVhc2VzIHBsYXllci5ocAotLSBOb3Rlczog
+Q2FsbGVkIGJ5IGNoZWNrX2ludGVyYWN0aW9uc19hdCgpIGZvciBkaXJlY3RfcGlja3VwIG9iamVj
+dHMKZnVuY3Rpb24gY29sbGVjdF9pdGVtKG9iKQogaWYgb2IudHlwLnN1YnR5cGU9PSJrZXkiIGFu
+ZCBvYi5rZXludW0gdGhlbgogIGFkZChwbGF5ZXIua2V5cyx7a2V5bnVtPW9iLmtleW51bX0pCiAg
+cHJpbnRoKCJjb2xsZWN0ZWQga2V5ICIuLm9iLmtleW51bSkKIGVsc2VpZiBvYi50eXAuc3VidHlw
+ZT09ImhlYXJ0IiB0aGVuCiAgcGxheWVyLmhwPW1pbigxMDAscGxheWVyLmhwKzIwKQogIHByaW50
+aCgiY29sbGVjdGVkIGhlYXJ0IikKIGVsc2UKICBwcmludGgoImNvbGxlY3RlZCBpdGVtIikKIGVu
+ZAplbmQKCi0tIGhhbmRsZSBpbnRlcmFjdGlvbiB3aGVuIHBsYXllciBwcmVzc2VzIEUvWgotLSBQ
+dXJwb3NlOiBQcm9jZXNzIHBsYXllci1pbml0aWF0ZWQgaW50ZXJhY3Rpb25zIChFIGtleSAvIFog
+YnV0dG9uKQotLSBBbGdvcml0aG06IFN3aXRjaCBvbiBjdXJyZW50X2ludGVyYWN0LnR5cC5zdWJ0
+eXBlCi0tIFNpZGUgZWZmZWN0czogT3BlbnMgY2hlc3RzLCBhY3RpdmF0ZXMgc2hyaW5lcywgcmVh
+ZHMgbm90ZXMsIHRyaWdnZXJzIGZsb29yIHRyYW5zaXRpb24KLS0gTm90ZXM6IE9ubHkgcnVucyB3
+aGVuIGludGVyYWN0aW9uX2FjdGl2ZSBmbGFnIGlzIHRydWUKZnVuY3Rpb24gaGFuZGxlX2ludGVy
+YWN0KCkKIGlmIG5vdCBpbnRlcmFjdGlvbl9hY3RpdmUgb3Igbm90IGN1cnJlbnRfaW50ZXJhY3Qg
+dGhlbiByZXR1cm4gZW5kCiAKIGxvY2FsIHN1YnR5cGU9Y3VycmVudF9pbnRlcmFjdC50eXAgYW5k
+IGN1cnJlbnRfaW50ZXJhY3QudHlwLnN1YnR5cGUgb3IgInVua25vd24iCiAKIGlmIHN1YnR5cGU9
+PSJjaGVzdCIgdGhlbgogIC0tIG9wZW4gY2hlc3QgKHBsYWNlaG9sZGVyKQogIHBsYXllci5ocD1t
+aW4oMTAwLHBsYXllci5ocCsxMCkKICBwcmludGgoIm9wZW5lZCBjaGVzdCIpCiAgZGVsKG9iamVj
+dHMsY3VycmVudF9pbnRlcmFjdCkKICBpZiBjdXJyZW50X2ludGVyYWN0LmF1dG9hbmltIHRoZW4g
+ZGVsKGFuaW1hdGVkX29iamVjdHMsY3VycmVudF9pbnRlcmFjdCkgZW5kCiAgCiBlbHNlaWYgc3Vi
+dHlwZT09InNocmluZSIgdGhlbgogIC0tIGFjdGl2YXRlIHNocmluZSAocGxhY2Vob2xkZXIpCiAg
+cGxheWVyLmhwPTEwMAogIHByaW50aCgiYWN0aXZhdGVkIHNocmluZSIpCiAgCiBlbHNlaWYgc3Vi
+dHlwZT09Im5vdGUiIHRoZW4KICAtLSByZWFkIG5vdGUgKHBsYWNlaG9sZGVyKQogIHByaW50aCgi
+cmVhZCBub3RlIikKICBkZWwob2JqZWN0cyxjdXJyZW50X2ludGVyYWN0KQogIGlmIGN1cnJlbnRf
+aW50ZXJhY3QuYXV0b2FuaW0gdGhlbiBkZWwoYW5pbWF0ZWRfb2JqZWN0cyxjdXJyZW50X2ludGVy
+YWN0KSBlbmQKICAKIGVsc2VpZiBzdWJ0eXBlPT0iZXhpdCIgdGhlbgogIC0tIHRyaWdnZXIgbmV4
+dCBmbG9vcgogIHByaW50aCgidXNpbmcgZXhpdCBwb3J0YWwiKQogIGdlbmVyYXRlX25ld19mbG9v
+cigpCiAgCiBlbmQKIAogLS0gY2xlYXIgaW50ZXJhY3Rpb24gc3RhdGUgYWZ0ZXIgaGFuZGxpbmcK
+IGludGVyYWN0aW9uX2FjdGl2ZT1mYWxzZQogY3VycmVudF9pbnRlcmFjdD1uaWwKZW5kCgotLSBn
+ZW5lcmF0ZSBuZXcgZmxvb3IgKHJlZ2VuZXJhdGUgZHVuZ2VvbikKZnVuY3Rpb24gZ2VuZXJhdGVf
+bmV3X2Zsb29yKCkKIC0tIGluY3JlbWVudCBkaWZmaWN1bHR5CiBnZW5fcGFyYW1zLmRpZmZpY3Vs
+dHk9bWluKGdlbl9wYXJhbXMubWF4X2RpZmZpY3VsdHksZ2VuX3BhcmFtcy5kaWZmaWN1bHR5KzEp
+CiAKIC0tIGNsZWFyIGV4aXN0aW5nIG9iamVjdHMKIG9iamVjdHM9e30KIGFuaW1hdGVkX29iamVj
+dHM9e30KIGRvb3JzPXt9CiAtLSBhbHNvIGNsZWFyIGRvb3JncmlkIHRvIHByZXZlbnQgc3RhbGUg
+cmVmZXJlbmNlcwogZm9yIGk9MCwxMjcgZG8KICBpZiBkb29yZ3JpZFtpXSB0aGVuCiAgIGZvciBq
+PTAsMTI3IGRvCiAgICBkb29yZ3JpZFtpXVtqXT1uaWwKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0g
+cmVnZW5lcmF0ZSBkdW5nZW9uCiBzdGFydF9wb3MsZ2VuX3N0YXRzPWdlbmVyYXRlX2R1bmdlb24o
+KQotLSBUcmlnZ2VyIEdDIGFmdGVyIGR1bmdlb24gZ2VuZXJhdGlvbiAoUGljb3Ryb24gZ3VpZGVs
+aW5lOiBhdm9pZCBtaWQtZ2FtZXBsYXkgc3R1dHRlcikKc3RhdCgwKQogLS0gaW52YWxpZGF0ZSBw
+ZXJzaXN0ZW50IHJlbmRlciBjYWNoZXMgZm9yIG5ldyBmbG9vcgotLSBQcm9kdWN0aW9uOiBjbGVh
+ciBjYWNoZSBvbiBsZXZlbCBsb2FkIHRvIHByZXZlbnQgc3RhbGUgdGV4dHVyZSByZWZlcmVuY2Vz
+CmlmIGNsZWFyX3RleHR1cmVfY2FjaGVzIHRoZW4gY2xlYXJfdGV4dHVyZV9jYWNoZXMoKSBlbmQK
+IAogcHJpbnRoKCJmbG9vciBjb21wbGV0ZSEgZGlmZmljdWx0eTogIi4uZ2VuX3BhcmFtcy5kaWZm
+aWN1bHR5KQogCiAtLSBsZXZlbCBsb2FkIGRpYWdub3N0aWMgc3VtbWFyeQogcHJpbnRoKCI9PT0g
+TEVWRUwgTE9BRCBESUFHTk9TVElDUyA9PT0iKQogcHJpbnRoKCJGbG9vcjogIi4uKGN1cnJlbnRf
+Zmxvb3Igb3IgInVua25vd24iKSkKIHByaW50aCgiRGlmZmljdWx0eTogIi4uZ2VuX3BhcmFtcy5k
+aWZmaWN1bHR5KQogcHJpbnRoKCJSb29tczogIi4uZ2VuX3N0YXRzLnJvb21zKQogcHJpbnRoKCJP
+YmplY3RzOiAiLi5nZW5fc3RhdHMub2JqZWN0cykKIHByaW50aCgiU2VlZDogIi4uZ2VuX3N0YXRz
+LnNlZWQpCmVuZAoKLS0gdXBkYXRlIGNvbWJhdCAocGxhY2Vob2xkZXIpCmZ1bmN0aW9uIHVwZGF0
+ZV9jb21iYXQoKQogLS0gdGVtcCBleGl0OiBwcmVzcyBRIG9yIEVudGVyCiBpZiBrZXlwKCJxIikg
+b3Iga2V5cCgiZW50ZXIiKSB0aGVuCiAgaW5fY29tYmF0PWZhbHNlCiAgY3VycmVudF90YXJnZXQ9
+bmlsCiAgcHJpbnRoKCJleGl0ZWQgY29tYmF0IikKIGVuZAplbmQKCi0tIHVwZGF0ZSBucGMgYWkg
+KGJhc2ljIHBhdHJvbCBhbmQgZm9sbG93KQpmdW5jdGlvbiB1cGRhdGVfbnBjX2FpKCkKIGZvciBv
+YiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5kIG9iLnR5cC5raW5kPT0iaG9zdGls
+ZV9ucGMiIGFuZCBvYi5haV90eXBlIHRoZW4KICAgbG9jYWwgb2xkX3gsb2xkX3k9b2IucG9zWzFd
+LG9iLnBvc1syXQogICAKICAgaWYgb2IuYWlfdHlwZT09InBhdHJvbCIgdGhlbgogICAgLS0gcGF0
+cm9sOiBjeWNsZSB0aHJvdWdoIHBhdHJvbF9wb2ludHMKICAgIGlmIG9iLnBhdHJvbF9wb2ludHMg
+YW5kICNvYi5wYXRyb2xfcG9pbnRzPjAgdGhlbgogICAgIC0tIGluaXRpYWxpemUgcGF0cm9sX2lu
+ZGV4IGlmIG5pbCBvciAwCiAgICAgaWYgbm90IG9iLnBhdHJvbF9pbmRleCBvciBvYi5wYXRyb2xf
+aW5kZXg9PTAgdGhlbgogICAgICBvYi5wYXRyb2xfaW5kZXg9MQogICAgIGVuZAogICAgIAogICAg
+IGxvY2FsIHRhcmdldD1vYi5wYXRyb2xfcG9pbnRzW29iLnBhdHJvbF9pbmRleF0KICAgICBpZiB0
+YXJnZXQgdGhlbgogICAgICBsb2NhbCBkeD10YXJnZXQueC1vYi5wb3NbMV0KICAgICAgbG9jYWwg
+ZHk9dGFyZ2V0Lnktb2IucG9zWzJdCiAgICAgIGxvY2FsIGRpc3Q9c3FydChkeCpkeCtkeSpkeSkK
+ICAgICAgCiAgICAgIC0tIHJlYWNoZWQgd2F5cG9pbnQ6IGFkdmFuY2UgdG8gbmV4dAogICAgICBp
+ZiBkaXN0PDAuMSB0aGVuCiAgICAgICBvYi5wYXRyb2xfaW5kZXg9KG9iLnBhdHJvbF9pbmRleCUj
+b2IucGF0cm9sX3BvaW50cykrMQogICAgICBlbHNlCiAgICAgICAtLSBtb3ZlIHRvd2FyZCBjdXJy
+ZW50IHdheXBvaW50CiAgICAgICBpZiBkaXN0PjAgdGhlbgogICAgICAgIGxvY2FsIHNwZD1vYi50
+eXAucGF0cm9sX3NwZWVkIG9yIDAuMDMKICAgICAgICBsb2NhbCBueD1vYi5wb3NbMV0rZHgvZGlz
+dCpzcGQKICAgICAgICBsb2NhbCBueT1vYi5wb3NbMl0rZHkvZGlzdCpzcGQKICAgICAgICB0cnlt
+b3ZldG9fcG9zKG9iLnBvcyxueCxueSxvYi50eXAudyBvciAwLjQsZmFsc2UsZmFsc2UpCiAgICAg
+ICBlbmQKICAgICAgZW5kCiAgICAgZW5kCiAgICBlbmQKICAgIAogICBlbHNlaWYgb2IuYWlfdHlw
+ZT09ImZvbGxvdyIgdGhlbgogICAgLS0gZm9sbG93OiBtb3ZlIHRvd2FyZCBwbGF5ZXIgaWYgaW4g
+cmFuZ2UKICAgIGxvY2FsIGR4PXBsYXllci54LW9iLnBvc1sxXQogICAgbG9jYWwgZHk9cGxheWVy
+Lnktb2IucG9zWzJdCiAgICBsb2NhbCBkaXN0PXNxcnQoZHgqZHgrZHkqZHkpCiAgICBsb2NhbCBm
+b2xsb3dfcmFuZ2U9b2IudHlwLmZvbGxvd19yYW5nZSBvciAyMAogICAgaWYgZGlzdDxmb2xsb3df
+cmFuZ2UgYW5kIGRpc3Q_MC4xIHRoZW4KICAgICBsb2NhbCBzcGQ9b2IudHlwLmZvbGxvd19zcGVl
+ZCBvciAwLjA1CiAgICAgbG9jYWwgbng9b2IucG9zWzFdK2R4L2Rpc3Qqc3BkCiAgICAgbG9jYWwg
+bnk9b2IucG9zWzJdK2R5L2Rpc3Qqc3BkCiAgICAgdHJ5bW92ZXRvX3BvcyhvYi5wb3Msbngsbnks
+b2IudHlwLncgb3IgMC40LGZhbHNlLGZhbHNlKQogICAgZW5kCiAgIGVuZAogIGVuZAogZW5kCmVu
+ZA==
 :: src/.info.pod
---[[pod,created="2025-11-07 22:14:13",modified="2025-11-12 01:15:56"]]
+--[[pod,created="2025-11-07 22:14:13",modified="2025-11-12 02:28:40"]]
+:: tests/.info.pod
+--[[pod,created="2025-11-12 02:28:40",modified="2025-11-12 02:28:40"]]
 :: [eoc]

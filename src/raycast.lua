@@ -246,6 +246,8 @@ function raycast_scene()
   ray_z:set(i, z)
   rbuf_tile:set(i, tile)
   rbuf_tx:set(i, tx)
+  ray_hitx:set(i, hx)
+  ray_hity:set(i, hy)
   
   maxz=max(maxz,z)
  end

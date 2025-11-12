@@ -120,6 +120,30 @@ gen_params={
  pickup_density=0.1
 }
 
+gen_observability={
+ enable_console=false,
+ capture_history=true,
+ history_limit=400,
+ log_seed=true,
+ log_room_attempts=true,
+ log_corridors=true,
+ log_progression=true,
+ log_repairs=true
+}
+
+gen_adaptive_settings={
+ spacing_relax_threshold=4,
+ spacing_relax_step=1,
+ spacing_max_relax=4,
+ spacing_restore_delay=2,
+ spacing_restore_step=1,
+ max_room_failures=24,
+ offcenter_bias=0.65,
+ bias_radius=12,
+ junction_retry_limit=6,
+ corridor_jog_chance=0.25
+}
+
 -- helper constants
 max_spawn_attempts=50
 max_room_attempts=100
@@ -175,11 +199,71 @@ decoration_types={
 
 -- theme definitions
 themes={
- dng={floor="stone_tile",roof="stone_ceiling",decor_prob=0.8},
- out={floor="dirt",roof="sky",decor_prob=0.5},
- dem={floor="stone_tile",roof="night_sky",decor_prob=0.9},
- house={floor="stone_tile",roof="stone_ceiling",decor_prob=0.7},
- dark={floor="stone_tile",roof="night_sky",decor_prob=0.6}
+ dng={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.8,
+  rules={
+   room_shape_weights={square=0.5,hall_horizontal=0.25,hall_vertical=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=10,
+   center_bias=0.55,
+   corridor_jog_chance=0.2,
+   erosion_intensity=1.0
+  }
+ },
+ out={
+  floor="dirt",
+  roof="sky",
+  decor_prob=0.5,
+  rules={
+   room_shape_weights={hall_horizontal=0.45,square=0.35,grand=0.05,hall_vertical=0.15},
+   room_extra_size=0,
+   bias_radius=14,
+   center_bias=0.7,
+   corridor_jog_chance=0.35,
+   erosion_intensity=1.2
+  }
+ },
+ dem={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.9,
+  rules={
+   room_shape_weights={square=0.4,hall_vertical=0.3,hall_horizontal=0.2,grand=0.15},
+   room_extra_size=2,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.15,
+   erosion_intensity=0.8
+  }
+ },
+ house={
+  floor="stone_tile",
+  roof="stone_ceiling",
+  decor_prob=0.7,
+  rules={
+   room_shape_weights={square=0.6,hall_horizontal=0.2,hall_vertical=0.2},
+   room_extra_size=0,
+   bias_radius=9,
+   center_bias=0.6,
+   corridor_jog_chance=0.1,
+   erosion_intensity=0.5
+  }
+ },
+ dark={
+  floor="stone_tile",
+  roof="night_sky",
+  decor_prob=0.6,
+  rules={
+   room_shape_weights={square=0.35,hall_vertical=0.35,hall_horizontal=0.2,grand=0.1},
+   room_extra_size=1,
+   bias_radius=8,
+   center_bias=0.5,
+   corridor_jog_chance=0.25,
+   erosion_intensity=0.9
+  }
+ }
 }
 
 -- fog palettes (distance-based)
