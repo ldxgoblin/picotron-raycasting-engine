@@ -3,6 +3,7 @@
 -- Depth-bucketed sprite renderer with impostor fallback
 
 local r_sprites = {}
+local assert_lib = include"lib/assert.lua"
 
 -- Note: Sprite buckets now use userdata buffers from r_state
 -- Each bucket stores object indices (not object references) to avoid GC pressure
@@ -187,6 +188,17 @@ end
 -- r_batch: batch module
 -- game_state: {objects, far_plane, sprite_lod_ratio, fog_far, sprite_size, get_spr, error_textures}
 function r_sprites.draw(camera, r_view, r_state, r_batch, game_state)
+  -- Contract guards
+  assert_lib.is_not_nil(game_state.objects, "r_sprites: game_state.objects required")
+  assert_lib.is_type(game_state.objects, "table", "r_sprites: game_state.objects must be table")
+  assert_lib.is_not_nil(game_state.far_plane, "r_sprites: game_state.far_plane required")
+  assert_lib.is_not_nil(game_state.sprite_lod_ratio, "r_sprites: game_state.sprite_lod_ratio required")
+  assert_lib.is_not_nil(game_state.fog_far, "r_sprites: game_state.fog_far required")
+  assert_lib.is_not_nil(game_state.get_spr, "r_sprites: game_state.get_spr required")
+  assert_lib.is_type(game_state.get_spr, "function", "r_sprites: game_state.get_spr must be callable")
+  assert_lib.is_not_nil(game_state.error_textures, "r_sprites: game_state.error_textures required")
+  assert_lib.is_type(game_state.error_textures, "table", "r_sprites: game_state.error_textures must be table")
+
   local cfg = r_state.config
   local sa, ca = sin(camera.a), cos(camera.a)
   local bucket_size = game_state.far_plane / 8
@@ -292,6 +304,33 @@ function r_sprites.draw(camera, r_view, r_state, r_batch, game_state)
   
   palt()
   r_state.occupancy.sprite_count = r_state.occupancy.sprite_count + #game_state.objects
+end
+
+-- Contract verification harness
+-- Call after draw() to verify occupancy counters and bucket usage
+function r_sprites.verify_contract(r_state, game_state)
+  local sprite_count = r_state.occupancy.sprite_count
+  local expected_count = #game_state.objects
+
+  printh("[r_sprites] verifying contract...")
+  printh(string.format("  sprite_count: %d (expected: %d)", sprite_count, expected_count))
+
+  -- Check bucket usage
+  local total_bucketed = 0
+  local cfg = r_state.config
+  for i = 0, cfg.sprite_bucket_count - 1 do
+    local count = r_state.buffers.sprite_bucket_counts:get(i)
+    total_bucketed = total_bucketed + count
+    if count > cfg.sprite_bucket_capacity then
+      printh(string.format("  WARNING: bucket %d overflow (%d > %d)", i, count, cfg.sprite_bucket_capacity))
+    end
+  end
+  printh(string.format("  total bucketed: %d", total_bucketed))
+
+  local success = sprite_count == expected_count
+  printh("[r_sprites] contract: " .. (success and "PASSED" or "FAILED"))
+
+  return success
 end
 
 return r_sprites

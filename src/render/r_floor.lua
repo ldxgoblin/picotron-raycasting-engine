@@ -3,6 +3,7 @@
 -- Hybrid floor/ceiling renderer with near/mid/far row scheduling
 
 local r_floor = {}
+local assert_lib = include"lib/assert.lua"
 
 -- Preallocated buffers for per-cell floor runs (avoid per-frame allocations)
 local RUN_CAP = 1024
@@ -148,6 +149,19 @@ end
 -- r_batch: batch module
 -- game_state: {floor, roof, sprite_size, per_cell_floors_enabled, get_floor, planetyps, error_textures, ERROR_IDX, get_spr}
 function r_floor.draw_floor_ceiling(camera, r_view, r_state, r_batch, game_state)
+  -- Contract guards
+  assert_lib.is_not_nil(game_state.floor, "r_floor: game_state.floor required")
+  assert_lib.is_not_nil(game_state.roof, "r_floor: game_state.roof required")
+  assert_lib.is_not_nil(game_state.get_spr, "r_floor: game_state.get_spr required")
+  assert_lib.is_type(game_state.get_spr, "function", "r_floor: game_state.get_spr must be callable")
+  assert_lib.is_not_nil(game_state.planetyps, "r_floor: game_state.planetyps required")
+  assert_lib.is_type(game_state.planetyps, "table", "r_floor: game_state.planetyps must be table")
+  assert_lib.is_not_nil(game_state.ERROR_IDX, "r_floor: game_state.ERROR_IDX required")
+  if game_state.per_cell_floors_enabled then
+    assert_lib.is_not_nil(game_state.get_floor, "r_floor: game_state.get_floor required when per_cell_floors_enabled")
+    assert_lib.is_type(game_state.get_floor, "function", "r_floor: game_state.get_floor must be callable")
+  end
+
   local cfg = r_state.config
   local screen_center_y = cfg.screen_height / 2
   local screen_width = cfg.screen_width
@@ -241,6 +255,20 @@ function r_floor.draw_floor_ceiling(camera, r_view, r_state, r_batch, game_state
   
   r_batch.tline_submit()
   palt()
+end
+
+-- Contract verification harness
+-- Call after draw_floor_ceiling() to verify occupancy counters
+function r_floor.verify_contract(r_state)
+  local floor_rows = r_state.occupancy.floor_rows
+
+  printh("[r_floor] verifying contract...")
+  printh(string.format("  floor_rows: %d", floor_rows))
+
+  local success = floor_rows > 0
+  printh("[r_floor] contract: " .. (success and "PASSED" or "FAILED"))
+
+  return success
 end
 
 return r_floor

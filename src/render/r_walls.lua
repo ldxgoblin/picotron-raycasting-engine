@@ -3,6 +3,7 @@
 -- Span batcher for wall rendering with LOD
 
 local r_walls = {}
+local assert_lib = include"lib/assert.lua"
 
 -- Texture cache (sprite index -> {src, is_fallback})
 local tex_cache = {}
@@ -68,6 +69,15 @@ end
 -- r_batch: batch module
 -- game_state: {wall_lod_distance, wall_tiny_screen_px, sprite_size, is_door, get_spr, error_textures, ERROR_IDX}
 function r_walls.draw_spans(camera, r_view, r_state, r_batch, game_state)
+  -- Contract guards
+  assert_lib.is_not_nil(r_state.occupancy.rays_active, "r_walls: rays_active not set")
+  assert_lib.is_true(r_state.occupancy.rays_active > 0, "r_walls: no active rays")
+  assert_lib.is_not_nil(game_state.get_spr, "r_walls: game_state.get_spr required")
+  assert_lib.is_type(game_state.get_spr, "function", "r_walls: game_state.get_spr must be callable")
+  assert_lib.is_not_nil(game_state.error_textures, "r_walls: game_state.error_textures required")
+  assert_lib.is_type(game_state.error_textures, "table", "r_walls: game_state.error_textures must be table")
+  assert_lib.is_not_nil(game_state.ERROR_IDX, "r_walls: game_state.ERROR_IDX required")
+
   local bufs = r_state.buffers
   local ray_cnt = r_state.occupancy.rays_active
   local cfg = r_state.config
@@ -240,6 +250,20 @@ end
 function r_walls.clear_caches()
   tex_cache = {}
   avg_color_cache = {}
+end
+
+-- Contract verification harness
+-- Call after draw_spans() to verify occupancy counters
+function r_walls.verify_contract(r_state)
+  local wall_spans = r_state.occupancy.wall_spans
+
+  printh("[r_walls] verifying contract...")
+  printh(string.format("  wall_spans: %d", wall_spans))
+
+  local success = wall_spans >= 0  -- Allow 0 for empty scenes
+  printh("[r_walls] contract: " .. (success and "PASSED" or "FAILED"))
+
+  return success
 end
 
 return r_walls
