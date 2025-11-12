@@ -3,12 +3,19 @@
 -- main entry point
 
 include"src/config.lua"
-include"src/raycast.lua"
-include"src/render.lua"
-include"src/render_sprite.lua"
 include"src/door_system.lua"
 include"src/dungeon_gen.lua"
 include"tests/dungeon_harness.lua"
+
+-- Initialize renderer modules
+local r_state = include"src/r_state.lua"
+local r_batch = include"src/r_batch.lua"
+local r_view = include"src/r_view.lua"
+local r_cast = include"src/r_cast.lua"
+local r_floor = include"src/r_floor.lua"
+local r_walls = include"src/r_walls.lua"
+local r_sprites = include"src/r_sprites.lua"
+local r_diag = include"src/r_diag.lua"
 
 local scenes={}
 local scene_state={}
@@ -70,6 +77,29 @@ function _init()
  
  -- frame counter for ai timing
  frame_ct=0
+ 
+ -- Initialize new renderer
+ r_state.init({
+  screen_width = screen_width,
+  screen_height = screen_height,
+  ray_count = ray_count,
+  sprite_bucket_count = 8,
+  sprite_bucket_capacity = 64,
+  debug_mode = false
+ })
+ r_batch.init()
+ printh("[main] new renderer initialized")
+ 
+ -- Compatibility helpers for minimap drawing (uses r_batch)
+ function rbatch_reset()
+  r_batch.rect_reset()
+ end
+ function rbatch_push(x0, y0, x1, y1, c)
+  r_batch.rect_push(x0, y0, x1, y1, c)
+ end
+ function rbatch_submit()
+  r_batch.rect_submit()
+ end
  
  -- player state
  player={
@@ -182,47 +212,10 @@ function _init()
  objects={}
  animated_objects={}
  
--- z-buffer and frame-stamp as typed userdata for speed
--- zbuf: per-column depth values (one z per screen x); zstamp: frame-stamp to avoid per-frame clears
- zbuf=userdata("f64", screen_width)
- zstamp=userdata("i32", screen_width)
- for i=0,screen_width-1 do
-  -- initialize stamps to 0; z values are considered invalid until stamped
-  zstamp:set(i, 0)
- end
- 
+-- Legacy buffers removed (now managed by r_state)
  -- dynamic budgets
  active_ray_count=ray_count
  row_stride_dynamic=row_stride
- 
- -- Convert to userdata for 24x performance gain (Picotron optimization guideline)
- ray_z = userdata("f64", ray_count)
- ray_x0 = userdata("i16", ray_count)
- ray_x1 = userdata("i16", ray_count)
- ray_dx = userdata("f64", ray_count)
- ray_dy = userdata("f64", ray_count)
- ray_hitx = userdata("f64", ray_count)
- ray_hity = userdata("f64", ray_count)
- 
- -- Precomputed pixel centers for camera-space ray offsets (eliminates per-frame computation)
- ray_px_center = userdata("f64", ray_count)
- 
- -- Initialize with defaults
- for i=0,ray_count-1 do
-   ray_z:set(i, 999)
-   ray_x0:set(i, 0)
-   ray_x1:set(i, 0)
-   ray_dx:set(i, 0)
-   ray_dy:set(i, 0)
- end
- 
- -- rbuf: use separate userdata arrays for tile and tx (avoid nested structures)
- rbuf_tile = userdata("i16", ray_count)
- rbuf_tx = userdata("f64", ray_count)
- for i=0,ray_count-1 do
-   rbuf_tile:set(i, 0)
-   rbuf_tx:set(i, 0)
- end
  
  -- fog state for hysteresis
  last_fog_z=0
@@ -480,18 +473,9 @@ function update_gameplay()
   if clear_texture_caches then clear_texture_caches() end
  end
  
- -- debug ray casting
-  if debug_mode then
-   local sa,ca=sin(player.a),cos(player.a)
-   local z,hx,hy,tile,tx=raycast(player.x,player.y,ca,sa,sa,ca)
-   printh("debug: z="..(flr(z*100)/100).." hx="..(flr(hx*100)/100).." hy="..(flr(hy*100)/100).." tile="..tile.." tx="..(flr(tx*100)/100))
-   local ob,dist=hitscan(player.x,player.y,ca,sa)
-   if ob then
-    printh("debug: obj found at dist="..(flr(dist*100)/100).." kind="..(ob.kind or "unknown"))
-   else
-    printh("debug: no obj hit")
-   end
-  end
+ -- debug ray casting (removed - use diagnostics overlay instead with Tab key)
+ -- Legacy raycast()/hitscan() functions no longer available after renderer refactor
+ -- Use r_diag diagnostics overlay (Tab key) for performance metrics
 end
 
 function draw_gameplay()
@@ -536,39 +520,82 @@ end
 last_cpu_sample=cpu_sample
 diag_active_rays=active_ray_count
  
- -- z-buffer helpers (use frame-stamp, defined once)
- if not zread then
-  function zread(x)
-   -- x is 0-based; return 999 unless stamped this frame
-   local stamp=zstamp:get(x) or 0
-   if stamp==diag_frame_count then
-    local z=zbuf:get(x)
-    return z or 999
-   end
-   return 999
-  end
-  function zwrite(x,z)
-   zbuf:set(x,z)
-   zstamp:set(x,diag_frame_count)
-  end
- end
+ -- Prepare frame in new renderer
+ r_state.prepare_frame()
+ r_state.config.debug_mode = debug_mode
  
- -- cache sin/cos for entire frame to avoid recomputation
- sa_cached=sin(player.a)
- ca_cached=cos(player.a)
+ -- Cache sin/cos for entire frame (used by minimap)
+ ca_cached = cos(player.a)
+ sa_cached = sin(player.a)
  
  if view_mode=="3d" then
-  raycast_scene()
-  local t_raycast=time()
-  render_floor_ceiling()  -- Now includes wall rendering
-  local t_floor_walls=time()
-  render_sprites()
-  local t_sprites=time()
+  -- Build camera table
+  local camera = {x = player.x, y = player.y, a = player.a}
   
-  local ms_raycast=(t_raycast-frame_start)*1000
-  local ms_floor_walls=(t_floor_walls-t_raycast)*1000
-  local ms_sprites=(t_sprites-t_floor_walls)*1000
-  local frame_ms=(t_sprites-frame_start)*1000
+  -- Update view (camera basis and ray LUTs)
+  r_view.update(camera, r_state, fov, active_ray_count)
+  local t_view = time()
+  
+  -- Cast rays
+  local game_state_cast = {
+    get_wall = get_wall,
+    is_door = is_door,
+    doorgrid = doorgrid,
+    test_door_mode = test_door_mode,
+    test_door_open = test_door_open,
+    far_plane = far_plane,
+    map_size = map_size
+  }
+  r_cast.cast_scene(camera, r_view, r_state, game_state_cast)
+  local t_raycast = time()
+  
+  -- Draw floor and ceiling
+  local game_state_floor = {
+    floor = floor,
+    roof = roof,
+    sprite_size = sprite_size,
+    per_cell_floors_enabled = per_cell_floors_enabled,
+    get_floor = get_floor,
+    planetyps = planetyps,
+    ERROR_IDX = ERROR_IDX,
+    get_spr = get_spr,
+    error_textures = error_textures
+  }
+  r_floor.draw_floor_ceiling(camera, r_view, r_state, r_batch, game_state_floor)
+  local t_floor = time()
+  
+  -- Draw walls
+  local game_state_walls = {
+    wall_lod_distance = wall_lod_distance,
+    wall_tiny_screen_px = wall_tiny_screen_px,
+    sprite_size = sprite_size,
+    is_door = is_door,
+    get_spr = get_spr,
+    error_textures = error_textures,
+    ERROR_IDX = ERROR_IDX
+  }
+  r_walls.draw_spans(camera, r_view, r_state, r_batch, game_state_walls)
+  local t_walls = time()
+  
+  -- Draw sprites
+  local game_state_sprites = {
+    objects = objects,
+    far_plane = far_plane,
+    sprite_lod_ratio = sprite_lod_ratio,
+    fog_far = fog_far,
+    sprite_size = sprite_size,
+    get_spr = get_spr,
+    error_textures = error_textures
+  }
+  r_sprites.draw(camera, r_view, r_state, r_batch, game_state_sprites)
+  local t_sprites = time()
+  
+  local ms_view = (t_view - frame_start) * 1000
+  local ms_raycast = (t_raycast - t_view) * 1000
+  local ms_floor = (t_floor - t_raycast) * 1000
+  local ms_walls = (t_walls - t_floor) * 1000
+  local ms_sprites = (t_sprites - t_walls) * 1000
+  local frame_ms = (t_sprites - frame_start) * 1000
   
   -- hud (minimal)
   print("pos:"..flr(player.x)..","..flr(player.y),2,2,7)
@@ -617,48 +644,8 @@ diag_active_rays=active_ray_count
  last_fog_level=-1
  prev_pal={}
 
-if debug_mode then
- draw_diagnostics_panel(frame_ms, cpu_sample)
- end
-end
-
-function draw_diagnostics_panel(frame_ms, cpu_sample)
- frame_ms = frame_ms or 0
- cpu_sample = cpu_sample or last_cpu_sample or 0
- local cpu_pct=flr(cpu_sample*1000+0.5)/10
- local frame_ms_fmt=flr(frame_ms*10+0.5)/10
- local rays_text=(diag_active_rays or active_ray_count or 0) .. "/" .. ray_count
- local wall_tex=diag_wall_columns or 0
- local wall_lod=diag_wall_lod_columns or 0
- local wall_total=wall_tex+wall_lod
- local lod_pct=wall_total>0 and flr((wall_lod/wall_total)*100+0.5) or 0
- local lines={
-  {text="diag: metrics",color=11},
-  {text="frame_ms: "..frame_ms_fmt,color=11},
-  {text="cpu%: "..cpu_pct,color= cpu_pct>90 and 8 or (cpu_pct>70 and 10 or 11)},
-  {text="rays: "..rays_text,color=7},
-  {text="row_stride: "..(row_stride_dynamic or row_stride),color=7},
-  {text="floor rows: "..(diag_floor_rows or 0),color=7},
-  {text="floor draws: "..(diag_floor_batches or 0),color=7},
-  {text="wall tex: "..wall_tex,color=7},
-  {text="wall lod: "..wall_lod.." ("..lod_pct.."%)",color=7},
-  {text="sprite tex: "..(diag_sprite_columns or 0),color=7},
-  {text="sprite lod: "..(diag_sprite_impostor_columns or 0),color=7}
- }
- local max_len=0
- for entry in all(lines) do
-  if #entry.text>max_len then max_len=#entry.text end
- end
- local panel_x=4
- local panel_y=80
- local panel_w=max_len*4+6
- local panel_h=#lines*8+6
- rectfill(panel_x-2,panel_y-2,panel_x+panel_w,panel_y+panel_h,1)
- rect(panel_x-3,panel_y-3,panel_x+panel_w+1,panel_y+panel_h+1,7)
- for i=1,#lines do
-  local entry=lines[i]
-  print(entry.text,panel_x,panel_y+(i-1)*8,entry.color)
- end
+ -- Draw diagnostics overlay (new renderer)
+ r_diag.draw(r_state, frame_ms, cpu_sample)
 end
 
 local function generate_lab_dungeon(state,seed)
@@ -730,45 +717,76 @@ local function draw_lab_map(state)
    circfill(cx,cy,1,color)
   end
  end
- print("seed:"..(state.seed or "?"),ox+map_px+8,oy,7)
- print("rooms:"..(#gen_nodes or 0),ox+map_px+8,oy+8,7)
+ print("controls: Z=random  X=replay  ←/→ seed  F=harness",8,screen_height-20,7)
+ print("scroll log: ↑/↓    menu: G or MENU",8,screen_height-12,7)
+end
+
+local function draw_lab_history(state)
+ local panel_x=screen_width-154
+ local panel_w=140
+ local panel_top=12
+ local panel_bottom=screen_height-12
+ local panel_h=panel_bottom-panel_top
+
+ rectfill(panel_x-4,panel_top-4,panel_x+panel_w+2,panel_bottom,0)
+ rect(panel_x-5,panel_top-5,panel_x+panel_w+3,panel_bottom+1,1)
+
+ local y=panel_top
+ local seed_text="seed: "..(state.seed or "?")
+ local rooms_text="rooms: "..(#gen_nodes or 0)
  local locked_count=0
  if gen_locked_edges then
   for e in all(gen_locked_edges) do
    if e.locked then locked_count+=1 end
   end
  end
- print("locked edges:"..locked_count,ox+map_px+8,oy+16,7)
- print("[z] random  [x] replay  [←/→] seed  [h] harness  [j/k] log  [m] menu",8,screen_height-16,7)
-end
+ local locked_text="locked edges: "..locked_count
+ print(seed_text,panel_x,y,7) y+=8
+ print(rooms_text,panel_x,y,7) y+=8
+ print(locked_text,panel_x,y,7) y+=12
 
-local function draw_lab_history(state)
  local history=state.history or {}
- local cursor=state.history_cursor or 0
- local lines=15
- local start=max(1,#history-lines+1)
- cursor=max(0,min(cursor,#history-lines))
- local y=24
- print("generation log:",screen_width-140,y,11)
- y+=8
- for i=cursor+1,min(#history,cursor+lines) do
-  local line=history[i]
-  if line then
-   print(string.sub(line,1,28),screen_width-140,y,7)
-   y+=8
+ local available_space=panel_h-(y-panel_top)-24
+ local line_h=8
+ local max_lines=max(0,flr(available_space/line_h))
+
+ print("generation log",panel_x,y,11)
+ y+=line_h
+
+ if max_lines<=0 then
+  print("(panel too small)",panel_x,y,8)
+ else
+  local cursor=state.history_cursor or 0
+  local max_cursor=max(0,max(#history-max_lines,0))
+  if cursor>max_cursor then cursor=max_cursor end
+  if cursor<0 then cursor=0 end
+  state.history_cursor=cursor
+  if #history==0 then
+   print("(no events)",panel_x,y,5)
+  else
+   for i=1,max_lines do
+    local idx=cursor+i
+    if idx>#history then break end
+    local entry=history[idx]
+    if entry then
+     print(string.sub(entry,1,32),panel_x,y,7)
+     y+=line_h
+    end
+   end
   end
  end
- state.history_cursor=cursor
- if #history>lines then
-  print("log scroll [J/K]",screen_width-140,screen_height-32,7)
- end
+
+ y=panel_bottom-16
  if state.harness_result then
   local res=state.harness_result
   local failures=res.failures or 0
   local color=failures>0 and 8 or 11
-  print("harness: "..(res.total or 0).." seeds",screen_width-140,screen_height-48,color)
-  print("failures: "..failures,screen_width-140,screen_height-40,color)
+  print("harness: "..(res.total or 0),panel_x,y,color)
+  y+=line_h
+  print("failures: "..failures,panel_x,y,color)
+  y+=line_h
  end
+ print("scroll: ↑/↓   menu: G/MENU",panel_x,y,6)
 end
 
 scenes.menu={
@@ -819,7 +837,7 @@ scenes.gameplay={
   state.seed=gen_stats.seed
  end,
  update=function(state)
-  if keyp("m") then
+  if btnp(6) or keyp("g") then
    switch_scene("menu")
    return
   end
@@ -827,7 +845,7 @@ scenes.gameplay={
  end,
  draw=function(state)
   draw_gameplay()
-  print("[M] menu",screen_width-56,screen_height-10,7)
+  print("[MENU]/G to return",screen_width-120,screen_height-10,7)
  end
 }
 
@@ -837,7 +855,7 @@ scenes.dungeon_lab={
   generate_lab_dungeon(state,state.seed)
  end,
  update=function(state)
-  if keyp("m") then
+  if btnp(6) or keyp("g") then
    switch_scene("menu")
    return
   end
@@ -852,15 +870,16 @@ scenes.dungeon_lab={
   elseif keyp("right") or btnp(1) then
    local seed=(state.seed or 1)+1
    generate_lab_dungeon(state,seed)
-  elseif keyp("h") then
+  elseif keyp("f") then
    local previous_seed=state.seed
    state.harness_result=dungeon_harness.run()
    generate_lab_dungeon(state,previous_seed)
-  elseif keyp("j") then
-   state.history_cursor=max(0,(state.history_cursor or 0)-3)
-  elseif keyp("k") then
+  elseif btnp(2) or keyp("up") or keyp("pageup") then
+   state.history_cursor=max(0,(state.history_cursor or 0)-1)
+  elseif btnp(3) or keyp("down") or keyp("pagedown") then
    local history=state.history or {}
-   state.history_cursor=min(max(0,#history-20),(state.history_cursor or 0)+3)
+   local max_cursor=max(0,#history-1)
+   state.history_cursor=min(max_cursor,(state.history_cursor or 0)+1)
   end
  end,
  draw=function(state)

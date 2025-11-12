@@ -464,6 +464,10 @@ local adaptive_settings=rawget(_G,"gen_adaptive_settings") or {
 local room_failure_streak=0
 local total_room_failures=0
 
+local tick_spacing -- forward declaration
+local gen_log -- forward declaration
+local relax_spacing -- forward declaration
+
 local function hist_push(entry)
  if not observability.capture_history then return end
  add(gen_history,entry)
@@ -471,8 +475,6 @@ local function hist_push(entry)
   deli(gen_history,1)
  end
 end
-
-local tick_spacing
 
 local function register_room_failure(reason)
  room_failure_streak+=1
@@ -492,7 +494,7 @@ local function register_room_success()
  tick_spacing(true)
 end
 
-local function gen_log(tag,msg)
+gen_log=function(tag,msg)
  local line="["..tag.."] "..msg
  hist_push(line)
  if observability.enable_console then printh(line) end
@@ -521,7 +523,7 @@ local function reset_adaptive_spacing()
  total_room_failures=0
 end
 
-local function relax_spacing()
+relax_spacing=function()
  if spacing_relaxations>=(adaptive_settings.spacing_max_relax or 4) then return end
  dynamic_spacing=max(0,dynamic_spacing-(adaptive_settings.spacing_relax_step or 1))
  spacing_relaxations+=1
@@ -529,7 +531,7 @@ local function relax_spacing()
  gen_log("spacing","relaxed spacing to "..dynamic_spacing)
 end
 
-local function tick_spacing(success)
+tick_spacing=function(success)
  if success then
   if spacing_restore_timer>0 then
    spacing_restore_timer-=1
@@ -2088,1166 +2090,1397 @@ function generate_dungeon(opts)
 end
 
 
-:: src/raycast.lua
---[[pod_format="raw",created="2025-11-07 21:17:12",modified="2025-11-07 21:48:07",revision=1]]
--- raycasting core
+:: src/r_batch.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_batch.lua
+-- Central batching for tline3d and rectfill operations
 
--- sign helper
-function sgn(n)
- if n<0 then return -1 end
- if n>0 then return 1 end
- return 0
+local r_batch = {}
+
+-- Batch configuration
+local TLINE_COLS = 13  -- sprite_index, x0,y0,x1,y1, u0,v0,u1,v1, w0,w1, flags
+local RECT_COLS = 5    -- x0,y0,x1,y1, color
+
+-- Buffer capacities
+local tline_capacity = 480 * 2  -- 2x screen width
+local rect_capacity = 480 * 4   -- 4x screen width
+
+-- Batch buffers
+local tline_args = nil
+local rect_args = nil
+local tline_count = 0
+local rect_count = 0
+
+-- Current clip/palette state (for pass isolation)
+local current_clip = nil
+local current_palette = nil
+
+-- Initialize batch buffers
+function r_batch.init()
+  tline_args = userdata("f64", TLINE_COLS, tline_capacity)
+  rect_args = userdata("f64", RECT_COLS, rect_capacity)
+  tline_count = 0
+  rect_count = 0
+  printh("[r_batch] initialized: tline=" .. tline_capacity .. ", rect=" .. rect_capacity)
 end
 
--- vector length
-function length(x,y)
- x/=16
- y/=16
- return sqrt(x*x+y*y)*16
+-- Reset tline batch
+function r_batch.tline_reset()
+  tline_count = 0
 end
 
--- vector normalization
-function normalise(x,y)
- local l=length(x,y)
- if l<=0.0001 then return 0,1 end
- return x/l,y/l
-end
-
--- dda raycast with z-depth tracking
--- fx,fy represent the forward/depth axis used for perpendicular distance:
---  - In main scene: fx,fy = camera forward = (cos(a), sin(a))
---  - In hitscan:    fx,fy = normalized ray direction
-function raycast(x,y,dx,dy,fx,fy)
- -- clamp near-zero components before normalization
- if abs(dx)<0.01 then dx=0.01 end
- if abs(dy)<0.01 then dy=0.01 end
- 
- -- normalize direction if forward axis not provided
- if not fx then
-  fx,fy=normalise(dx,dy)
- end
- 
- -- horizontal ray initialization
- local hx,hy,hdx,hdy=x,y,sgn(dx),dy/abs(dx)
- local hdz,hz=hdx*fx+hdy*fy,0
- 
- -- initial step to grid boundary
- local fracx=hx%1
- local hstep
- if hdx>0 then
-  hstep=1-fracx
- else
-  hstep=fracx
- end
- hx+=hdx*hstep
- hy+=hdy*hstep
- hz+=hdz*hstep
- 
- -- vertical ray initialization
- local vx,vy,vdx,vdy=x,y,dx/abs(dy),sgn(dy)
- local vdz,vz=vdx*fx+vdy*fy,0
- 
- -- initial step to grid boundary
- local fracy=vy%1
- local vstep
- if vdy>0 then
-  vstep=1-fracy
- else
-  vstep=fracy
- end
- vx+=vdx*vstep
- vy+=vdy*vstep
- vz+=vdz*vstep
- 
- -- compute iteration limit from remaining grid crossings to map edges
- -- compute remaining crossings to nearest boundary per axis based on current positions
- local horizontal_crossings
- if hdx>0 then
-  horizontal_crossings=map_size-flr(hx)
- else
-  horizontal_crossings=flr(hx)+1
- end
- 
- local vertical_crossings
- if vdy>0 then
-  vertical_crossings=map_size-flr(vy)
- else
-  vertical_crossings=flr(vy)+1
- end
- 
- local iteration_limit=min(256,horizontal_crossings+vertical_crossings+10)
- 
- -- track DDA steps for diagnostics
- local dda_steps=0
- 
- -- ray marching
- for iter=1,iteration_limit do
-  -- increment step counter
-  dda_steps+=1
-  
-  -- far-plane check: early-out if both candidates exceed far_plane
-  if min(hz, vz) > far_plane then
-   -- if debug_mode then
-   --  diag_dda_steps_total+=dda_steps
-   --  diag_dda_early_outs+=1
-   -- end
-   return 999,hx,hy,0,0
+-- Push a tline3d call to batch
+function r_batch.tline_push(idx, x0, y0, x1, y1, u0, v0, u1, v1, w0, w1, flags)
+  if tline_count >= tline_capacity then
+    r_batch.tline_submit()
   end
   
-  if hz<vz then
-   -- horizontal closer
-   -- crossing a vertical gridline (x changes): choose the cell we are entering
-   local gx=flr(hx)+(hdx<0 and -1 or 0)
-   local gy=flr(hy)
-   
-   -- irreversible OOB check for horizontal candidate
-   if (gx<0 and hdx<0) or (gx>=map_size and hdx>0) or (gy<0 and hdy<0) or (gy>=map_size and hdy>0) then
-    -- if debug_mode then
-    --  diag_dda_steps_total+=dda_steps
-    --  diag_dda_early_outs+=1
-    -- end
-    return 999,hx,hy,0,0
-   end
-   
-   if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
-    local m=get_wall(gx,gy)
-    if m>0 then
-     -- check if door
-     if is_door(m) and doorgrid[gx][gy] then
-     local dz=((hx+hdx/2-x)*fx+(hy+hdy/2-y)*fy)
-      if dz<=vz then
-       local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
-       local dy_off=(hy+hdy/2)%1-open
-       if dy_off>=0 then
-        return dz,hx,hy,m,dy_off
-       end
-      end
-     else
-      -- wall hit
-     -- if debug_mode then
-     --  diag_dda_steps_total+=dda_steps
-     -- end
-     local z=((hx-x)*fx+(hy-y)*fy)
-     -- texture coordinate from y-fraction; flip when rayDirX > 0
-     local frac=hy-flr(hy)
-     local tx=(hdx>0) and (1-frac) or frac
-     return z,hx,hy,m,tx
-     end
-    end
-   end
-   hx+=hdx
-   hy+=hdy
-   hz+=hdz
+  tline_args:set(0, tline_count, 
+    idx, x0, y0, x1, y1, 
+    u0, v0, u1, v1, 
+    w0 or 1, w1 or 1, 
+    flags or 0)
+  tline_count = tline_count + 1
+end
+
+-- Submit tline batch
+function r_batch.tline_submit()
+  if tline_count > 0 then
+    tline3d(tline_args, 0, tline_count, TLINE_COLS)
+    tline_count = 0
+  end
+end
+
+-- Reset rect batch
+function r_batch.rect_reset()
+  rect_count = 0
+end
+
+-- Push a rectfill call to batch
+function r_batch.rect_push(x0, y0, x1, y1, c)
+  if rect_count >= rect_capacity then
+    r_batch.rect_submit()
+  end
+  
+  rect_args:set(0, rect_count, x0, y0, x1, y1, c)
+  rect_count = rect_count + 1
+end
+
+-- Submit rect batch
+function r_batch.rect_submit()
+  if rect_count > 0 then
+    rectfill(rect_args, 0, rect_count, RECT_COLS)
+    rect_count = 0
+  end
+end
+
+-- Set clip region for current pass
+function r_batch.set_clip(x, y, w, h)
+  -- Flush any pending batches before changing state
+  r_batch.tline_submit()
+  r_batch.rect_submit()
+  
+  if x == nil then
+    clip()
+    current_clip = nil
   else
-   -- vertical closer or equal
-   -- crossing a horizontal gridline (y changes): choose the cell we are entering
-   local gx=flr(vx)
-   local gy=flr(vy)+(vdy<0 and -1 or 0)
-   
-   -- irreversible OOB check for vertical candidate
-   if (gx<0 and vdx<0) or (gx>=map_size and vdx>0) or (gy<0 and vdy<0) or (gy>=map_size and vdy>0) then
-    -- if debug_mode then
-    --  diag_dda_steps_total+=dda_steps
-    --  diag_dda_early_outs+=1
-    -- end
-    return 999,vx,vy,0,0
-   end
-   
-   if gx>=0 and gx<map_size and gy>=0 and gy<map_size then
-    local m=get_wall(gx,gy)
-    if m>0 then
-     -- check if door
-     if is_door(m) and doorgrid[gx][gy] then
-     local dz=((vx+vdx/2-x)*fx+(vy+vdy/2-y)*fy)
-      if dz<=hz then
-       local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
-       local dx_off=(vx+vdx/2)%1-open
-       if dx_off>=0 then
-        return dz,vx,vy,m,dx_off
-       end
-      end
-     else
-      -- wall hit
-     -- if debug_mode then
-     --  diag_dda_steps_total+=dda_steps
-     -- end
-     local z=((vx-x)*fx+(vy-y)*fy)
-     -- texture coordinate from x-fraction; flip when rayDirY < 0
-     local frac=vx-flr(vx)
-     local tx=(vdy<0) and (1-frac) or frac
-     return z,vx,vy,m,tx
-     end
-    end
-   end
-   vx+=vdx
-   vy+=vdy
-   vz+=vdz
+    clip(x, y, w, h)
+    current_clip = {x, y, w, h}
   end
- end
- 
- -- fallback if iteration limit reached
--- if debug_mode then
---  diag_dda_steps_total+=dda_steps
---  diag_dda_early_outs+=1
--- end
- return 999,hx,hy,0,0
 end
 
--- raycast entire scene
--- Note: ray arrays (ray_z, ray_x0, ray_x1, ray_dx, ray_dy, rbuf_tile, rbuf_tx)
--- use userdata for 24x performance gain per Picotron optimization guidelines
-function raycast_scene()
- -- compute projection distance from FOV (fov is half-angle in radians)
- -- sdist = screen_center_x / tan(half_fov) ensures proper perspective mapping
- sdist=screen_center_x/math.tan(fov)
- 
- -- classic forward basis: forward = (cos(a), sin(a))
- -- use cached cos/sin from _draw() if available
- local fwdx=(ca_cached or cos(player.a))
- local fwdy=(sa_cached or sin(player.a))
- maxz=0
- 
-  -- precompute per-ray screen spans (decouples ray_count from screen_width)
-  -- only when active_ray_count changes
-  local span_count = active_ray_count or ray_count
-  if _last_span_count ~= span_count then
-    for i=0,span_count-1 do
-      ray_x0:set(i, flr(i*screen_width/span_count))
-      ray_x1:set(i, max(ray_x0:get(i), flr((i+1)*screen_width/span_count)-1))
-      -- precompute pixel center for camera-space offset (eliminates per-frame computation)
-      local pixel_x=(ray_x0:get(i)+ray_x1:get(i))/2+0.5
-      ray_px_center:set(i, pixel_x)
-    end
-    _last_span_count = span_count
-  end
- 
- for i=0,span_count-1 do
-  -- use precomputed pixel center for camera-space offset
-  local dx=ray_px_center:get(i)-screen_center_x
-  local dy=sdist
+-- Set palette for current pass
+function r_batch.set_palette(pal_table)
+  -- Flush any pending batches before changing state
+  r_batch.tline_submit()
+  r_batch.rect_submit()
   
-  -- map camera-space to world-space and cache direction
-  ray_dx:set(i, (-fwdy)*dx+fwdx*dy)
-  ray_dy:set(i, ( fwdx)*dx+fwdy*dy)
-  
-  -- cast ray using cached direction
-  local z,hx,hy,tile,tx=raycast(player.x,player.y,ray_dx:get(i),ray_dy:get(i),fwdx,fwdy)
-  
-  -- store hit data in dedicated per-ray arrays
-  ray_z:set(i, z)
-  rbuf_tile:set(i, tile)
-  rbuf_tx:set(i, tx)
-  ray_hitx:set(i, hx)
-  ray_hity:set(i, hy)
-  
-  maxz=max(maxz,z)
- end
- 
- -- frustum AABB computation removed; sprite culling now uses distance checks
-end
-
--- compute_frustum_aabb removed (distance-based culling is used instead)
-
--- hitscan for projectiles/line-of-sight
-function hitscan(x,y,dx,dy)
- -- normalize and get wall depth
- local sa,ca=normalise(dx,dy)
- local d,hx,hy,tile,tx=raycast(x,y,dx,dy,sa,ca)
- 
- local closest_obj=nil
- local closest_dist=d
- 
- -- iterate all objects; check solid intersections before wall hit
- for ob in all(objects) do
-  if ob and ob.pos and ob.typ and ob.typ.solid then
-   local ox=ob.pos[1]-x
-   local oy=ob.pos[2]-y
-   local dn=ox*ca-oy*sa
-   local dt=ox*sa+oy*ca
-   if abs(dn)<= (ob.typ.w or 0)*0.5 and dt>0 and dt<d then
-    if dt<closest_dist then
-     closest_dist=dt
-     closest_obj=ob
-    end
-   end
-  end
- end
- 
- return closest_obj,closest_dist
-end
-
-:: src/render.lua
- local function clamped_blit(src_row,dst_row)
-  if dst_row>y1 then return end
-  local dst_y=screen_center_y+dst_row
-  if dst_y<0 or dst_y>=screen_height then return end
-  local src_y=screen_center_y+src_row
-  if src_y<0 or src_y>=screen_height then return end
-  blit(get_draw_target(),get_draw_target(),0,src_y,0,dst_y,screen_width,1)
-  diag_floor_rows+=1
-  diag_floor_batches+=1
- end
---[[pod_format="raw",created="2025-11-07 21:17:11",modified="2025-11-07 21:48:08",revision=1]]
--- rendering pipeline
-
--- track warned sprite indices to avoid per-frame spam
-warned_sprites={}
-
--- lazy initialization flag for error texture
-error_texture_initialized=false
-
--- persistent caches for textures and average colors across frames
-tex_cache={}
-avg_color_cache={}
--- Cache size limits to prevent unbounded growth (Picotron optimization guideline)
-local CACHE_CAPACITY = 256  -- Max entries per cache (covers all game sprites + buffer)
-local tex_cache_index = 0   -- Circular buffer write index for tex_cache
-local avg_cache_index = 0   -- Circular buffer write index for avg_color_cache
-local tex_cache_keys = {}   -- Array of tile IDs in insertion order (max 256)
-local avg_cache_keys = {}   -- Array of tile IDs in insertion order (max 256)
-
--- bounded cache insert helpers
-function cache_tex(tile, src, is_fallback)
- if not tile or not src then return end
- if #tex_cache_keys < CACHE_CAPACITY then
-  tex_cache[tile]={src=src,is_fallback=is_fallback}
-  add(tex_cache_keys, tile)
- else
-  local evict_idx = (tex_cache_index % CACHE_CAPACITY) + 1
-  local evict_tile = tex_cache_keys[evict_idx]
-  tex_cache[evict_tile] = nil
-  tex_cache[tile]={src=src,is_fallback=is_fallback}
-  tex_cache_keys[evict_idx] = tile
-  tex_cache_index += 1
- end
-end
-
-function cache_avg(tile, color)
- if tile==nil or color==nil then return end
- if #avg_cache_keys < CACHE_CAPACITY then
-  avg_color_cache[tile]=color
-  add(avg_cache_keys, tile)
- else
-  local evict_idx = (avg_cache_index % CACHE_CAPACITY) + 1
-  local evict_tile = avg_cache_keys[evict_idx]
-  avg_color_cache[evict_tile] = nil
-  avg_color_cache[tile]=color
-  avg_cache_keys[evict_idx] = tile
-  avg_cache_index += 1
- end
-end
-
--- clear caches when tiles/floor/ceiling change (e.g., on new floor)
-function clear_texture_caches()
- -- Log cache statistics before clearing (useful for tuning CACHE_CAPACITY)
- if enable_diagnostics_logging then
-  printh("tex_cache size: "..#tex_cache_keys.." / "..CACHE_CAPACITY)
-  printh("avg_color_cache size: "..#avg_cache_keys.." / "..CACHE_CAPACITY)
- end
- tex_cache={}
- avg_color_cache={}
- warned_sprites={}
- 
- -- Reset circular buffer tracking
- tex_cache_keys={}
- avg_cache_keys={}
- tex_cache_index=0
- avg_cache_index=0
-end
-
--- initialize error texture on first access (defensive fallback)
-function init_error_texture()
- if not error_texture_initialized and not error_texture then
-  -- create default error texture if none exists
-  error_texture = userdata("u8", 32, 32)
-  for y=0,31 do
-   for x=0,31 do
-    local color = ((flr(x/4) + flr(y/4)) % 2 == 0) and 8 or 14
-    error_texture:set(x, y, color)
-   end
-  end
-  error_texture_initialized=true
- end
-end
-
--- get appropriate error texture for object type
-function get_error_texture(obj_type)
- if error_textures then
-  return error_textures[obj_type] or error_textures.default
- end
- init_error_texture()
- return error_texture
-end
-
--- get individual sprite userdata for tline3d by sprite index
-function get_texture_source(sprite_index, obj_type)
- -- default to sprite 0 for backward compatibility
- sprite_index=sprite_index or 0
- obj_type=obj_type or "default"
- 
- -- return sprite sheet userdata
- local src=get_spr(sprite_index)
- if not src then
-  -- warn once per sprite index to avoid per-frame spam
-  if not warned_sprites[sprite_index] then
-   printh("warning: sprite "..sprite_index.." not found, using "..obj_type.." error texture")
-   warned_sprites[sprite_index]=true
-  end
-  -- return appropriate error texture for object type
-  return get_error_texture(obj_type),true
- end
- return src,false
-end
-
-
-
--- =========================
--- Batched tline3d utilities
--- =========================
--- Each row: sprite_index, x0,y0,x1,y1, u0,v0,u1,v1, w0,w1, flags  (13 columns)
-local TLINE_COLS=13
-local tline_buf_capacity=screen_width*2
-local tline_args=userdata("f64", TLINE_COLS, tline_buf_capacity)
-local tline_count=0
-
-local function batch_reset()
-	tline_count=0
-end
-
-local function batch_push(idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1,flags)
-	if tline_count>=tline_buf_capacity then
-		tline3d(tline_args, 0, tline_count, TLINE_COLS)
-		tline_count=0
-	end
-	tline_args:set(0, tline_count, idx, x0, y0, x1, y1, u0, v0, u1, v1, w0 or 1, w1 or 1, flags or 0)
-	tline_count+=1
-end
-
-local function batch_submit()
-	if tline_count>0 then
-		tline3d(tline_args, 0, tline_count, TLINE_COLS)
-		tline_count=0
-	end
-end
-
--- =========================
--- Batched rectfill utility
--- =========================
--- Each row: x0,y0,x1,y1,c (5 columns)
-local RECT_COLS=5
-local rect_buf_capacity=screen_width*4
-local rect_args=userdata("f64", RECT_COLS, rect_buf_capacity)
-local rect_count=0
-function rbatch_reset() rect_count=0 end
-function rbatch_push(x0,y0,x1,y1,c)
-	if rect_count>=rect_buf_capacity then
-		rectfill(rect_args, 0, rect_count, RECT_COLS)
-		rect_count=0
-	end
-	rect_args:set(0, rect_count, x0, y0, x1, y1, c)
-	rect_count+=1
-end
-function rbatch_submit()
-	if rect_count>0 then
-		rectfill(rect_args, 0, rect_count, RECT_COLS)
-		rect_count=0
-	end
-end
-
-local function resolve_sprite_index(idx, kind)
-	if idx and get_spr(idx) then
-		return idx
-	end
-	if ERROR_IDX then
-		if kind=="floor" then return ERROR_IDX.floor
-		elseif kind=="ceiling" then return ERROR_IDX.ceiling
-		elseif kind=="sprite" then return ERROR_IDX.sprite
-		elseif kind=="door" then return ERROR_IDX.door
-		else return ERROR_IDX.wall end
-	end
-	return 0
-end
-
--- preallocated buffers for per-cell floor runs (avoid per-frame table allocations)
-local RUN_CAP=1024
-local runs_x0=userdata("i16", RUN_CAP)
-local runs_x1=userdata("i16", RUN_CAP)
-local runs_id=userdata("i16", RUN_CAP)
-local merged_x0=userdata("i16", RUN_CAP)
-local merged_x1=userdata("i16", RUN_CAP)
-local merged_id=userdata("i16", RUN_CAP)
-
--- Precomputed wall y-ranges for merged rendering (avoid per-scanline recalculation)
--- render perspective floor/ceiling and walls (flat shading, fog removed)
-function render_floor_ceiling()
- palt(0,false)
- 
- local fwdx=(ca_cached or cos(player.a))
- local fwdy=(sa_cached or sin(player.a))
- local tex_size=sprite_size or 32
- local _rc = active_ray_count or ray_count
- 
- -- Draw ceiling and floor first so walls overlay them
- batch_reset()
- local roof_typ=roof.typ
- local roof_src,roof_fallback=get_texture_source(roof_typ.tex,"ceiling")
- if roof_fallback then roof_src=get_error_texture("ceiling") end
- draw_rows(roof_src,-screen_center_y,-1,roof_typ.scale,roof_typ.height,cam[1]-roof.x,cam[2]-roof.y,roof_typ.lit,fwdy,fwdx,roof_typ.tex,false)
- 
- local floor_typ=floor.typ
- local floor_src,floor_fallback=get_texture_source(floor_typ.tex,"floor")
- if floor_fallback then floor_src=get_error_texture("floor") end
- draw_rows(floor_src,0,screen_center_y-1,floor_typ.scale,floor_typ.height,cam[1]-floor.x,cam[2]-floor.y,floor_typ.lit,fwdy,fwdx,floor_typ.tex,false)
- batch_submit()
-
- -- Render walls per-ray in a single vertical pass (drawn after floors)
- rbatch_reset()
- batch_reset()
- local span_start=nil
- local span_tile=nil
- local span_spr=nil
- local span_avg=nil
- local span_tx0=nil
- local span_tx1=nil
- local span_hitx0=nil
- local span_hity0=nil
- local span_hitx1=nil
- local span_hity1=nil
- local function flush_span(span_end)
-  if not span_start then return end
-  local x0=ray_x0:get(span_start)
-  local x1=ray_x1:get(span_end)
-  if x0>x1 then span_start=nil return end
-  local spr_idx=span_spr
-  local avg_color=span_avg
-  local hx0=span_hitx0
-  local hy0=span_hity0
-  local hx1=span_hitx1
-  local hy1=span_hity1
-  local tx0=span_tx0
-  local tx1=span_tx1
-  local span_width=x1-x0
-  local base_z=nil
-  local base_tdy0=nil
-  local base_tdy1=nil
-  local first_wall=false
-  if span_width<=0 then
-   span_width=0
-   local rel_x=hx0-player.x
-   local rel_y=hy0-player.y
-   base_z=rel_x*fwdx+rel_y*fwdy
-   if base_z<=0.0001 then base_z=0.0001 end
-   local h=sdist/base_z
-   local y0=screen_center_y-h/2
-   local y1=screen_center_y+h/2
-   base_tdy0=ceil(y0)
-   base_tdy1=min(flr(y1),screen_height-1)
-   if base_tdy0<=base_tdy1 then
-    local wall_height=base_tdy1-base_tdy0
-    if base_z>wall_lod_distance or wall_height<wall_tiny_screen_px then
-     rbatch_push(x0, base_tdy0, x1, base_tdy1, avg_color)
-     diag_wall_lod_columns+=x1-x0+1
-    else
-     local u0=tx0*tex_size
-     local v0=0
-     local full_h=y1-y0
-     if full_h>0 and base_tdy0<y1 then
-      v0=((base_tdy0-y0)/full_h)*tex_size
-     end
-     local w0=1/base_z
-     batch_push(spr_idx,x0,base_tdy0,x1,base_tdy1,u0,v0,u0,v0+tex_size,w0,w0,0)
-     diag_wall_columns+=x1-x0+1
-    end
-    if zwrite then zwrite(x0,base_z) else zbuf:set(x0,base_z) end
-   end
-   span_start=nil
-   return
-  end
-  local rel_x0=hx0-player.x
-  local rel_y0=hy0-player.y
-  local z0=rel_x0*fwdx+rel_y0*fwdy
-  if z0<=0.0001 then z0=0.0001 end
-  local h0=sdist/z0
-  local base_y0=screen_center_y-h0/2
-  local base_y1=screen_center_y+h0/2
-  local tdy0=ceil(base_y0)
-  local tdy1=min(flr(base_y1),screen_height-1)
-  if tdy0>tdy1 then
-   span_start=nil
-   return
-  end
-  local rel_x1=hx1-player.x
-  local rel_y1=hy1-player.y
-  local z1=rel_x1*fwdx+rel_y1*fwdy
-  if z1<=0.0001 then z1=0.0001 end
-  local h1=sdist/z1
-  local y1_top=screen_center_y-h1/2
-  local y1_bot=screen_center_y+h1/2
-  local tdy1_alt=ceil(y1_top)
-  local tdy1_bot=min(flr(y1_bot),screen_height-1)
-  tdy0=min(tdy0,tdy1_alt)
-  tdy1=max(tdy1,tdy1_bot)
-  tdy0=max(tdy0,0)
-  tdy1=min(tdy1,screen_height-1)
-  if tdy0>tdy1 then
-   span_start=nil
-   return
-  end
-  local wall_height=tdy1-tdy0
-  local column_count=x1-x0+1
-  if z0>wall_lod_distance and z1>wall_lod_distance then
-   rbatch_push(x0, tdy0, x1, tdy1, avg_color)
-   diag_wall_lod_columns+=column_count
+  if pal_table == nil then
+    pal()
+    current_palette = nil
   else
-   local u0=tx0*tex_size
-   local u1=tx1*tex_size
-   local v0=((tdy0-base_y0)/(base_y1-base_y0))*tex_size
-   if base_y1-base_y0<=0 then v0=0 end
-   if v0<0 then v0=0 elseif v0>tex_size then v0=tex_size end
-   local v1=v0+tex_size
-   batch_push(spr_idx, x0, tdy0, x1, tdy1, u0, v0, u1, v1, 1/z0, 1/z1, 0)
-   diag_wall_columns+=column_count
+    pal(pal_table)
+    current_palette = pal_table
   end
-  for col=x0,x1 do
-   local t=(span_width>0) and ((col-x0)/span_width) or 0
-   local world_x=hx0+(hx1-hx0)*t
-   local world_y=hy0+(hy1-hy0)*t
-   local rel_x=world_x-player.x
-   local rel_y=world_y-player.y
-   local z=rel_x*fwdx+rel_y*fwdy
-   if z<=0.0001 then z=0.0001 end
-   if zwrite then zwrite(col,z) else zbuf:set(col,z) end
-  end
-  span_start=nil
- end
- for ray_idx=0,_rc-1 do
-  local tile=rbuf_tile:get(ray_idx)
-  if tile and tile>0 then
-   if span_start and tile==span_tile then
-    span_tx1=rbuf_tx:get(ray_idx)
-    span_hitx1=ray_hitx:get(ray_idx)
-    span_hity1=ray_hity:get(ray_idx)
-   else
-    if span_start then flush_span(ray_idx-1) end
-    span_start=ray_idx
-    span_tile=tile
-    span_spr=resolve_sprite_index(tile,(is_door and is_door(tile)) and "door" or "wall")
-    local avg=avg_color_cache[tile]
-    if not avg then
-     local cached=tex_cache[tile]
-     local src,is_fallback
-     if cached then
-      src,is_fallback=cached.src,cached.is_fallback
-     else
-      local obj_type=is_door and is_door(tile) and "door" or "wall"
-      src,is_fallback=get_texture_source(tile,obj_type)
-      cache_tex(tile, src, is_fallback)
-     end
-     avg=5
-     if src and src.get then
-      avg=src:get(16,16) or 5
-     end
-     cache_avg(tile, avg)
-    end
-    span_avg=avg
-    span_tx0=rbuf_tx:get(ray_idx)
-    span_tx1=span_tx0
-    span_hitx0=ray_hitx:get(ray_idx)
-    span_hity0=ray_hity:get(ray_idx)
-    span_hitx1=span_hitx0
-    span_hity1=span_hity0
-   end
-  else
-   if span_start then flush_span(ray_idx-1) end
-  end
- end
- if span_start then flush_span(_rc-1) end
- batch_submit()
- 
- palt()
 end
 
--- draw horizontal scanlines with 32x32 sprite sampling and optional wall rendering (flat shading)
-function draw_rows(src,y0,y1,tilesize,height,cx,cy,lit,sa,ca,tex,render_walls)
- local size=sprite_size or 32
- local function draw_single_row(row)
-  diag_floor_rows+=1
-  local y=row
-  local y_offset=y>=0 and (y+0.5) or abs(y-0.5)
-  local g=y_offset/sdist
-  if g<0.0001 then g=0.0001 end
-  local z=(height or 0.5)/g
-  local mx=(cx+z*sa)/tilesize
-  local my=(cy+z*ca)/tilesize
-  local s=sdist/z*tilesize
-  local mdx=-ca/s
-  local mdy=sa/s
-  mx-=screen_center_x*mdx
-  my-=screen_center_x*mdy
-  if per_cell_floors_enabled then
-   local sample_interval=12
-   local rcount=0
-   local cur_id=-1
-   local cur_x0=0
-   for x=0,screen_width-1,sample_interval do
-    local wx=mx+x*mdx
-    local wy=my+x*mdy
-    local gx=flr(wx)
-    local gy=flr(wy)
-    local fid=get_floor(gx,gy)
-    if cur_id<0 then
-     cur_id=fid
-     cur_x0=x
-    elseif fid~=cur_id then
-     if rcount<RUN_CAP then
-      runs_x0:set(rcount, cur_x0)
-      runs_x1:set(rcount, x-1)
-      runs_id:set(rcount, cur_id)
-      rcount+=1
-     end
-     cur_id=fid
-     cur_x0=x
-    end
-   end
-   if rcount<RUN_CAP then
-    runs_x0:set(rcount, cur_x0)
-    runs_x1:set(rcount, screen_width-1)
-    runs_id:set(rcount, cur_id)
-    rcount+=1
-   end
-   local mcount=0
-   for i=0,rcount-1 do
-    local x0i=runs_x0:get(i)
-    local x1i=runs_x1:get(i)
-    local fidi=runs_id:get(i)
-    local width=x1i-x0i+1
-    if width<4 and mcount>0 then
-     local prev_x1=merged_x1:get(mcount-1)
-     if x1i>prev_x1 then merged_x1:set(mcount-1, x1i) end
-    else
-     if mcount<RUN_CAP then
-      merged_x0:set(mcount, x0i)
-      merged_x1:set(mcount, x1i)
-      merged_id:set(mcount, fidi)
-      mcount+=1
-     end
-    end
-   end
-   for i=0,mcount-1 do
-    local rx0=merged_x0:get(i)
-    local rx1=merged_x1:get(i)
-    local fid=merged_id:get(i)
-    local run_tex=tex
-    if fid>0 and fid<=#planetyps then
-     run_tex=planetyps[fid].tex
-    end
-    local idx=resolve_sprite_index(run_tex,"floor")
-    local u0=(mx+rx0*mdx)%1*size
-    local v0=(my+rx0*mdy)%1*size
-    u0=max(0,min(size-0.001,u0))
-    v0=max(0,min(size-0.001,v0))
-    local u1=u0+(rx1-rx0)*mdx*size
-    local v1=v0+(rx1-rx0)*mdy*size
-    batch_push(idx, rx0, screen_center_y+y, rx1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
-    diag_floor_batches+=1
-   end
-  else
-   local idx=resolve_sprite_index(tex,"floor")
-   local u0=(mx)%1*size
-   local v0=(my)%1*size
-   u0=max(0,min(size-0.001,u0))
-   v0=max(0,min(size-0.001,v0))
-   local u1=u0+(screen_width-1)*mdx*size
-   local v1=v0+(screen_width-1)*mdy*size
-   batch_push(idx, 0, screen_center_y+y, screen_width-1, screen_center_y+y, u0, v0, u1, v1, 1, 1)
-   diag_floor_batches+=1
-  end
- end
- local function duplicate_rows(src_row, count)
-  if count<=0 then return end
-  local y0=screen_center_y+src_row+1
-  local y1=y0+count-1
-  if y0>screen_center_y+y1 then return end
-  y1=min(y1,screen_center_y+y1)
-  if y0>screen_height-1 then return end
- end
- local function blit_rows(src_row,rep_count)
-  if rep_count<=0 then return end
-  for k=1,rep_count do
-   local row=src_row+k
-  if row>y1 then break end
-   diag_floor_rows+=1
-   diag_floor_batches+=1
-   blit(get_draw_target(),get_draw_target(),0,screen_center_y+src_row,0,screen_center_y+row,screen_width,1)
-  end
- end
- local near_end = min(y1, -16)
- local mid_end = min(y1, 32)
- for y=y0, near_end do
-  draw_single_row(y)
- end
- local y=near_end+1
- while y<=mid_end do
-  draw_single_row(y)
- clamped_blit(y,y+1)
-  y+=2
- end
- while y<=y1 do
-  draw_single_row(y)
- clamped_blit(y,y+1)
- clamped_blit(y,y+2)
- clamped_blit(y,y+3)
-  y+=4
- end
+-- Restore default state (called at pass boundaries)
+function r_batch.restore_defaults()
+  r_batch.tline_submit()
+  r_batch.rect_submit()
+  clip()
+  pal()
+  palt()
+  current_clip = nil
+  current_palette = nil
 end
 
+return r_batch
 
-:: src/render_sprite.lua
---[[pod_format="raw",created="2025-11-07 21:17:10",modified="2025-11-07 21:48:08",revision=1]]
--- sprite rendering pipeline
 
--- global sprite tline batch (12 cols: idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1)
-local SPR_TLINE_COLS=12
-local spr_tline_capacity=screen_width*2
-local spr_tline_args=userdata("f64", SPR_TLINE_COLS, spr_tline_capacity)
-local spr_tline_count=0
-local function sbatch_reset() spr_tline_count=0 end
-local function sbatch_push(idx,x0,y0,x1,y1,u0,v0,u1,v1,w0,w1)
- if spr_tline_count>=spr_tline_capacity then
-  tline3d(spr_tline_args, 0, spr_tline_count, SPR_TLINE_COLS)
-  spr_tline_count=0
- end
- spr_tline_args:set(0, spr_tline_count, idx, x0, y0, x1, y1, u0, v0, u1, v1, w0 or 1, w1 or 1)
- spr_tline_count+=1
-end
-local function sbatch_submit()
- if spr_tline_count>0 then
-  tline3d(spr_tline_args, 0, spr_tline_count, SPR_TLINE_COLS)
-  spr_tline_count=0
- end
+:: src/r_cast.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_cast.lua
+-- DDA raycaster writing hit data to userdata buffers
+
+local r_cast = {}
+
+-- Sign helper
+local function sgn(n)
+  if n < 0 then return -1 end
+  if n > 0 then return 1 end
+  return 0
 end
 
--- persistent depth buckets (0..15) reused each frame
-sprite_buckets=sprite_buckets or {}
-for i=0,7 do sprite_buckets[i]=sprite_buckets[i] or {} end
-local function clear_buckets()
- for i=0,7 do
-  local b=sprite_buckets[i]
-  for j=#b,1,-1 do b[j]=nil end
- end
-end
-
--- render sprites with z-buffer occlusion (flat array iteration with distance culling)
-function render_sprites()
- -- use cached sin/cos from _draw() if available
- local sa,ca=sa_cached or sin(player.a),ca_cached or cos(player.a)
- 
- -- frustum bounds check removed (distance-based culling in use)
- 
- -- initialize depth buckets for sprite sorting
--- 8 total buckets: 0-7 for all sprites (upright and flat treated uniformly)
--- bucket size = far_plane / 8 (e.g., 25.0 / 8 = 3.125 units per bucket)
--- iterate all objects with distance culling (no spatial grid)
-local bucket_size = far_plane / 8
- clear_buckets()
- 
- -- iterate all objects with simple distance culling (no spatial grid)
- for ob in all(objects) do
-  if ob and ob.pos and ob.typ then
-   -- transform to view space
-   local rx=ob.pos[1]-player.x
-   local ry=ob.pos[2]-player.y
-   
-   -- simple distance culling using axis-aligned bound
-   if abs(rx)>=far_plane or abs(ry)>=far_plane then
-    goto skip_sprite
-   end
-   
-   -- rotate to view-aligned coordinates (camera space)
-   -- right = (-sin a, cos a), forward = (cos a, sin a)
-   local x_cam = -sa*rx + ca*ry
-   local z_cam =  ca*rx + sa*ry
-   ob.rel[1]=x_cam
-   ob.rel[2]=z_cam
-   
-   -- far-plane culling: skip sprites beyond far_plane
-   if ob.rel[2]>far_plane then
-    goto skip_sprite
-   end
-   
-   -- depth culling: skip sprites beyond max wall depth
-   if ob.rel[2]>=maxz then
-    goto skip_sprite
-   end
-   
-   -- cull behind camera and outside frustum
-   local t=ob.typ
-   local pass_frustum=false
-   if ob.rel[2]>0.1 then
-    if t.flat then
-     -- flat sprites: require minimum distance to prevent z-division issues
-     if ob.rel[2]>=t.w/2 then
-      pass_frustum=true
-     end
-    else
-     -- upright sprites: horizontal frustum culling
-     if abs(ob.rel[1])-(t.w/2)<ob.rel[2]*(screen_center_x/sdist) then
-      pass_frustum=true
-     end
+-- DDA raycast with depth tracking
+-- Returns: z, hit_x, hit_y, tile, tx
+local function raycast_dda(x, y, dx, dy, fx, fy, far_plane, map_size, get_wall_fn, is_door_fn, doorgrid, test_door_mode, test_door_open)
+  -- Clamp near-zero components
+  if abs(dx) < 0.01 then dx = 0.01 end
+  if abs(dy) < 0.01 then dy = 0.01 end
+  
+  -- Horizontal ray initialization
+  local hx, hy, hdx, hdy = x, y, sgn(dx), dy / abs(dx)
+  local hdz = hdx * fx + hdy * fy
+  local hz = 0
+  
+  -- Step to grid boundary
+  local fracx = hx % 1
+  local hstep = (hdx > 0) and (1 - fracx) or fracx
+  hx = hx + hdx * hstep
+  hy = hy + hdy * hstep
+  hz = hz + hdz * hstep
+  
+  -- Vertical ray initialization
+  local vx, vy, vdx, vdy = x, y, dx / abs(dy), sgn(dy)
+  local vdz = vdx * fx + vdy * fy
+  local vz = 0
+  
+  -- Step to grid boundary
+  local fracy = vy % 1
+  local vstep = (vdy > 0) and (1 - fracy) or fracy
+  vx = vx + vdx * vstep
+  vy = vy + vdy * vstep
+  vz = vz + vdz * vstep
+  
+  -- Compute iteration limit
+  local horizontal_crossings = (hdx > 0) and (map_size - math.floor(hx)) or (math.floor(hx) + 1)
+  local vertical_crossings = (vdy > 0) and (map_size - math.floor(vy)) or (math.floor(vy) + 1)
+  local iteration_limit = min(256, horizontal_crossings + vertical_crossings + 10)
+  
+  -- Ray marching
+  for iter = 1, iteration_limit do
+    -- Far-plane check
+    if min(hz, vz) > far_plane then
+      return 999, hx, hy, 0, 0
     end
-   end
-   
-   if pass_frustum then
-    -- compute bucket index based on depth
-    -- bucket 0 = 0.0-6.25, bucket 1 = 6.25-12.5, ..., bucket 7 = 43.75-50.0+
-    local bucket_idx = min(7, flr(ob.rel[2] / bucket_size))
     
-    -- add to bucket
-    add(sprite_buckets[bucket_idx], ob)
-   end
-   
-   ::skip_sprite::
-  end
- end
- 
- -- draw sprites back-to-front using bucket iteration
--- bucket 7-0: farthest to nearest (bucket 7 = all sprites at far distance)
- palt(0,false)
- palt(14,true)
- 
-for bucket_idx=7,0,-1 do
-  -- sort non-empty bucket by z descending (far to near) for correct sprite-sprite occlusion
-  local bucket = sprite_buckets[bucket_idx]
- if #bucket > 4 then
-   -- insertion sort by ob.rel[2] descending
-   for i=2,#bucket do
-    local ob = bucket[i]
-    local z = ob.rel[2]
-    local j = i - 1
-    while j >= 1 and bucket[j].rel[2] < z do
-     bucket[j+1] = bucket[j]
-     j = j - 1
+    if hz < vz then
+      -- Horizontal crossing (vertical gridline)
+      local gx = math.floor(hx) + ((hdx < 0) and -1 or 0)
+      local gy = math.floor(hy)
+      
+      -- OOB check
+      if (gx < 0 and hdx < 0) or (gx >= map_size and hdx > 0) or 
+         (gy < 0 and hdy < 0) or (gy >= map_size and hdy > 0) then
+        return 999, hx, hy, 0, 0
+      end
+      
+      if gx >= 0 and gx < map_size and gy >= 0 and gy < map_size then
+        local m = get_wall_fn(gx, gy)
+        if m > 0 then
+          -- Check if door
+          if is_door_fn(m) and doorgrid[gx] and doorgrid[gx][gy] then
+            local dz = ((hx + hdx / 2 - x) * fx + (hy + hdy / 2 - y) * fy)
+            if dz <= vz then
+              local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
+              local dy_off = (hy + hdy / 2) % 1 - open
+              if dy_off >= 0 then
+                return dz, hx, hy, m, dy_off
+              end
+            end
+          else
+            -- Wall hit
+            local z = ((hx - x) * fx + (hy - y) * fy)
+            local frac = hy - math.floor(hy)
+            local tx = (hdx > 0) and (1 - frac) or frac
+            return z, hx, hy, m, tx
+          end
+        end
+      end
+      
+      hx = hx + hdx
+      hy = hy + hdy
+      hz = hz + hdz
+    else
+      -- Vertical crossing (horizontal gridline)
+      local gx = math.floor(vx)
+      local gy = math.floor(vy) + ((vdy < 0) and -1 or 0)
+      
+      -- OOB check
+      if (gx < 0 and vdx < 0) or (gx >= map_size and vdx > 0) or 
+         (gy < 0 and vdy < 0) or (gy >= map_size and vdy > 0) then
+        return 999, vx, vy, 0, 0
+      end
+      
+      if gx >= 0 and gx < map_size and gy >= 0 and gy < map_size then
+        local m = get_wall_fn(gx, gy)
+        if m > 0 then
+          -- Check if door
+          if is_door_fn(m) and doorgrid[gx] and doorgrid[gx][gy] then
+            local dz = ((vx + vdx / 2 - x) * fx + (vy + vdy / 2 - y) * fy)
+            if dz <= hz then
+              local open = test_door_mode and (test_door_open or 0) or doorgrid[gx][gy].open
+              local dx_off = (vx + vdx / 2) % 1 - open
+              if dx_off >= 0 then
+                return dz, vx, vy, m, dx_off
+              end
+            end
+          else
+            -- Wall hit
+            local z = ((vx - x) * fx + (vy - y) * fy)
+            local frac = vx - math.floor(vx)
+            local tx = (vdy < 0) and (1 - frac) or frac
+            return z, vx, vy, m, tx
+          end
+        end
+      end
+      
+      vx = vx + vdx
+      vy = vy + vdy
+      vz = vz + vdz
     end
-    bucket[j+1] = ob
-   end
   end
   
-  for ob in all(bucket) do
-   drawobj_single(ob, sa, ca)
-  end
- end
- 
- palt()
- clip()
+  -- Fallback
+  return 999, hx, hy, 0, 0
 end
 
--- draw single sprite object with z-buffer occlusion (color 0=opaque, color 14=transparent)
-function drawobj_single(ob, sa, ca)
- if not ob or not ob.typ or not ob.rel then
-  return
- end
+-- Cast scene: populate ray hit buffers
+-- camera: {x, y} position table
+-- r_view: view module with forward/right vectors
+-- r_state: renderer state with buffers
+-- game_state: {get_wall, is_door, doorgrid, test_door_mode, test_door_open, far_plane, map_size}
+function r_cast.cast_scene(camera, r_view, r_state, game_state)
+  local bufs = r_state.buffers
+  local ray_cnt = r_state.occupancy.rays_active
+  local fx, fy = r_view.forward_x, r_view.forward_y
   
-  local t=ob.typ
-  local x=ob.rel[1]
-  local z=ob.rel[2]
+  for i = 0, ray_cnt - 1 do
+    local dx = bufs.ray_dir_x:get(i)
+    local dy = bufs.ray_dir_y:get(i)
+    
+    local z, hx, hy, tile, tx = raycast_dda(
+      camera.x, camera.y, dx, dy, fx, fy,
+      game_state.far_plane, game_state.map_size,
+      game_state.get_wall, game_state.is_door,
+      game_state.doorgrid, game_state.test_door_mode, game_state.test_door_open
+    )
+    
+    bufs.ray_z:set(i, z)
+    bufs.ray_hitx:set(i, hx)
+    bufs.ray_hity:set(i, hy)
+    bufs.ray_tile:set(i, tile)
+    bufs.ray_tx:set(i, tx)
+  end
+end
+
+return r_cast
+
+
+:: src/r_diag.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_diag.lua
+-- Diagnostics overlay gated by debug_mode
+
+local r_diag = {}
+
+-- Draw diagnostics panel
+-- r_state: renderer state with occupancy counters
+-- frame_ms: frame time in milliseconds
+-- cpu_sample: CPU usage from stat(1)
+function r_diag.draw(r_state, frame_ms, cpu_sample)
+  if not r_state.config.debug_mode then
+    return
+  end
   
-  -- fetch sprite for this object
+  local cfg = r_state.config
+  local occ = r_state.occupancy
+  
+  -- Format metrics
+  frame_ms = frame_ms or 0
+  cpu_sample = cpu_sample or 0
+  local cpu_pct = math.floor(cpu_sample * 1000 + 0.5) / 10
+  local frame_ms_fmt = math.floor(frame_ms * 10 + 0.5) / 10
+  local rays_text = occ.rays_active .. "/" .. cfg.ray_count
+  
+  local lines = {
+    {text = "r_diag: metrics", color = 11},
+    {text = "frame_ms: " .. frame_ms_fmt, color = 11},
+    {text = "cpu%: " .. cpu_pct, color = (cpu_pct > 90) and 8 or ((cpu_pct > 70) and 10 or 11)},
+    {text = "rays: " .. rays_text, color = 7},
+    {text = "floor rows: " .. occ.floor_rows, color = 7},
+    {text = "wall spans: " .. occ.wall_spans, color = 7},
+    {text = "sprite count: " .. occ.sprite_count, color = 7}
+  }
+  
+  -- Compute panel dimensions
+  local max_len = 0
+  for entry in all(lines) do
+    if #entry.text > max_len then
+      max_len = #entry.text
+    end
+  end
+  
+  local panel_x = 4
+  local panel_y = 80
+  local panel_w = max_len * 4 + 6
+  local panel_h = #lines * 8 + 6
+  
+  -- Save clip/palette state
+  local prev_clip = peek(0x5f20, 4)
+  
+  -- Draw panel background and border
+  clip()
+  rectfill(panel_x - 2, panel_y - 2, panel_x + panel_w, panel_y + panel_h, 1)
+  rect(panel_x - 3, panel_y - 3, panel_x + panel_w + 1, panel_y + panel_h + 1, 7)
+  
+  -- Draw text
+  for i = 1, #lines do
+    local entry = lines[i]
+    print(entry.text, panel_x, panel_y + (i - 1) * 8, entry.color)
+  end
+  
+  -- Restore clip state
+  clip()
+end
+
+return r_diag
+
+
+:: src/r_floor.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_floor.lua
+-- Hybrid floor/ceiling renderer with near/mid/far row scheduling
+
+local r_floor = {}
+
+-- Preallocated buffers for per-cell floor runs (avoid per-frame allocations)
+local RUN_CAP = 1024
+local runs_x0 = userdata("i16", RUN_CAP)
+local runs_x1 = userdata("i16", RUN_CAP)
+local runs_id = userdata("i16", RUN_CAP)
+local merged_x0 = userdata("i16", RUN_CAP)
+local merged_x1 = userdata("i16", RUN_CAP)
+local merged_id = userdata("i16", RUN_CAP)
+
+-- Clamped blit helper
+local function clamped_blit(src_row, dst_row, screen_center_y, screen_height, y1_limit, r_state)
+  if dst_row > y1_limit then return end
+  local dst_y = screen_center_y + dst_row
+  if dst_y < 0 or dst_y >= screen_height then return end
+  local src_y = screen_center_y + src_row
+  if src_y < 0 or src_y >= screen_height then return end
+  blit(get_draw_target(), get_draw_target(), 0, src_y, 0, dst_y, screen_width, 1)
+  r_state.occupancy.floor_rows = r_state.occupancy.floor_rows + 1
+end
+
+-- Resolve sprite index with fallback
+local function resolve_sprite_index(idx, kind, error_idx_table, get_spr_fn)
+  if idx and get_spr_fn(idx) then
+    return idx
+  end
+  if error_idx_table then
+    if kind == "floor" then return error_idx_table.floor
+    elseif kind == "ceiling" then return error_idx_table.ceiling
+    else return error_idx_table.default end
+  end
+  return 0
+end
+
+-- Draw single row with optional per-cell floor sampling
+local function draw_single_row(row, src, tex, tilesize, height, cx, cy, sa, ca, sdist, screen_center_y, screen_width, sprite_size, r_batch, r_state, per_cell_floors, get_floor_fn, planetyps, error_idx_table, get_spr_fn)
+  local y = row
+  local y_offset = (y >= 0) and (y + 0.5) or abs(y - 0.5)
+  local g = y_offset / sdist
+  if g < 0.0001 then g = 0.0001 end
+  local z = (height or 0.5) / g
+  local mx = (cx + z * sa) / tilesize
+  local my = (cy + z * ca) / tilesize
+  local s = sdist / z * tilesize
+  local mdx = -ca / s
+  local mdy = sa / s
+  mx = mx - screen_center_x * mdx
+  my = my - screen_center_x * mdy
+  
+  if per_cell_floors then
+    -- Per-cell floor sampling
+    local sample_interval = 12
+    local rcount = 0
+    local cur_id = -1
+    local cur_x0 = 0
+    
+    for x = 0, screen_width - 1, sample_interval do
+      local wx = mx + x * mdx
+      local wy = my + x * mdy
+      local gx = math.floor(wx)
+      local gy = math.floor(wy)
+      local fid = get_floor_fn(gx, gy)
+      
+      if cur_id < 0 then
+        cur_id = fid
+        cur_x0 = x
+      elseif fid ~= cur_id then
+        if rcount < RUN_CAP then
+          runs_x0:set(rcount, cur_x0)
+          runs_x1:set(rcount, x - 1)
+          runs_id:set(rcount, cur_id)
+          rcount = rcount + 1
+        end
+        cur_id = fid
+        cur_x0 = x
+      end
+    end
+    
+    if rcount < RUN_CAP then
+      runs_x0:set(rcount, cur_x0)
+      runs_x1:set(rcount, screen_width - 1)
+      runs_id:set(rcount, cur_id)
+      rcount = rcount + 1
+    end
+    
+    -- Merge tiny runs
+    local mcount = 0
+    for i = 0, rcount - 1 do
+      local x0i = runs_x0:get(i)
+      local x1i = runs_x1:get(i)
+      local fidi = runs_id:get(i)
+      local width = x1i - x0i + 1
+      if width < 4 and mcount > 0 then
+        local prev_x1 = merged_x1:get(mcount - 1)
+        if x1i > prev_x1 then merged_x1:set(mcount - 1, x1i) end
+      else
+        if mcount < RUN_CAP then
+          merged_x0:set(mcount, x0i)
+          merged_x1:set(mcount, x1i)
+          merged_id:set(mcount, fidi)
+          mcount = mcount + 1
+        end
+      end
+    end
+    
+    -- Draw merged runs
+    for i = 0, mcount - 1 do
+      local rx0 = merged_x0:get(i)
+      local rx1 = merged_x1:get(i)
+      local fid = merged_id:get(i)
+      local run_tex = tex
+      if fid > 0 and fid <= #planetyps then
+        run_tex = planetyps[fid].tex
+      end
+      local idx = resolve_sprite_index(run_tex, "floor", error_idx_table, get_spr_fn)
+      local u0 = ((mx + rx0 * mdx) % 1) * sprite_size
+      local v0 = ((my + rx0 * mdy) % 1) * sprite_size
+      u0 = math.max(0, math.min(sprite_size - 0.001, u0))
+      v0 = math.max(0, math.min(sprite_size - 0.001, v0))
+      local u1 = u0 + (rx1 - rx0) * mdx * sprite_size
+      local v1 = v0 + (rx1 - rx0) * mdy * sprite_size
+      r_batch.tline_push(idx, rx0, screen_center_y + y, rx1, screen_center_y + y, u0, v0, u1, v1, 1, 1)
+    end
+  else
+    -- Single texture for entire row
+    local idx = resolve_sprite_index(tex, "floor", error_idx_table, get_spr_fn)
+    local u0 = (mx % 1) * sprite_size
+    local v0 = (my % 1) * sprite_size
+    u0 = math.max(0, math.min(sprite_size - 0.001, u0))
+    v0 = math.max(0, math.min(sprite_size - 0.001, v0))
+    local u1 = u0 + (screen_width - 1) * mdx * sprite_size
+    local v1 = v0 + (screen_width - 1) * mdy * sprite_size
+    r_batch.tline_push(idx, 0, screen_center_y + y, screen_width - 1, screen_center_y + y, u0, v0, u1, v1, 1, 1)
+  end
+  
+  r_state.occupancy.floor_rows = r_state.occupancy.floor_rows + 1
+end
+
+-- Draw floor and ceiling with hybrid duplication schedule
+-- camera: {x, y} position
+-- r_view: view module with forward/right vectors and sdist
+-- r_state: renderer state
+-- r_batch: batch module
+-- game_state: {floor, roof, sprite_size, per_cell_floors_enabled, get_floor, planetyps, error_textures, ERROR_IDX, get_spr}
+function r_floor.draw_floor_ceiling(camera, r_view, r_state, r_batch, game_state)
+  local cfg = r_state.config
+  local screen_center_y = cfg.screen_height / 2
+  local screen_width = cfg.screen_width
+  local screen_height = cfg.screen_height
+  local fwdy = r_view.forward_y
+  local fwdx = r_view.forward_x
+  local sdist = r_view.sdist
+  local sprite_size = game_state.sprite_size or 32
+  
+  palt(0, false)
+  
+  r_batch.tline_reset()
+  
+  -- Draw ceiling
+  local roof_typ = game_state.roof.typ
+  local roof_src = game_state.get_spr(roof_typ.tex)
+  local y0_ceil = -screen_center_y
+  local y1_ceil = -1
+  
+  -- Near ceiling rows (every row)
+  local near_end = math.min(y1_ceil, -16)
+  for y = y0_ceil, near_end do
+    draw_single_row(y, roof_src, roof_typ.tex, roof_typ.scale, roof_typ.height, 
+      camera.x - game_state.roof.x, camera.y - game_state.roof.y, 
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size, 
+      r_batch, r_state, false, nil, nil, game_state.ERROR_IDX, game_state.get_spr)
+  end
+  
+  -- Mid ceiling rows (2x duplication)
+  local mid_end = math.min(y1_ceil, 32)
+  local y = near_end + 1
+  while y <= mid_end do
+    draw_single_row(y, roof_src, roof_typ.tex, roof_typ.scale, roof_typ.height,
+      camera.x - game_state.roof.x, camera.y - game_state.roof.y,
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size,
+      r_batch, r_state, false, nil, nil, game_state.ERROR_IDX, game_state.get_spr)
+    clamped_blit(y, y + 1, screen_center_y, screen_height, y1_ceil, r_state)
+    y = y + 2
+  end
+  
+  -- Far ceiling rows (4x duplication)
+  while y <= y1_ceil do
+    draw_single_row(y, roof_src, roof_typ.tex, roof_typ.scale, roof_typ.height,
+      camera.x - game_state.roof.x, camera.y - game_state.roof.y,
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size,
+      r_batch, r_state, false, nil, nil, game_state.ERROR_IDX, game_state.get_spr)
+    clamped_blit(y, y + 1, screen_center_y, screen_height, y1_ceil, r_state)
+    clamped_blit(y, y + 2, screen_center_y, screen_height, y1_ceil, r_state)
+    clamped_blit(y, y + 3, screen_center_y, screen_height, y1_ceil, r_state)
+    y = y + 4
+  end
+  
+  -- Draw floor
+  local floor_typ = game_state.floor.typ
+  local floor_src = game_state.get_spr(floor_typ.tex)
+  local y0_floor = 0
+  local y1_floor = screen_center_y - 1
+  
+  -- Near floor rows (every row) - POSITIVE threshold for floor space
+  near_end = math.min(y1_floor, 16)
+  for y = y0_floor, near_end do
+    draw_single_row(y, floor_src, floor_typ.tex, floor_typ.scale, floor_typ.height,
+      camera.x - game_state.floor.x, camera.y - game_state.floor.y,
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size,
+      r_batch, r_state, game_state.per_cell_floors_enabled, game_state.get_floor, game_state.planetyps, game_state.ERROR_IDX, game_state.get_spr)
+  end
+  
+  -- Mid floor rows (2x duplication) - POSITIVE threshold
+  mid_end = math.min(y1_floor, 48)
+  y = near_end + 1
+  while y <= mid_end do
+    draw_single_row(y, floor_src, floor_typ.tex, floor_typ.scale, floor_typ.height,
+      camera.x - game_state.floor.x, camera.y - game_state.floor.y,
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size,
+      r_batch, r_state, game_state.per_cell_floors_enabled, game_state.get_floor, game_state.planetyps, game_state.ERROR_IDX, game_state.get_spr)
+    clamped_blit(y, y + 1, screen_center_y, screen_height, y1_floor, r_state)
+    y = y + 2
+  end
+  
+  -- Far floor rows (4x duplication)
+  while y <= y1_floor do
+    draw_single_row(y, floor_src, floor_typ.tex, floor_typ.scale, floor_typ.height,
+      camera.x - game_state.floor.x, camera.y - game_state.floor.y,
+      fwdy, fwdx, sdist, screen_center_y, screen_width, sprite_size,
+      r_batch, r_state, game_state.per_cell_floors_enabled, game_state.get_floor, game_state.planetyps, game_state.ERROR_IDX, game_state.get_spr)
+    clamped_blit(y, y + 1, screen_center_y, screen_height, y1_floor, r_state)
+    clamped_blit(y, y + 2, screen_center_y, screen_height, y1_floor, r_state)
+    clamped_blit(y, y + 3, screen_center_y, screen_height, y1_floor, r_state)
+    y = y + 4
+  end
+  
+  r_batch.tline_submit()
+  palt()
+end
+
+return r_floor
+
+
+:: src/r_sprites.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_sprites.lua
+-- Depth-bucketed sprite renderer with impostor fallback
+
+local r_sprites = {}
+
+-- Note: Sprite buckets now use userdata buffers from r_state
+-- Each bucket stores object indices (not object references) to avoid GC pressure
+-- Buckets are stored as flat arrays: [bucket0_obj1, bucket0_obj2, ..., bucket1_obj1, ...]
+-- bucket_counts tracks how many objects in each bucket
+
+local function clear_buckets(r_state)
+  -- Zero out bucket counts (userdata stays allocated)
+  for i = 0, r_state.config.sprite_bucket_count - 1 do
+    r_state.buffers.sprite_bucket_counts:set(i, 0)
+  end
+end
+
+-- Draw single sprite with z-buffer occlusion
+local function draw_sprite(ob, camera, r_view, r_state, r_batch, game_state)
+  if not ob or not ob.typ or not ob.rel then
+    return
+  end
+  
+  local t = ob.typ
+  local x = ob.rel[1]  -- camera-space x
+  local z = ob.rel[2]  -- camera-space z (depth)
+  local sdist = r_view.sdist
+  local cfg = r_state.config
+  local screen_center_x = cfg.screen_width / 2
+  local screen_center_y = cfg.screen_height / 2
+  local sprite_size = game_state.sprite_size or 32
+  
+  -- Fetch sprite index
   local base_sprite_index = ob.sprite_index or t.mx
   local sprite_index = base_sprite_index
   
-  -- handle animation with sequential sprite indexes
+  -- Handle animation
   if t.framect then
-   local fr=flr(ob.frame or 0)
-   if ob.animloop then
-    fr=fr%t.framect
-   else
-    fr=min(fr,t.framect-1)
-   end
-   sprite_index = base_sprite_index + fr
-  end
-  
-  -- validate sprite exists; if animation overflow, reset to base
-  local test_src = get_spr(sprite_index)
-  if not test_src then
-   if sprite_index ~= base_sprite_index then
-    -- animation frame overflow detected
-    if not warned_sprites[base_sprite_index] then
-     printh("warning: animation frame overflow for sprite "..base_sprite_index..", clamping to base")
-     warned_sprites[base_sprite_index]=true
+    local fr = math.floor(ob.frame or 0)
+    if ob.animloop then
+      fr = fr % t.framect
+    else
+      fr = math.min(fr, t.framect - 1)
     end
-    sprite_index = base_sprite_index
-   end
+    sprite_index = base_sprite_index + fr
   end
   
-  local src,is_fallback = get_texture_source(sprite_index,"sprite")
-  if is_fallback then
-   src = get_error_texture("sprite")
+  -- Validate sprite exists
+  local src = game_state.get_spr(sprite_index)
+  if not src then
+    if sprite_index ~= base_sprite_index then
+      sprite_index = base_sprite_index
+    end
+    src = game_state.get_spr(sprite_index)
   end
   
-  -- get vertical offset (can be animated)
-  local y=ob.y or t.y
+  if not src then
+    src = game_state.error_textures.sprite or game_state.error_textures.default
+  end
+  
+  -- Get vertical offset
+  local y = ob.y or t.y
   if t.yoffs then
-   local frame = ob.frame or 0
-   local frame_idx=flr(frame%#t.yoffs)+1
-   if frame_idx>0 and frame_idx<=#t.yoffs then
-    y+=t.yoffs[frame_idx]
-   end
+    local frame = ob.frame or 0
+    local frame_idx = math.floor(frame % #t.yoffs) + 1
+    if frame_idx > 0 and frame_idx <= #t.yoffs then
+      y = y + t.yoffs[frame_idx]
+    end
   end
   
   -- LOD: impostor rendering for distant sprites
-  local sprite_lod_distance=fog_far*sprite_lod_ratio
-  if z>sprite_lod_distance then
-   -- sample average color from sprite center (defaults to fog color 5)
-   local avg_color=5
-   if src and src.get then
-    avg_color=src:get(16,16) or 5
-   end
-   
-   -- apply fog uniformly
-  -- fog disabled
-   
-   -- project to screen space
-   local f_lod=sdist/z
-   local sx_lod=x*f_lod+screen_center_x
-   local w_lod=t.w*f_lod
-   
-   -- compute vertical span
-   local y0_lod,y1_lod
-   if t.flat then
-    local z0=z+t.w/2
-    local z1=z-t.w/2
-    y0_lod=y*sdist/z0+screen_center_y
-    y1_lod=y*sdist/z1+screen_center_y
-   else
-    local sy_lod=y*f_lod+screen_center_y
-    local h_lod=t.h*f_lod
-    y0_lod=sy_lod-h_lod/2
-    y1_lod=sy_lod+h_lod/2
-   end
-   
-   -- clamp to screen bounds
-   local x0=max(0,ceil(sx_lod-w_lod/2))
-   local x1=min(screen_width-1,flr(sx_lod+w_lod/2))
-   y0_lod=max(0,ceil(y0_lod))
-   y1_lod=min(screen_height-1,flr(y1_lod))
-   
-  -- draw solid impostor columns with z-test (batched rectfill)
-   if y1_lod>y0_lod and x1>=x0 then
-   rbatch_reset()
-   for px=x0,x1 do
-    local zb=(zread and zread(px)) or (zbuf.get and zbuf:get(px)) or 999
-    if z<zb then
-      rbatch_push(px,y0_lod,px,y1_lod,avg_color)
-      if zwrite then
-       zwrite(px, z)
-      elseif zbuf.set then
-       zbuf:set(px, z)
-      end
+  local sprite_lod_distance = game_state.fog_far * game_state.sprite_lod_ratio
+  if z > sprite_lod_distance then
+    -- Sample average color from sprite center
+    local avg_color = 5
+    if src and src.get then
+      avg_color = src:get(16, 16) or 5
     end
-   end
-   rbatch_submit()
-   diag_sprite_impostor_columns+=max(0,x1-x0+1)
-   end
-   
-   return
+    
+    -- Project to screen space
+    local f_lod = sdist / z
+    local sx_lod = x * f_lod + screen_center_x
+    local w_lod = t.w * f_lod
+    
+    -- Compute vertical span
+    local y0_lod, y1_lod
+    if t.flat then
+      local z0 = z + t.w / 2
+      local z1 = z - t.w / 2
+      y0_lod = y * sdist / z0 + screen_center_y
+      y1_lod = y * sdist / z1 + screen_center_y
+    else
+      local sy_lod = y * f_lod + screen_center_y
+      local h_lod = t.h * f_lod
+      y0_lod = sy_lod - h_lod / 2
+      y1_lod = sy_lod + h_lod / 2
+    end
+    
+    -- Clamp to screen bounds
+    local x0 = math.max(0, math.ceil(sx_lod - w_lod / 2))
+    local x1 = math.min(cfg.screen_width - 1, math.floor(sx_lod + w_lod / 2))
+    y0_lod = math.max(0, math.ceil(y0_lod))
+    y1_lod = math.min(cfg.screen_height - 1, math.floor(y1_lod))
+    
+    -- Draw impostor columns with z-test
+    if y1_lod > y0_lod and x1 >= x0 then
+      r_batch.rect_reset()
+      for px = x0, x1 do
+        local zb = r_state.zread(px)
+        if z < zb then
+          r_batch.rect_push(px, y0_lod, px, y1_lod, avg_color)
+          r_state.zwrite(px, z)
+        end
+      end
+      r_batch.rect_submit()
+    end
+    
+    return
   end
   
-  -- calculate scale factor (perspective)
-  local f=sdist/z
+  -- Full texture rendering
+  local f = sdist / z
+  local sx = x * f + screen_center_x
+  local w = t.w * f
   
-  -- project to screen space
-  local sx=x*f+screen_center_x
-  local w=t.w*f
-  
-  -- calculate y coordinates (different for flat vs upright)
-  local y0,y1
+  -- Calculate y coordinates
+  local y0, y1
   if t.flat then
-   -- floor-aligned sprite
-   local z0=z+t.w/2
-   local z1=z-t.w/2
-   y0=y*sdist/z0+screen_center_y
-   y1=y*sdist/z1+screen_center_y
+    local z0 = z + t.w / 2
+    local z1 = z - t.w / 2
+    y0 = y * sdist / z0 + screen_center_y
+    y1 = y * sdist / z1 + screen_center_y
   else
-   -- upright sprite (use world-space height t.h, not pixel size sprite_size)
-   local sy=y*f+screen_center_y
-   local h=t.h*f
-   y0=sy-h/2
-   y1=sy+h/2
+    local sy = y * f + screen_center_y
+    local h = t.h * f
+    y0 = sy - h / 2
+    y1 = sy + h / 2
   end
   
-  -- map screen dimensions to 32x32 sprite UV space
-  local size=sprite_size or 32
-  local sxd=size/w
-  local syd=size/(y1-y0+0.01)
-  
-  -- UV coordinates start at (0,0) for top-left of 32x32 sprite
+  -- Map to UV space
+  local sxd = sprite_size / w
+  local syd = sprite_size / (y1 - y0 + 0.01)
   local u0 = 0
   local v0 = 0
   
-  -- compute floating left/top edges for sub-pixel adjustment
-  local lx=sx-w/2
-  local fy0=y0
+  -- Clamp to screen bounds
+  local lx = sx - w / 2
+  local fy0 = y0
+  local x0 = math.max(0, math.ceil(lx))
+  local x1 = math.min(cfg.screen_width - 1, math.floor(sx + w / 2))
   
-  -- clamp to screen bounds (0 to screen_width-1 for X, 0 to screen_height-1 for Y)
-  local x0=max(0,ceil(lx))
-  local x1=min(screen_width-1,flr(sx+w/2))
-  -- adjust u0 for x clipping
-  if x0>lx then
-   u0+=(x0-lx)*sxd
+  if x0 > lx then
+    u0 = u0 + (x0 - lx) * sxd
   end
   
-  y0=max(0,ceil(fy0))
-  y1=min(screen_height-1,flr(y1))
-  -- adjust v0 for y clipping
-  if y0>fy0 then
-   v0+=(y0-fy0)*syd
+  y0 = math.max(0, math.ceil(fy0))
+  y1 = math.min(cfg.screen_height - 1, math.floor(y1))
+  
+  if y0 > fy0 then
+    v0 = v0 + (y0 - fy0) * syd
   end
   
-  -- guard against degenerate vertical or horizontal span
-  if y1<=y0 or x1<x0 then
-   return
+  -- Guard against degenerate span
+  if y1 <= y0 or x1 < x0 then
+    return
   end
   
-  -- set fog and palette
-  if ob.pal then
-   pal(ob.pal)
-  else
-   -- fog disabled
-  end
-  
-  -- draw sprite column-by-column with z-buffer (no diagonal batching)
-  local function resolve_sprite_index(idx, kind)
-   if idx and get_spr(idx) then
-    return idx
-   end
-   if ERROR_IDX then
-    if kind=="sprite" then return ERROR_IDX.sprite else return ERROR_IDX.default end
-   end
-   return 0
-  end
-  local spr_idx=resolve_sprite_index(sprite_index,"sprite")
-  sbatch_reset()
-  for px=x0,x1 do
-  local zb=(zread and zread(px)) or (zbuf.get and zbuf:get(px)) or 999
-   if z<zb then
-    local u=u0+(px-x0)*sxd
-    sbatch_push(spr_idx, px, y0, px, y1, u, v0, u, v0+size, 1, 1)
-    -- diagnostics removed for production
-    if zwrite then
-     zwrite(px, z)
-    elseif zbuf.set then
-     zbuf:set(px, z)
+  -- Draw sprite column-by-column with z-buffer
+  local spr_idx = sprite_index
+  r_batch.tline_reset()
+  for px = x0, x1 do
+    local zb = r_state.zread(px)
+    if z < zb then
+      local u = u0 + (px - x0) * sxd
+      r_batch.tline_push(spr_idx, px, y0, px, y1, u, v0, u, v0 + sprite_size, 1, 1)
+      r_state.zwrite(px, z)
     end
-   diag_sprite_columns+=1
-   end
   end
-  sbatch_submit()
-  
-  -- if a custom palette was applied, restore fog mapping for subsequent draws
-  if ob.pal then
-   -- fog state removed
-  end
+  r_batch.tline_submit()
 end
+
+-- Render all sprites with depth bucketing
+-- camera: {x, y} position
+-- r_view: view module with forward/right vectors
+-- r_state: renderer state
+-- r_batch: batch module
+-- game_state: {objects, far_plane, sprite_lod_ratio, fog_far, sprite_size, get_spr, error_textures}
+function r_sprites.draw(camera, r_view, r_state, r_batch, game_state)
+  local cfg = r_state.config
+  local sa, ca = sin(camera.a), cos(camera.a)
+  local bucket_size = game_state.far_plane / 8
+  local bufs = r_state.buffers
+  local bucket_count = cfg.sprite_bucket_count
+  local bucket_capacity = cfg.sprite_bucket_capacity
+  
+  clear_buckets(r_state)
+  
+  -- Build object index list (for stable bucket storage)
+  local obj_list = game_state.objects
+  local obj_count = #obj_list
+  
+  -- Transform sprites to camera space and bucket by depth
+  for obj_idx = 1, obj_count do
+    local ob = obj_list[obj_idx]
+    if ob and ob.pos and ob.typ then
+      -- Transform to view space
+      local rx = ob.pos[1] - camera.x
+      local ry = ob.pos[2] - camera.y
+      
+      -- Simple distance culling
+      if abs(rx) >= game_state.far_plane or abs(ry) >= game_state.far_plane then
+        goto skip_sprite
+      end
+      
+      -- Rotate to camera space
+      local x_cam = -sa * rx + ca * ry
+      local z_cam = ca * rx + sa * ry
+      ob.rel = ob.rel or {}
+      ob.rel[1] = x_cam
+      ob.rel[2] = z_cam
+      
+      -- Far-plane culling
+      if ob.rel[2] > game_state.far_plane then
+        goto skip_sprite
+      end
+      
+      -- Frustum culling
+      local t = ob.typ
+      local pass_frustum = false
+      if ob.rel[2] > 0.1 then
+        if t.flat then
+          if ob.rel[2] >= t.w / 2 then
+            pass_frustum = true
+          end
+        else
+          if abs(ob.rel[1]) - (t.w / 2) < ob.rel[2] * (cfg.screen_width / 2 / r_view.sdist) then
+            pass_frustum = true
+          end
+        end
+      end
+      
+      if pass_frustum then
+        local bucket_idx = math.min(bucket_count - 1, math.floor(ob.rel[2] / bucket_size))
+        local count = bufs.sprite_bucket_counts:get(bucket_idx)
+        
+        -- Check capacity
+        if count < bucket_capacity then
+          local base = bucket_idx * bucket_capacity
+          bufs.sprite_bucket_indices:set(base + count, obj_idx)
+          bufs.sprite_bucket_depths:set(base + count, ob.rel[2])
+          bufs.sprite_bucket_counts:set(bucket_idx, count + 1)
+        end
+      end
+      
+      ::skip_sprite::
+    end
+  end
+  
+  -- Draw sprites back-to-front
+  palt(0, false)
+  palt(14, true)
+  
+  for bucket_idx = bucket_count - 1, 0, -1 do
+    local count = bufs.sprite_bucket_counts:get(bucket_idx)
+    
+    -- Sort bucket by z descending (far to near) using insertion sort
+    if count > 4 then
+      local base = bucket_idx * bucket_capacity
+      for i = 1, count - 1 do
+        local idx_i = bufs.sprite_bucket_indices:get(base + i)
+        local z_i = bufs.sprite_bucket_depths:get(base + i)
+        local j = i - 1
+        while j >= 0 and bufs.sprite_bucket_depths:get(base + j) < z_i do
+          bufs.sprite_bucket_indices:set(base + j + 1, bufs.sprite_bucket_indices:get(base + j))
+          bufs.sprite_bucket_depths:set(base + j + 1, bufs.sprite_bucket_depths:get(base + j))
+          j = j - 1
+        end
+        bufs.sprite_bucket_indices:set(base + j + 1, idx_i)
+        bufs.sprite_bucket_depths:set(base + j + 1, z_i)
+      end
+    end
+    
+    -- Draw all sprites in bucket
+    local base = bucket_idx * bucket_capacity
+    for i = 0, count - 1 do
+      local obj_idx = bufs.sprite_bucket_indices:get(base + i)
+      local ob = obj_list[obj_idx]
+      draw_sprite(ob, camera, r_view, r_state, r_batch, game_state)
+    end
+  end
+  
+  palt()
+  r_state.occupancy.sprite_count = r_state.occupancy.sprite_count + #game_state.objects
+end
+
+return r_sprites
+
+
+:: src/r_state.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_state.lua
+-- Renderer state: owns all userdata buffers, config, and occupancy counters
+
+local r_state = {}
+
+-- Memory base address for renderer buffers (safe range per optimization guidelines)
+local MEM_BASE = 0x080000
+
+-- Configuration
+r_state.config = {
+  screen_width = 480,
+  screen_height = 270,
+  ray_count = 128,
+  sprite_bucket_count = 8,
+  sprite_bucket_capacity = 64,
+  debug_mode = false
+}
+
+-- Buffer handles (will be populated by init)
+r_state.buffers = {}
+
+-- Occupancy counters (reset per frame)
+r_state.occupancy = {
+  rays_active = 0,
+  wall_spans = 0,
+  floor_rows = 0,
+  sprite_count = 0
+}
+
+-- Frame counter for z-buffer stamping
+r_state.frame_id = 0
+
+-- Initialize all renderer buffers using memmap
+function r_state.init(config)
+  -- Merge user config
+  if config then
+    for k, v in pairs(config) do
+      r_state.config[k] = v
+    end
+  end
+  
+  local cfg = r_state.config
+  local ray_cnt = cfg.ray_count
+  local sw = cfg.screen_width
+  local sh = cfg.screen_height
+  
+  -- Ray direction and hit data buffers
+  r_state.buffers.ray_dir_x = userdata("f64", ray_cnt)
+  r_state.buffers.ray_dir_y = userdata("f64", ray_cnt)
+  r_state.buffers.ray_z = userdata("f64", ray_cnt)
+  r_state.buffers.ray_tx = userdata("f64", ray_cnt)
+  r_state.buffers.ray_hitx = userdata("f64", ray_cnt)
+  r_state.buffers.ray_hity = userdata("f64", ray_cnt)
+  r_state.buffers.ray_tile = userdata("i16", ray_cnt)
+  
+  -- Screen span mapping (which pixels each ray covers)
+  r_state.buffers.ray_x0 = userdata("i16", ray_cnt)
+  r_state.buffers.ray_x1 = userdata("i16", ray_cnt)
+  r_state.buffers.ray_px_center = userdata("f64", ray_cnt)
+  
+  -- Wall span buffers (worst case: one span per ray)
+  r_state.buffers.wall_span_start = userdata("i16", ray_cnt)
+  r_state.buffers.wall_span_end = userdata("i16", ray_cnt)
+  r_state.buffers.wall_span_tile = userdata("i16", ray_cnt)
+  r_state.buffers.wall_span_uv0 = userdata("f32", ray_cnt)
+  r_state.buffers.wall_span_uv1 = userdata("f32", ray_cnt)
+  r_state.buffers.wall_span_depth = userdata("f32", ray_cnt)
+  
+  -- Sprite buckets (depth-sorted bins)
+  local bucket_size = cfg.sprite_bucket_count * cfg.sprite_bucket_capacity
+  r_state.buffers.sprite_bucket_indices = userdata("i16", bucket_size)
+  r_state.buffers.sprite_bucket_depths = userdata("f32", bucket_size)
+  r_state.buffers.sprite_bucket_counts = userdata("i16", cfg.sprite_bucket_count)
+  
+  -- Z-buffer and frame stamp
+  r_state.buffers.zbuf = userdata("f32", sw)
+  r_state.buffers.zstamp = userdata("i32", sw)
+  
+  -- Initialize zstamp to 0
+  for i = 0, sw - 1 do
+    r_state.buffers.zstamp:set(i, 0)
+  end
+  
+  -- Diagnostics snapshot buffer (only used when debug_mode enabled)
+  r_state.buffers.stats_ud = userdata("f32", 32)
+  
+  printh("[r_state] initialized: " .. ray_cnt .. " rays, " .. sw .. "x" .. sh .. " screen")
+end
+
+-- Prepare frame: clear occupancy counters and stamp z-buffer
+function r_state.prepare_frame()
+  r_state.frame_id = r_state.frame_id + 1
+  r_state.occupancy.rays_active = 0
+  r_state.occupancy.wall_spans = 0
+  r_state.occupancy.floor_rows = 0
+  r_state.occupancy.sprite_count = 0
+  
+  -- Z-buffer is invalidated by frame stamp, no need to clear values
+end
+
+-- Z-buffer helpers using frame stamping
+function r_state.zread(x)
+  if x < 0 or x >= r_state.config.screen_width then return 999 end
+  local stamp = r_state.buffers.zstamp:get(x) or 0
+  if stamp == r_state.frame_id then
+    return r_state.buffers.zbuf:get(x) or 999
+  end
+  return 999
+end
+
+function r_state.zwrite(x, z)
+  if x < 0 or x >= r_state.config.screen_width then return end
+  r_state.buffers.zbuf:set(x, z)
+  r_state.buffers.zstamp:set(x, r_state.frame_id)
+end
+
+-- Dump buffer usage (debug mode only)
+function r_state.dump_usage()
+  if not r_state.config.debug_mode then return end
+  
+  printh("[r_state] buffer usage:")
+  printh("  rays_active: " .. r_state.occupancy.rays_active .. " / " .. r_state.config.ray_count)
+  printh("  wall_spans: " .. r_state.occupancy.wall_spans .. " / " .. r_state.config.ray_count)
+  printh("  floor_rows: " .. r_state.occupancy.floor_rows)
+  printh("  sprite_count: " .. r_state.occupancy.sprite_count)
+end
+
+-- Teardown: unmap all userdata (allows GC)
+function r_state.teardown()
+  -- Picotron doesn't require explicit unmap, but we clear references
+  for k, v in pairs(r_state.buffers) do
+    r_state.buffers[k] = nil
+  end
+  printh("[r_state] teardown complete")
+end
+
+return r_state
+
+
+:: src/r_view.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_view.lua
+-- Camera basis and ray direction LUT computation
+
+local r_view = {}
+
+-- Cached state to detect changes
+local last_ray_count = 0
+local last_fov = 0
+
+-- Camera basis vectors (cached per frame)
+r_view.forward_x = 0
+r_view.forward_y = 0
+r_view.right_x = 0
+r_view.right_y = 0
+
+-- Projection distance (cached, recomputed when FOV changes)
+r_view.sdist = 200
+
+-- Update camera basis and ray direction LUTs
+-- camera: {x, y, a} table with position and angle
+-- r_state: renderer state with buffers
+-- fov: field of view (half-angle in radians)
+-- active_ray_count: current ray budget (can be < r_state.config.ray_count)
+function r_view.update(camera, r_state, fov, active_ray_count)
+  local cfg = r_state.config
+  local ray_cnt = active_ray_count or cfg.ray_count
+  local screen_center_x = cfg.screen_width / 2
+  
+  -- Recompute projection distance if FOV changed
+  if fov ~= last_fov then
+    r_view.sdist = screen_center_x / math.tan(fov)
+    last_fov = fov
+  end
+  
+  -- Update camera basis (cached sin/cos)
+  local sa = sin(camera.a)
+  local ca = cos(camera.a)
+  
+  r_view.forward_x = ca
+  r_view.forward_y = sa
+  r_view.right_x = -sa
+  r_view.right_y = ca
+  
+  -- Rebuild ray direction LUTs only if ray count changed
+  if ray_cnt ~= last_ray_count then
+    local bufs = r_state.buffers
+    
+    for i = 0, ray_cnt - 1 do
+      -- Compute screen span for this ray
+      local x0 = math.floor(i * cfg.screen_width / ray_cnt)
+      local x1 = math.max(x0, math.floor((i + 1) * cfg.screen_width / ray_cnt) - 1)
+      local pixel_x = (x0 + x1) / 2 + 0.5
+      
+      bufs.ray_x0:set(i, x0)
+      bufs.ray_x1:set(i, x1)
+      bufs.ray_px_center:set(i, pixel_x)
+    end
+    
+    last_ray_count = ray_cnt
+    printh("[r_view] rebuilt LUTs for " .. ray_cnt .. " rays")
+  end
+  
+  -- Compute ray directions in world space
+  local bufs = r_state.buffers
+  for i = 0, ray_cnt - 1 do
+    local pixel_x = bufs.ray_px_center:get(i)
+    local dx = pixel_x - screen_center_x
+    local dy = r_view.sdist
+    
+    -- Transform camera-space direction to world-space
+    -- ray_dir = right * dx + forward * dy
+    local world_dx = r_view.right_x * dx + r_view.forward_x * dy
+    local world_dy = r_view.right_y * dx + r_view.forward_y * dy
+    
+    bufs.ray_dir_x:set(i, world_dx)
+    bufs.ray_dir_y:set(i, world_dy)
+  end
+  
+  r_state.occupancy.rays_active = ray_cnt
+end
+
+return r_view
+
+
+:: src/r_walls.lua
+--[[pod_format="raw",created="2025-11-12 00:00:00",modified="2025-11-12 00:00:00",revision=1]]
+-- r_walls.lua
+-- Span batcher for wall rendering with LOD
+
+local r_walls = {}
+
+-- Texture cache (sprite index -> {src, is_fallback})
+local tex_cache = {}
+local avg_color_cache = {}
+
+-- Resolve sprite index with fallback to error textures
+local function resolve_sprite_index(idx, kind, error_idx_table, get_spr_fn)
+  if idx and get_spr_fn(idx) then
+    return idx
+  end
+  if error_idx_table then
+    if kind == "door" then return error_idx_table.door
+    else return error_idx_table.wall end
+  end
+  return 0
+end
+
+-- Get texture source with caching
+local function get_texture_source(sprite_index, obj_type, get_spr_fn, error_textures)
+  sprite_index = sprite_index or 0
+  obj_type = obj_type or "default"
+  
+  -- Check cache
+  local cached = tex_cache[sprite_index]
+  if cached then
+    return cached.src, cached.is_fallback
+  end
+  
+  -- Try to fetch sprite
+  local src = get_spr_fn(sprite_index)
+  if not src then
+    -- Use error texture
+    local err_tex = error_textures[obj_type] or error_textures.default
+    tex_cache[sprite_index] = {src = err_tex, is_fallback = true}
+    return err_tex, true
+  end
+  
+  tex_cache[sprite_index] = {src = src, is_fallback = false}
+  return src, false
+end
+
+-- Get average color with caching
+local function get_avg_color(tile, get_spr_fn, error_textures, is_door_fn)
+  local avg = avg_color_cache[tile]
+  if avg then return avg end
+  
+  local obj_type = is_door_fn and is_door_fn(tile) and "door" or "wall"
+  local src, is_fallback = get_texture_source(tile, obj_type, get_spr_fn, error_textures)
+  
+  avg = 5  -- default fog color
+  if src and src.get then
+    avg = src:get(16, 16) or 5
+  end
+  
+  avg_color_cache[tile] = avg
+  return avg
+end
+
+-- Draw wall spans with LOD and batching
+-- camera: {x, y} position
+-- r_view: view module with forward vectors and sdist
+-- r_state: renderer state with buffers
+-- r_batch: batch module
+-- game_state: {wall_lod_distance, wall_tiny_screen_px, sprite_size, is_door, get_spr, error_textures, ERROR_IDX}
+function r_walls.draw_spans(camera, r_view, r_state, r_batch, game_state)
+  local bufs = r_state.buffers
+  local ray_cnt = r_state.occupancy.rays_active
+  local cfg = r_state.config
+  local screen_center_y = cfg.screen_height / 2
+  local fwdx, fwdy = r_view.forward_x, r_view.forward_y
+  local sdist = r_view.sdist
+  local tex_size = game_state.sprite_size or 32
+  
+  r_batch.rect_reset()
+  r_batch.tline_reset()
+  
+  -- Span merging state
+  local span_start = nil
+  local span_tile = nil
+  local span_spr = nil
+  local span_avg = nil
+  local span_tx0, span_tx1 = nil, nil
+  local span_hitx0, span_hity0 = nil, nil
+  local span_hitx1, span_hity1 = nil, nil
+  
+  local function flush_span(span_end)
+    if not span_start then return end
+    
+    local x0 = bufs.ray_x0:get(span_start)
+    local x1 = bufs.ray_x1:get(span_end)
+    if x0 > x1 then span_start = nil return end
+    
+    local span_width = x1 - x0
+    
+    -- Handle single-column span
+    if span_width <= 0 then
+      local rel_x = span_hitx0 - camera.x
+      local rel_y = span_hity0 - camera.y
+      local z = rel_x * fwdx + rel_y * fwdy
+      if z <= 0.0001 then z = 0.0001 end
+      
+      local h = sdist / z
+      local y0 = screen_center_y - h / 2
+      local y1 = screen_center_y + h / 2
+      local tdy0 = math.ceil(y0)
+      local tdy1 = math.min(math.floor(y1), cfg.screen_height - 1)
+      
+      if tdy0 <= tdy1 then
+        local wall_height = tdy1 - tdy0
+        if z > game_state.wall_lod_distance or wall_height < game_state.wall_tiny_screen_px then
+          r_batch.rect_push(x0, tdy0, x1, tdy1, span_avg)
+        else
+          local u0 = span_tx0 * tex_size
+          local v0 = 0
+          local full_h = y1 - y0
+          if full_h > 0 and tdy0 < y1 then
+            v0 = ((tdy0 - y0) / full_h) * tex_size
+          end
+          local w0 = 1 / z
+          r_batch.tline_push(span_spr, x0, tdy0, x1, tdy1, u0, v0, u0, v0 + tex_size, w0, w0, 0)
+        end
+        r_state.zwrite(x0, z)
+      end
+      
+      span_start = nil
+      return
+    end
+    
+    -- Multi-column span
+    local rel_x0 = span_hitx0 - camera.x
+    local rel_y0 = span_hity0 - camera.y
+    local z0 = rel_x0 * fwdx + rel_y0 * fwdy
+    if z0 <= 0.0001 then z0 = 0.0001 end
+    
+    local rel_x1 = span_hitx1 - camera.x
+    local rel_y1 = span_hity1 - camera.y
+    local z1 = rel_x1 * fwdx + rel_y1 * fwdy
+    if z1 <= 0.0001 then z1 = 0.0001 end
+    
+    local h0 = sdist / z0
+    local base_y0 = screen_center_y - h0 / 2
+    local base_y1 = screen_center_y + h0 / 2
+    local tdy0 = math.ceil(base_y0)
+    local tdy1 = math.min(math.floor(base_y1), cfg.screen_height - 1)
+    
+    if tdy0 > tdy1 then
+      span_start = nil
+      return
+    end
+    
+    local h1 = sdist / z1
+    local y1_top = screen_center_y - h1 / 2
+    local y1_bot = screen_center_y + h1 / 2
+    tdy0 = math.min(tdy0, math.ceil(y1_top))
+    tdy1 = math.max(tdy1, math.min(math.floor(y1_bot), cfg.screen_height - 1))
+    tdy0 = math.max(tdy0, 0)
+    tdy1 = math.min(tdy1, cfg.screen_height - 1)
+    
+    if tdy0 > tdy1 then
+      span_start = nil
+      return
+    end
+    
+    local column_count = x1 - x0 + 1
+    
+    -- LOD check
+    if z0 > game_state.wall_lod_distance and z1 > game_state.wall_lod_distance then
+      r_batch.rect_push(x0, tdy0, x1, tdy1, span_avg)
+    else
+      local u0 = span_tx0 * tex_size
+      local u1 = span_tx1 * tex_size
+      local v0 = ((tdy0 - base_y0) / (base_y1 - base_y0)) * tex_size
+      if base_y1 - base_y0 <= 0 then v0 = 0 end
+      v0 = math.max(0, math.min(tex_size, v0))
+      local v1 = v0 + tex_size
+      r_batch.tline_push(span_spr, x0, tdy0, x1, tdy1, u0, v0, u1, v1, 1 / z0, 1 / z1, 0)
+    end
+    
+    -- Update z-buffer for all columns in span
+    for col = x0, x1 do
+      local t = (span_width > 0) and ((col - x0) / span_width) or 0
+      local world_x = span_hitx0 + (span_hitx1 - span_hitx0) * t
+      local world_y = span_hity0 + (span_hity1 - span_hity0) * t
+      local rel_x = world_x - camera.x
+      local rel_y = world_y - camera.y
+      local z = rel_x * fwdx + rel_y * fwdy
+      if z <= 0.0001 then z = 0.0001 end
+      r_state.zwrite(col, z)
+    end
+    
+    r_state.occupancy.wall_spans = r_state.occupancy.wall_spans + 1
+    span_start = nil
+  end
+  
+  -- Iterate rays and merge into spans
+  for ray_idx = 0, ray_cnt - 1 do
+    local tile = bufs.ray_tile:get(ray_idx)
+    
+    if tile and tile > 0 then
+      if span_start and tile == span_tile then
+        -- Continue span
+        span_tx1 = bufs.ray_tx:get(ray_idx)
+        span_hitx1 = bufs.ray_hitx:get(ray_idx)
+        span_hity1 = bufs.ray_hity:get(ray_idx)
+      else
+        -- Flush previous span
+        if span_start then flush_span(ray_idx - 1) end
+        
+        -- Start new span
+        span_start = ray_idx
+        span_tile = tile
+        span_spr = resolve_sprite_index(tile, (game_state.is_door and game_state.is_door(tile)) and "door" or "wall", game_state.ERROR_IDX, game_state.get_spr)
+        span_avg = get_avg_color(tile, game_state.get_spr, game_state.error_textures, game_state.is_door)
+        span_tx0 = bufs.ray_tx:get(ray_idx)
+        span_tx1 = span_tx0
+        span_hitx0 = bufs.ray_hitx:get(ray_idx)
+        span_hity0 = bufs.ray_hity:get(ray_idx)
+        span_hitx1 = span_hitx0
+        span_hity1 = span_hity0
+      end
+    else
+      -- Empty tile: flush span
+      if span_start then flush_span(ray_idx - 1) end
+    end
+  end
+  
+  -- Flush final span
+  if span_start then flush_span(ray_cnt - 1) end
+  
+  r_batch.tline_submit()
+  r_batch.rect_submit()
+end
+
+-- Clear texture caches (call on level load)
+function r_walls.clear_caches()
+  tex_cache = {}
+  avg_color_cache = {}
+end
+
+return r_walls
+
 
 :: tests/dungeon_harness.lua
 -- deterministic dungeon generation harness
@@ -3325,729 +3558,732 @@ return harness
 b64$LS1bW3BvZF9mb3JtYXQ9InJhdyIsY3JlYXRlZD0iMjAyNS0xMS0wNyAyMTowNDowNiIsbW9k
 aWZpZWQ9IjIwMjUtMTEtMDcgMjI6MTg6NTEiLHJldmlzaW9uPTVdXQotLSBub25ib3kgcmF5Y2Fz
 dCBlbmdpbmUgdjEuMAotLSBtYWluIGVudHJ5IHBvaW50CgppbmNsdWRlInNyYy9jb25maWcubHVh
-IgppbmNsdWRlInNyYy9yYXljYXN0Lmx1YSIKaW5jbHVkZSJzcmMvcmVuZGVyLmx1YSIKaW5jbHVk
-ZSJzcmMvcmVuZGVyX3Nwcml0ZS5sdWEiCmluY2x1ZGUic3JjL2Rvb3Jfc3lzdGVtLmx1YSIKaW5j
-bHVkZSJzcmMvZHVuZ2Vvbl9nZW4ubHVhIgppbmNsdWRlInRlc3RzL2R1bmdlb25faGFybmVzcy5s
-dWEiCgpsb2NhbCBzY2VuZXM9e30KbG9jYWwgc2NlbmVfc3RhdGU9e30KbG9jYWwgY3VycmVudF9z
-Y2VuZT1uaWwKCmxvY2FsIGZ1bmN0aW9uIGdldF9zY2VuZV9zdGF0ZShuYW1lKQogc2NlbmVfc3Rh
-dGVbbmFtZV09c2NlbmVfc3RhdGVbbmFtZV0gb3Ige30KIHJldHVybiBzY2VuZV9zdGF0ZVtuYW1l
-XQplbmQKCmxvY2FsIGZ1bmN0aW9uIHN3aXRjaF9zY2VuZShuYW1lLHBhcmFtcykKIGxvY2FsIHNj
-ZW5lPXNjZW5lc1tuYW1lXQogaWYgbm90IHNjZW5lIHRoZW4KICBwcmludGgoIndhcm5pbmc6IHVu
-a25vd24gc2NlbmUgIi4udG9zdHJpbmcobmFtZSkpCiAgcmV0dXJuCiBlbmQKIGlmIGN1cnJlbnRf
-c2NlbmUgYW5kIHNjZW5lc1tjdXJyZW50X3NjZW5lXSBhbmQgc2NlbmVzW2N1cnJlbnRfc2NlbmVd
-LmxlYXZlIHRoZW4KICBzY2VuZXNbY3VycmVudF9zY2VuZV0ubGVhdmUoZ2V0X3NjZW5lX3N0YXRl
-KGN1cnJlbnRfc2NlbmUpKQogZW5kCiBjdXJyZW50X3NjZW5lPW5hbWUKIGxvY2FsIHN0YXRlPWdl
-dF9zY2VuZV9zdGF0ZShuYW1lKQogaWYgc2NlbmUuZW50ZXIgdGhlbgogIHNjZW5lLmVudGVyKHN0
-YXRlLHBhcmFtcyBvciB7fSkKIGVuZAplbmQKCmxvY2FsIGZ1bmN0aW9uIHNjZW5lX3VwZGF0ZSgp
-CiBpZiBjdXJyZW50X3NjZW5lIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0gYW5kIHNjZW5lc1tj
-dXJyZW50X3NjZW5lXS51cGRhdGUgdGhlbgogIHNjZW5lc1tjdXJyZW50X3NjZW5lXS51cGRhdGUo
-Z2V0X3NjZW5lX3N0YXRlKGN1cnJlbnRfc2NlbmUpKQogZW5kCmVuZAoKbG9jYWwgZnVuY3Rpb24g
-c2NlbmVfZHJhdygpCiBpZiBjdXJyZW50X3NjZW5lIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0g
-YW5kIHNjZW5lc1tjdXJyZW50X3NjZW5lXS5kcmF3IHRoZW4KICBzY2VuZXNbY3VycmVudF9zY2Vu
-ZV0uZHJhdyhnZXRfc2NlbmVfc3RhdGUoY3VycmVudF9zY2VuZSkpCiBlbHNlCiAgY2xzKDApCiBl
-bmQKZW5kCgotLSBjb25zdGFudHMKcGxheWVyX2NvbGxpc2lvbl9yYWRpdXM9MC4xNQoKZnVuY3Rp
-b24gX2luaXQoKQogd2luZG93KHNjcmVlbl93aWR0aCxzY3JlZW5faGVpZ2h0KQogCiAtLSBwaW4g
-bWFza3MgdG8gZGVmYXVsdHMgZm9yIHNpbmdsZSBjb2xvdXItdGFibGUgZmFzdCBwYXRoCiBwb2tl
-KDB4NTUwOCwweDNmKSBwb2tlKDB4NTUwOSwweDNmKSBwb2tlKDB4NTUwYSwweDNmKSBwb2tlKDB4
-NTUwYiwweDAwKQogCiAtLSB0aWxlIDAgZHJhd2luZyBzdGF0ZTogdmVyaWZpZWQgbm90IHJlcXVp
-cmVkOyBsZWF2ZSAweDVmMzYgYXQgZGVmYXVsdCAobm8gZXhwbGljaXQgcG9rZSkKIC0tIHNzcHIo
-KSB1c2FnZSB2ZXJpZmllZDogTm9uZSBpbiBwcm9kdWN0aW9uIGNvZGUgKG9ubHkgaW4gc2FtcGxl
-IGZpbGVzKQogLS0gUGVyIFBpY290cm9uIGd1aWRlbGluZXM6IGJsaXQoKSBpcyBmYXN0ZXI7IEhV
-RC9taW5pbWFwIHVzZSBkaXJlY3QgZHJhd2luZwogLS0gY29uZmlndXJhdGlvbiBndWFyZDogcHJl
-dmVudCBmb2cgcG9wcGluZyBiZXlvbmQgZmFyLXBsYW5lCiBhc3NlcnQoZmFyX3BsYW5lPj1mb2df
-ZmFyKzEsImNvbmZpZyBlcnJvcjogZmFyX3BsYW5lIG11c3QgYmUgPj0gZm9nX2ZhciArIDEiKQog
-CiAtLSBkZWZlbnNpdmUgZGVmYXVsdHMgaWYgY29uZmlnIGluY2x1ZGUgZmFpbGVkIHRvIHNldCB0
-aGVtIGZvciBhbnkgcmVhc29uCiBpZiBub3Qgb2JqZ3JpZF9zaXplIHRoZW4gb2JqZ3JpZF9zaXpl
-PTUgZW5kCiBpZiBub3Qgb2JqZ3JpZF9hcnJheV9zaXplIHRoZW4gb2JqZ3JpZF9hcnJheV9zaXpl
-PTI2IGVuZAogCiAtLSBmcmFtZSBjb3VudGVyIGZvciBhaSB0aW1pbmcKIGZyYW1lX2N0PTAKIAog
-LS0gcGxheWVyIHN0YXRlCiBwbGF5ZXI9ewogIHg9NjQseT02NCwKICBhPTAsCiAgc3BkPXBsYXll
-cl9tb3ZlX3NwZWVkLAogIGtleXM9e30sCiAgaHA9MTAwCiB9CiAKIC0tIGludGVyYWN0aW9uIHN0
-YXRlCiBpbnRlcmFjdGlvbl9hY3RpdmU9ZmFsc2UKIGN1cnJlbnRfaW50ZXJhY3Q9bmlsCiAKIC0t
-IGNvbWJhdCBzdGF0ZQogaW5fY29tYmF0PWZhbHNlCiBjdXJyZW50X3RhcmdldD1uaWwKIAogLS0g
-dHJhcCBtZXNzYWdlIHRpbWVyCiB0cmFwX21zZ190aW1lcj0wCiAKIC0tIGNhbWVyYQogY2FtPXtw
-bGF5ZXIueCxwbGF5ZXIueX0KIAogLS0gbWFwIGFic3RyYWN0aW9uIHdpdGggdXNlcmRhdGEgbGF5
-ZXJzCiBtYXA9e30KIG1hcC53YWxscz11c2VyZGF0YSgiaTE2IiwxMjgsMTI4KQogbWFwLmRvb3Jz
-PXVzZXJkYXRhKCJpMTYiLDEyOCwxMjgpCiBtYXAuZmxvb3JzPXVzZXJkYXRhKCJpMTYiLDEyOCwx
-MjgpCiAKIC0tIGhlbHBlcjogZ2V0IHdhbGwgdGlsZQotLSBQdXJwb3NlOiBSZXRyaWV2ZSB3YWxs
-IHRpbGUgSUQgYXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFyYW1ldGVyczogeCwgeSAoZ3JpZCBjb29y
-ZGluYXRlcyAwLTEyNykKIC0tIFJldHVybnM6IHRpbGUgSUQgKDA9ZW1wdHksID4wPXdhbGwvZG9v
-ci9leGl0KQogZnVuY3Rpb24gZ2V0X3dhbGwoeCx5KQogaWYgeD49MCBhbmQgeDwxMjggYW5kIHk_
-PTAgYW5kIHk8MTI4IHRoZW4KICByZXR1cm4gbWFwLndhbGxzOmdldCh4LHkpIG9yIDAKIGVuZAog
-cmV0dXJuIDAKIGVuZAogCiAtLSBoZWxwZXI6IHNldCB3YWxsIHRpbGUKIGZ1bmN0aW9uIHNldF93
-YWxsKHgseSx2YWwpCiAgaWYgeD49MCBhbmQgeDwxMjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4K
-CQltYXAud2FsbHM6c2V0KHgseSx2YWwgb3IgMCkKICBlbmQKIGVuZAogCiAtLSBoZWxwZXI6IGdl
-dCBkb29yIHRpbGUKIGZ1bmN0aW9uIGdldF9kb29yKHgseSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBh
-bmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4gbWFwLmRvb3JzOmdldCh4LHkpIG9yIDAK
-ICBlbmQKICByZXR1cm4gMAogZW5kCiAKIC0tIGhlbHBlcjogc2V0IGRvb3IgdGlsZQogZnVuY3Rp
-b24gc2V0X2Rvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwx
-MjggdGhlbgogICBtYXAuZG9vcnM6c2V0KHgseSx2YWwgb3IgMCkKICBlbmQKIGVuZAoKIC0tIGhl
-bHBlcjogZ2V0IGZsb29yIHRpbGUKIC0tIFB1cnBvc2U6IFJldHJpZXZlIGZsb29yIHR5cGUgSUQg
-YXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFyYW1ldGVyczogeCwgeSAoZ3JpZCBjb29yZGluYXRlcyAw
-LTEyNykKIC0tIFJldHVybnM6IGZsb29yIHR5cGUgSUQgKDA9dXNlIGdsb2JhbCBkZWZhdWx0LCAx
-LTg9c3BlY2lmaWMgZmxvb3IgdHlwZSBmcm9tIHBsYW5ldHlwcykKIC0tIE5vdGVzOiBGbG9vciB0
-eXBlIElEcyBtYXAgdG8gaW5kaWNlcyBpbiB0aGUgcGxhbmV0eXBzIHRhYmxlIGRlZmluZWQgaW4g
-Y29uZmlnLmx1YQogZnVuY3Rpb24gZ2V0X2Zsb29yKHgseSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBh
-bmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4gbWFwLmZsb29yczpnZXQoeCx5KSBvciAw
-CiAgZW5kCiAgcmV0dXJuIDAKIGVuZAoKIC0tIGhlbHBlcjogc2V0IGZsb29yIHRpbGUKIC0tIFB1
-cnBvc2U6IFN0b3JlIHBlci1jZWxsIGZsb29yIHR5cGUgSURzIGZvciB2YXJpZWQgZmxvb3IgdGV4
-dHVyZXMKIC0tIFBhcmFtZXRlcnM6IHgsIHkgKGdyaWQgY29vcmRpbmF0ZXMgMC0xMjcpLCB2YWwg
-KGZsb29yIHR5cGUgSUQgMC04KQogLS0gTm90ZXM6IDA9dXNlIGdsb2JhbCBkZWZhdWx0IGZsb29y
-IHR5cGUsIDEtOD1zcGVjaWZpYyBmbG9vciB0eXBlIGZyb20gcGxhbmV0eXBzCiBmdW5jdGlvbiBz
-ZXRfZmxvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwxMjgg
-dGhlbgogICAtLSBub3JtYWxpemUgdmFsIHRvIHZhbGlkIHJhbmdlIDAtOAogICBpZiB0eXBlKHZh
-bCl_PSJudW1iZXIiIG9yIHZhbD09bmlsIHRoZW4KICAgIHZhbD0wCiAgIGVsc2VpZiB2YWw8MCB0
-aGVuCiAgICB2YWw9MAogICBlbHNlaWYgdmFsPjggdGhlbgogICAgdmFsPTgKICAgZW5kCiAgIG1h
-cC5mbG9vcnM6c2V0KHgseSx2YWwpCiAgZW5kCiBlbmQKIAogZG9vcmdyaWQ9e30KIGZvciBpPTAs
-MTI3IGRvCiAgZG9vcmdyaWRbaV09e30KICBmb3Igaj0wLDEyNyBkbwogICBkb29yZ3JpZFtpXVtq
-XT1uaWwKICBlbmQKIGVuZAogCiAtLSBpbml0aWFsaXplIGZsb29yIGRhdGEKIGZvciBpPTAsMTI3
-IGRvCiAgZm9yIGo9MCwxMjcgZG8KICAgc2V0X2Zsb29yKGksaiwwKQogIGVuZAogZW5kCiAgCiBk
-b29ycz17fQogb2JqZWN0cz17fQogYW5pbWF0ZWRfb2JqZWN0cz17fQogCi0tIHotYnVmZmVyIGFu
-ZCBmcmFtZS1zdGFtcCBhcyB0eXBlZCB1c2VyZGF0YSBmb3Igc3BlZWQKLS0gemJ1ZjogcGVyLWNv
-bHVtbiBkZXB0aCB2YWx1ZXMgKG9uZSB6IHBlciBzY3JlZW4geCk7IHpzdGFtcDogZnJhbWUtc3Rh
-bXAgdG8gYXZvaWQgcGVyLWZyYW1lIGNsZWFycwogemJ1Zj11c2VyZGF0YSgiZjY0Iiwgc2NyZWVu
-X3dpZHRoKQogenN0YW1wPXVzZXJkYXRhKCJpMzIiLCBzY3JlZW5fd2lkdGgpCiBmb3IgaT0wLHNj
-cmVlbl93aWR0aC0xIGRvCiAgLS0gaW5pdGlhbGl6ZSBzdGFtcHMgdG8gMDsgeiB2YWx1ZXMgYXJl
-IGNvbnNpZGVyZWQgaW52YWxpZCB1bnRpbCBzdGFtcGVkCiAgenN0YW1wOnNldChpLCAwKQogZW5k
-CiAKIC0tIGR5bmFtaWMgYnVkZ2V0cwogYWN0aXZlX3JheV9jb3VudD1yYXlfY291bnQKIHJvd19z
-dHJpZGVfZHluYW1pYz1yb3dfc3RyaWRlCiAKIC0tIENvbnZlcnQgdG8gdXNlcmRhdGEgZm9yIDI0
-eCBwZXJmb3JtYW5jZSBnYWluIChQaWNvdHJvbiBvcHRpbWl6YXRpb24gZ3VpZGVsaW5lKQogcmF5
-X3ogPSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQogcmF5X3gwID0gdXNlcmRhdGEoImkxNiIs
-IHJheV9jb3VudCkKIHJheV94MSA9IHVzZXJkYXRhKCJpMTYiLCByYXlfY291bnQpCiByYXlfZHgg
-PSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQogcmF5X2R5ID0gdXNlcmRhdGEoImY2NCIsIHJh
-eV9jb3VudCkKIHJheV9oaXR4ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIHJheV9oaXR5
-ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIAogLS0gUHJlY29tcHV0ZWQgcGl4ZWwgY2Vu
-dGVycyBmb3IgY2FtZXJhLXNwYWNlIHJheSBvZmZzZXRzIChlbGltaW5hdGVzIHBlci1mcmFtZSBj
-b21wdXRhdGlvbikKIHJheV9weF9jZW50ZXIgPSB1c2VyZGF0YSgiZjY0IiwgcmF5X2NvdW50KQog
-CiAtLSBJbml0aWFsaXplIHdpdGggZGVmYXVsdHMKIGZvciBpPTAscmF5X2NvdW50LTEgZG8KICAg
-cmF5X3o6c2V0KGksIDk5OSkKICAgcmF5X3gwOnNldChpLCAwKQogICByYXlfeDE6c2V0KGksIDAp
-CiAgIHJheV9keDpzZXQoaSwgMCkKICAgcmF5X2R5OnNldChpLCAwKQogZW5kCiAKIC0tIHJidWY6
-IHVzZSBzZXBhcmF0ZSB1c2VyZGF0YSBhcnJheXMgZm9yIHRpbGUgYW5kIHR4IChhdm9pZCBuZXN0
-ZWQgc3RydWN0dXJlcykKIHJidWZfdGlsZSA9IHVzZXJkYXRhKCJpMTYiLCByYXlfY291bnQpCiBy
-YnVmX3R4ID0gdXNlcmRhdGEoImY2NCIsIHJheV9jb3VudCkKIGZvciBpPTAscmF5X2NvdW50LTEg
-ZG8KICAgcmJ1Zl90aWxlOnNldChpLCAwKQogICByYnVmX3R4OnNldChpLCAwKQogZW5kCiAKIC0t
-IGZvZyBzdGF0ZSBmb3IgaHlzdGVyZXNpcwogbGFzdF9mb2dfej0wCiAKIC0tIHByb2plY3Rpb24g
-Y29uc3RhbnQgZGVmaW5lZCBpbiBjb25maWcubHVhCiAKIC0tIGZsb29yIGFuZCByb29mIHN0YXRl
-CiBmbG9vcj17dHlwPXBsYW5ldHlwc1sxXSx4PTAseT0wfQogcm9vZj17dHlwPXBsYW5ldHlwc1sz
-XSx4PTAseT0wfQogCiBnZW5fc3RhdHM9e3Jvb21zPTAsb2JqZWN0cz0wLHNlZWQ9MCxoaXN0b3J5
-PXt9fQogc3RhcnRfcG9zPXt4PXBsYXllci54LHk9cGxheWVyLnl9CiAtLSBtb2RlOiAzZCBvciAy
-ZCBtYXAKIHZpZXdfbW9kZT0iM2QiCiAKIC0tIGRlYnVnIG1vZGUgZm9yIHJheSBjYXN0aW5nCiBk
-ZWJ1Z19tb2RlPWZhbHNlCnNob3dfZGlhZ25vc3RpY3M9ZmFsc2UKZW5hYmxlX2RpYWdub3N0aWNz
-X2xvZ2dpbmc9ZmFsc2UgIC0tIFBlcm1hbmVudGx5IGRpc2FibGVkIGZvciBwcm9kdWN0aW9uIHBl
-cmZvcm1hbmNlCi0tIE9wdGlvbmFsOiByZS1lbmFibGUgYSBub24tcmVuZGVyIENQVSBnb3Zlcm5v
-ciAoc2FtcGxlcyBDUFUgb3V0c2lkZSBfZHJhdygpKQplbmFibGVfbm9ucmVuZGVyX2dvdmVybm9y
-PWZhbHNlCnJlY2VudF9jcHU9MAogCiAtLSBwZXJmb3JtYW5jZSB2YWxpZGF0aW9uIG1vZGU6IGRp
-c2FibGVzIENQVSBnb3Zlcm5vciB0byBzdGFiaWxpemUgbWVhc3VyZW1lbnRzCiBwZXJmX3ZhbGlk
-YXRpb249ZmFsc2UKIAogLS0gZGlhZ25vc3RpYyBjb3VudGVycyBmb3IgcGVyZm9ybWFuY2UgdHJh
-Y2tpbmcgKHJlZnJlc2hlZCBlYWNoIGZyYW1lKQogZGlhZ19mcmFtZV9jb3VudD0wCiBkaWFnX3dh
-bGxfY29sdW1ucz0wCiBkaWFnX3dhbGxfbG9kX2NvbHVtbnM9MAogZGlhZ19mbG9vcl9yb3dzPTAK
-IGRpYWdfZmxvb3JfYmF0Y2hlcz0wCiBkaWFnX3Nwcml0ZV9jb2x1bW5zPTAKIGRpYWdfc3ByaXRl
-X2ltcG9zdG9yX2NvbHVtbnM9MAogZGlhZ19hY3RpdmVfcmF5cz1yYXlfY291bnQKIGxhc3RfY3B1
-X3NhbXBsZT0wCiAKIC0tIHRlc3QgZG9vciBtb2RlCiB0ZXN0X2Rvb3JfbW9kZT1mYWxzZQoKIC0t
-IGNyZWF0ZSB0aW50ZWQgZXJyb3IgdGV4dHVyZXMgZm9yIGRpZmZlcmVudCBvYmplY3QgdHlwZXMg
-KGNoZWNrZXJib2FyZCBwYXR0ZXJuKQogLS0gd2FsbHM6IG1hZ2VudGEvcGluayAoOC8xNCksIGZs
-b29yOiBibHVlL2N5YW4gKDEyLzEzKSwgY2VpbGluZzogZ3JlZW4vZGFyayBncmVlbiAoMTEvMykK
-IC0tIHNwcml0ZXM6IHllbGxvdy9vcmFuZ2UgKDEwLzkpLCBwcm9wczogcmVkL2Jyb3duICg4LzQp
-CiBlcnJvcl90ZXh0dXJlcyA9IHsKICB3YWxsID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKIGRv
-b3IgPSB1c2VyZGF0YSgidTgiLCAzMiwgMzIpLAogIGZsb29yID0gdXNlcmRhdGEoInU4IiwgMzIs
-IDMyKSwKICBjZWlsaW5nID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKICBzcHJpdGUgPSB1c2Vy
-ZGF0YSgidTgiLCAzMiwgMzIpLAogIGRlZmF1bHQgPSB1c2VyZGF0YSgidTgiLCAzMiwgMzIpCiB9
-CiAKIC0tIGdlbmVyYXRlIHRpbnRlZCBjaGVja2VyYm9hcmRzIGZvciBlYWNoIHR5cGUKIGxvY2Fs
-IHRpbnRzID0gewogIHdhbGwgPSB7OCwgMTR9LCAgICAgIC0tIG1hZ2VudGEvcGluawogZG9vciA9
-IHsyLCA2fSwgICAgICAgLS0gcHVycGxlL2JsdWUgKGRpc3RpbmN0IGZyb20gd2FsbHMpCiAgZmxv
-b3IgPSB7MTIsIDEzfSwgICAgLS0gYmx1ZS9jeWFuCiAgY2VpbGluZyA9IHsxMSwgM30sICAgLS0g
-Z3JlZW4vZGFyayBncmVlbgogIHNwcml0ZSA9IHsxMCwgOX0sICAgIC0tIHllbGxvdy9vcmFuZ2UK
-ICBkZWZhdWx0ID0gezgsIDE0fSAgICAtLSBtYWdlbnRhL3BpbmsgKGZhbGxiYWNrKQogfQogCiBm
-b3IgdHlwZV9uYW1lLCBjb2xvcnMgaW4gcGFpcnModGludHMpIGRvCiAgZm9yIHk9MCwzMSBkbwog
-ICBmb3IgeD0wLDMxIGRvCiAgICBsb2NhbCBjb2xvciA9ICgoZmxyKHgvNCkgKyBmbHIoeS80KSkg
-JSAyID09IDApIGFuZCBjb2xvcnNbMV0gb3IgY29sb3JzWzJdCiAgICBlcnJvcl90ZXh0dXJlc1t0
-eXBlX25hbWVdOnNldCh4LCB5LCBjb2xvcikKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gbWFpbnRh
-aW4gYmFja3dhcmQgY29tcGF0aWJpbGl0eSB3aXRoIHNpbmdsZSBlcnJvcl90ZXh0dXJlCiBlcnJv
-cl90ZXh0dXJlID0gZXJyb3JfdGV4dHVyZXMuZGVmYXVsdAoKIC0tIHJlc2VydmUgc3ByaXRlIGlu
-ZGV4ZXMgZm9yIGVycm9yIHRleHR1cmVzIChiYXRjaGluZyBwcmVmZXJzIHNwcml0ZSBpbmRleGVz
-KQogRVJST1JfSURYID0geyB3YWxsPTgwMDAsIGRvb3I9ODAwMSwgZmxvb3I9ODAwMiwgY2VpbGlu
-Zz04MDAzLCBzcHJpdGU9ODAwNCwgZGVmYXVsdD04MDA1IH0KIGZvciBuYW1lLCB1ZCBpbiBwYWly
-cyhlcnJvcl90ZXh0dXJlcykgZG8KICBsb2NhbCBpZHggPSBFUlJPUl9JRFhbbmFtZV0gb3IgRVJS
-T1JfSURYLmRlZmF1bHQKICBzZXRfc3ByKGlkeCwgdWQpCiBlbmQKIAogLS0gUHJlbG9hZCB0ZXh0
-dXJlIGNhY2hlIGZvciBjb21tb25seS11c2VkIHNwcml0ZXMgKDAtMjAwKQogLS0gUG9wdWxhdGUg
-dGV4X2NhY2hlIGRpcmVjdGx5IHVzaW5nIGdldF9zcHIoKSB0byBhdm9pZCB3YXJuaW5ncwogcHJp
-bnRoKCJwcmVsb2FkaW5nIHRleHR1cmUgY2FjaGUuLi4iKQogbG9jYWwgcHJlbG9hZF9zdGFydCA9
-IHRpbWUoKQogZm9yIGk9MCwyMDAgZG8KICBsb2NhbCBzcmM9Z2V0X3NwciBhbmQgZ2V0X3Nwcihp
-KQogIGlmIHNyYyBhbmQgY2FjaGVfdGV4IHRoZW4KICAgY2FjaGVfdGV4KGksIHNyYywgZmFsc2Up
-CiAgZW5kCiBlbmQKIGxvY2FsIHByZWxvYWRfdGltZSA9ICh0aW1lKCkgLSBwcmVsb2FkX3N0YXJ0
-KSAqIDEwMDAKIHByaW50aCgidGV4dHVyZSBjYWNoZSBwcmVsb2FkZWQ6ICIuLnByZWxvYWRfdGlt
-ZS4uIm1zIikKIC0tIFRyaWdnZXIgR0MgYWZ0ZXIgcHJlbG9hZGluZyAoUGljb3Ryb24gZ3VpZGVs
-aW5lOiBzdGF0KDApIGR1cmluZyBwYXVzZXMgb25seSkKIHN0YXQoMCkKIAogLS0gbG9nZ2luZyBo
-ZWxwZXI6IGNvbnNvbGUgKyByaW5nIGJ1ZmZlciBmb3Igb3B0aW9uYWwgb24tc2NyZWVuIGVjaG8K
-IGxvZ19saW5lcyA9IHt9CiBmdW5jdGlvbiBsb2coc3RyKQogIHByaW50aChzdHIpCiAgYWRkKGxv
-Z19saW5lcywgc3RyKQogIGlmICNsb2dfbGluZXMgPiAyMDAgdGhlbiBkZWxpKGxvZ19saW5lcywg
-MSkgZW5kCiBlbmQKCiAtLSB2YWxpZGF0ZSBhbGwgY29uZmlndXJlZCBzcHJpdGVzIGV4aXN0IChj
-b21tZW50IG91dCBmb3IgcHJvZHVjdGlvbikKIHZhbGlkYXRlX3Nwcml0ZV9jb25maWd1cmF0aW9u
-KCkKCiBwcmludGgoInBpY290cm9uIHJheWNhc3QgZW5naW5lIHYxLjAiKQogc3dpdGNoX3NjZW5l
-KCJtZW51IikKZW5kCgotLSB2YWxpZGF0ZSBzcHJpdGUgY29uZmlndXJhdGlvbiBhdCBzdGFydHVw
-IChvcHRpb25hbCwgY2FuIGJlIGRpc2FibGVkIGZvciBwZXJmb3JtYW5jZSkKZnVuY3Rpb24gdmFs
-aWRhdGVfc3ByaXRlX2NvbmZpZ3VyYXRpb24oKQogLS0gY2hlY2sgZW5lbXkgc3ByaXRlcwogZm9y
-IGVuZW15IGluIGFsbChlbmVteV90eXBlcykgZG8KICBpZiBub3QgZ2V0X3NwcihlbmVteS5zcHJp
-dGUpIHRoZW4KICAgcHJpbnRoKCJXQVJOSU5HOiBlbmVteSBzcHJpdGUgIi4uZW5lbXkuc3ByaXRl
-Li4iICgiLi5lbmVteS5uYW1lLi4iKSBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICBlbmQKIGVu
-ZAogCiAtLSBjaGVjayBkZWNvcmF0aW9uIHNwcml0ZXMKIGZvciBkZWMgaW4gYWxsKGRlY29yYXRp
-b25fdHlwZXMpIGRvCiAgaWYgbm90IGdldF9zcHIoZGVjLnNwcml0ZSkgdGhlbgogICBwcmludGgo
-IldBUk5JTkc6IGRlY29yYXRpb24gc3ByaXRlICIuLmRlYy5zcHJpdGUuLiIgKCIuLmRlYy5uYW1l
-Li4iKSBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICBlbmQKIGVuZAogCiAtLSBjaGVjayB3YWxs
-IHRleHR1cmUgc3ByaXRlcwogZm9yIHRleHNldCBpbiBhbGwodGV4c2V0cykgZG8KICBmb3IgdmFy
-aWFudCBpbiBhbGwodGV4c2V0LnZhcmlhbnRzKSBkbwogICBpZiBub3QgZ2V0X3Nwcih2YXJpYW50
-KSB0aGVuCiAgICBwcmludGgoIldBUk5JTkc6IHdhbGwgdGV4dHVyZSBzcHJpdGUgIi4udmFyaWFu
-dC4uIiBub3QgZm91bmQgaW4gR0ZYIGZpbGVzIikKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gY2hl
-Y2sgZmxvb3IvY2VpbGluZyBzcHJpdGVzCiBmb3IgdHlwIGluIGFsbChwbGFuZXR5cHMpIGRvCiAg
-aWYgbm90IGdldF9zcHIodHlwLnRleCkgdGhlbgogICBwcmludGgoIldBUk5JTkc6IGZsb29yL2Nl
-aWxpbmcgc3ByaXRlICIuLnR5cC50ZXguLiIgbm90IGZvdW5kIGluIEdGWCBmaWxlcyIpCiAgZW5k
-CiBlbmQKZW5kCgpmdW5jdGlvbiB1cGRhdGVfZ2FtZXBsYXkoKQogLS0gaW5jcmVtZW50IGZyYW1l
-IGNvdW50ZXIKIGZyYW1lX2N0Kz0xCiAKIC0tIG9wdGlvbmFsOiBzYW1wbGUgQ1BVIG91dHNpZGUg
-cmVuZGVyIGZyYW1lIChldmVyeSAzMCBmcmFtZXMpIGZvciBub24tcmVuZGVyIGdvdmVybm9yCiBp
-ZiBlbmFibGVfbm9ucmVuZGVyX2dvdmVybm9yIGFuZCAoZnJhbWVfY3QlMzA9PTApIHRoZW4KICBy
-ZWNlbnRfY3B1PXN0YXQoMSkgb3IgMAogZW5kCiAKIC0tIGNvbWJhdCBnYXRpbmc6IHNraXAgbm9y
-bWFsIHVwZGF0ZXMgd2hlbiBpbiBjb21iYXQKIGlmIGluX2NvbWJhdCB0aGVuCiAgdXBkYXRlX2Nv
-bWJhdCgpCiAgcmV0dXJuCiBlbmQKIAogdXBkYXRlX2lucHV0KCkKIHVwZGF0ZV9kb29ycygpCiAK
-IC0tIHVwZGF0ZSBucGMgYWkgKHJhdGUgbGltaXRlZCwgZGV0ZXJtaW5pc3RpYyBmcmFtZSBjaGVj
-aykKIGlmIGZyYW1lX2N0JWFpX3VwZGF0ZV9yYXRlPT0wIHRoZW4KICB1cGRhdGVfbnBjX2FpKCkK
-IGVuZAogCiBjYW09e3BsYXllci54LHBsYXllci55fQogCiAtLSB1cGRhdGUgZmxvb3IvY2VpbGlu
-ZyBzY3JvbGxpbmcKIGZsb29yLngrPWZsb29yLnR5cC54dmVsIG9yIDAKIGZsb29yLnkrPWZsb29y
-LnR5cC55dmVsIG9yIDAKIHJvb2YueCs9cm9vZi50eXAueHZlbCBvciAwCiByb29mLnkrPXJvb2Yu
-dHlwLnl2ZWwgb3IgMAogCiAtLSB1cGRhdGUgb2JqZWN0IGFuaW1hdGlvbnMKIGZvciBvYiBpbiBh
-bGwoYW5pbWF0ZWRfb2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5kIG9iLnR5cC5mcmFtZWN0IHRo
-ZW4KICAgb2IuZnJhbWUrPW9iLnR5cC5hbmltc3BkCiAgIGlmIG9iLmFuaW1sb29wIHRoZW4KICAg
-IG9iLmZyYW1lPW9iLmZyYW1lJW9iLnR5cC5mcmFtZWN0CiAgIGVsc2UKICAgIG9iLmZyYW1lPW1p
-bihvYi5mcmFtZSxvYi50eXAuZnJhbWVjdC0xKQogICBlbmQKICBlbmQKIGVuZAogCiAtLSB0b2dn
-bGUgdmlldyBtb2RlIChkZWJ1ZyBvbmx5KQogaWYgZGVidWdfbW9kZSBhbmQgKGtleXAoIngiKSBv
-ciBidG5wKDUpKSB0aGVuCiAgdmlld19tb2RlPXZpZXdfbW9kZT09IjNkIiBhbmQgIjJkIiBvciAi
-M2QiCiBlbmQKIAogLS0gZGVidWcgbW9kZSB0b2dnbGUgKG1vdmVkIGZyb20gYnRucCg0KSB0byBh
-dm9pZCBjb25mbGljdCkKIGlmIGtleXAoInRhYiIpIHRoZW4KICBkZWJ1Z19tb2RlPW5vdCBkZWJ1
-Z19tb2RlCiBlbmQKIAogLS0gZGlhZ25vc3RpY3Mgb3ZlcmxheSByZW1vdmVkOyBtZXJnZWQgaW50
-byBkZWJ1ZyBwYW5lbCAoVGFiKQogCiAtLSB0b2dnbGUgZGlhZ25vc3RpY3MgbG9nZ2luZyAoY29u
-dHJvbGxlciBidXR0b24gMTIpCiBpZiBidG5wKDEyKSB0aGVuCiAgZW5hYmxlX2RpYWdub3N0aWNz
-X2xvZ2dpbmc9bm90IGVuYWJsZV9kaWFnbm9zdGljc19sb2dnaW5nCiAgcHJpbnRoKCJEaWFnbm9z
-dGljcyBsb2dnaW5nOiAiLi50b3N0cmluZyhlbmFibGVfZGlhZ25vc3RpY3NfbG9nZ2luZykpCiBl
-bmQKIAogLS0gZGVjcmVtZW50IHRyYXAgbWVzc2FnZSB0aW1lcgogaWYgdHJhcF9tc2dfdGltZXI_
-MCB0aGVuCiAgdHJhcF9tc2dfdGltZXItPTEKIGVuZAogCiAtLSB0b2dnbGUgdGVzdCBkb29yIG1v
-ZGUgKHdoZW4gbm90IGluIDJkIG1hcCB2aWV3KQogaWYgdmlld19tb2RlPT0iM2QiIGFuZCAoa2V5
-cCgidiIpIG9yIGJ0bnAoMTUpKSB0aGVuCiAgdGVzdF9kb29yX21vZGU9bm90IHRlc3RfZG9vcl9t
-b2RlCiBlbmQKIAogLS0gY3ljbGUgdGVzdCBkb29yIG9wZW4gdmFsdWUgKDAuMCB0byAxLjApCiBp
-ZiB0ZXN0X2Rvb3JfbW9kZSB0aGVuCiAgaWYga2V5cCgiYyIpIHRoZW4KICAgdGVzdF9kb29yX29w
-ZW49KHRlc3RfZG9vcl9vcGVuIG9yIDApKzAuMQogICBpZiB0ZXN0X2Rvb3Jfb3Blbj4xIHRoZW4g
-dGVzdF9kb29yX29wZW49MCBlbmQKICBlbmQKICBpZiBrZXlwKCJkIikgdGhlbgogICB0ZXN0X2Rv
-b3Jfb3Blbj0odGVzdF9kb29yX29wZW4gb3IgMCktMC4xCiAgIGlmIHRlc3RfZG9vcl9vcGVuPDAg
-dGhlbiB0ZXN0X2Rvb3Jfb3Blbj0xIGVuZAogIGVuZAogZW5kCiAKIC0tIGN5Y2xlIGZsb29yIHR5
-cGUgKGZvciB0ZXN0aW5nKSB3aGVuIG5vdCBpbiBkb29yIHRlc3QgbW9kZQogaWYgbm90IHRlc3Rf
-ZG9vcl9tb2RlIGFuZCBrZXlwKCJjIikgdGhlbgogIGxvY2FsIGN1cnJlbnRfaWR4PTEKICBmb3Ig
-aT0xLCNwbGFuZXR5cHMgZG8KICAgaWYgcGxhbmV0eXBzW2ldLnRleD09Zmxvb3IudHlwLnRleCB0
-aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQKICBlbmQKICBmbG9vci50eXA9
-cGxhbmV0eXBzWyhjdXJyZW50X2lkeCAlICNwbGFuZXR5cHMpKzFdCiAgZmxvb3IueCxmbG9vci55
-PTAsMAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBjeWNsaW5nIGZsb29yIHR5cGVz
-IChjYW4gYmUgZGlzYWJsZWQgaW4gcHJvZHVjdGlvbikKICBpZiBjbGVhcl90ZXh0dXJlX2NhY2hl
-cyB0aGVuIGNsZWFyX3RleHR1cmVfY2FjaGVzKCkgZW5kCiBlbmQKIAogLS0gY3ljbGUgcm9vZiB0
-eXBlIChmb3IgdGVzdGluZykgd2hlbiBub3QgaW4gZG9vciB0ZXN0IG1vZGUKIGlmIG5vdCB0ZXN0
-X2Rvb3JfbW9kZSBhbmQga2V5cCgiZCIpIHRoZW4KICBsb2NhbCBjdXJyZW50X2lkeD0xCiAgZm9y
-IGk9MSwjcGxhbmV0eXBzIGRvCiAgIGlmIHBsYW5ldHlwc1tpXS50ZXg9PXJvb2YudHlwLnRleCB0
-aGVuCiAgICBjdXJyZW50X2lkeD1pCiAgICBicmVhawogICBlbmQKICBlbmQKICByb29mLnR5cD1w
-bGFuZXR5cHNbKGN1cnJlbnRfaWR4ICUgI3BsYW5ldHlwcykrMV0KICByb29mLngscm9vZi55PTAs
-MAogIC0tIFRlc3QgbW9kZTogY2xlYXIgY2FjaGUgd2hlbiBjeWNsaW5nIHJvb2YgdHlwZXMgKGNh
-biBiZSBkaXNhYmxlZCBpbiBwcm9kdWN0aW9uKQogIGlmIGNsZWFyX3RleHR1cmVfY2FjaGVzIHRo
-ZW4gY2xlYXJfdGV4dHVyZV9jYWNoZXMoKSBlbmQKIGVuZAogCiAtLSBkZWJ1ZyByYXkgY2FzdGlu
-ZwogIGlmIGRlYnVnX21vZGUgdGhlbgogICBsb2NhbCBzYSxjYT1zaW4ocGxheWVyLmEpLGNvcyhw
-bGF5ZXIuYSkKICAgbG9jYWwgeixoeCxoeSx0aWxlLHR4PXJheWNhc3QocGxheWVyLngscGxheWVy
-LnksY2Esc2Esc2EsY2EpCiAgIHByaW50aCgiZGVidWc6IHo9Ii4uKGZscih6KjEwMCkvMTAwKS4u
-IiBoeD0iLi4oZmxyKGh4KjEwMCkvMTAwKS4uIiBoeT0iLi4oZmxyKGh5KjEwMCkvMTAwKS4uIiB0
-aWxlPSIuLnRpbGUuLiIgdHg9Ii4uKGZscih0eCoxMDApLzEwMCkpCiAgIGxvY2FsIG9iLGRpc3Q9
-aGl0c2NhbihwbGF5ZXIueCxwbGF5ZXIueSxjYSxzYSkKICAgaWYgb2IgdGhlbgogICAgcHJpbnRo
-KCJkZWJ1Zzogb2JqIGZvdW5kIGF0IGRpc3Q9Ii4uKGZscihkaXN0KjEwMCkvMTAwKS4uIiBraW5k
-PSIuLihvYi5raW5kIG9yICJ1bmtub3duIikpCiAgIGVsc2UKICAgIHByaW50aCgiZGVidWc6IG5v
-IG9iaiBoaXQiKQogICBlbmQKICBlbmQKZW5kCgpmdW5jdGlvbiBkcmF3X2dhbWVwbGF5KCkKIGNs
-aXAoMCwwLHNjcmVlbl93aWR0aCxzY3JlZW5faGVpZ2h0KQogY2xzKDApCiAKIGxvY2FsIGZyYW1l
-X3N0YXJ0PXRpbWUoKQogCiBkaWFnX2ZyYW1lX2NvdW50Kz0xCiAKLS0gcmVzZXQgcGVyLWZyYW1l
-IGRpYWdub3N0aWNzCmRpYWdfd2FsbF9jb2x1bW5zPTAKZGlhZ193YWxsX2xvZF9jb2x1bW5zPTAK
-ZGlhZ19mbG9vcl9yb3dzPTAKZGlhZ19mbG9vcl9iYXRjaGVzPTAKZGlhZ19zcHJpdGVfY29sdW1u
-cz0wCmRpYWdfc3ByaXRlX2ltcG9zdG9yX2NvbHVtbnM9MAoKLS0gRW5zdXJlIGFkYXB0aXZlIGNv
-bnRyb2xzIGFyZSBpbml0aWFsaXplZCBvbmNlCmlmIG5vdCBhY3RpdmVfcmF5X2NvdW50IHRoZW4g
-YWN0aXZlX3JheV9jb3VudD1yYXlfY291bnQgZW5kCmlmIG5vdCByb3dfc3RyaWRlX2R5bmFtaWMg
-dGhlbiByb3dfc3RyaWRlX2R5bmFtaWM9cm93X3N0cmlkZSBlbmQKCmxvY2FsIGZ1bmN0aW9uIGFk
-anVzdF9yYXlfYnVkZ2V0KGNwdV9zYW1wbGUpCiBsb2NhbCBtaW5fcmF5cz1tYXgoNDgsIGZscihy
-YXlfY291bnQqMC4yNSkpCiBpZiBjcHVfc2FtcGxlPjAuOTAgdGhlbgogIGFjdGl2ZV9yYXlfY291
-bnQ9bWF4KG1pbl9yYXlzLCBhY3RpdmVfcmF5X2NvdW50LTE2KQogZWxzZWlmIGNwdV9zYW1wbGU8
-MC43MCB0aGVuCiAgYWN0aXZlX3JheV9jb3VudD1taW4ocmF5X2NvdW50LCBhY3RpdmVfcmF5X2Nv
-dW50KzgpCiBlbmQKZW5kCgotLSBDb250aW51b3VzIENQVSBzYW1wbGluZyBmb3IgYWRhcHRpdmUg
-YnVkZ2V0CmxvY2FsIGNwdV9zYW1wbGUgPSBzdGF0KDEpIG9yIGxhc3RfY3B1X3NhbXBsZSBvciAw
-CmlmIG5vdCBwZXJmX3ZhbGlkYXRpb24gYW5kIG5vdCBlbmFibGVfbm9ucmVuZGVyX2dvdmVybm9y
-IHRoZW4KIGFkanVzdF9yYXlfYnVkZ2V0KGNwdV9zYW1wbGUpCmVuZAoKLS0gT3B0aW9uYWwgbm9u
-LXJlbmRlciBnb3Zlcm5vcjogdXNlcyBDUFUgc2FtcGxlZCBpbiBfdXBkYXRlKCkKaWYgZW5hYmxl
-X25vbnJlbmRlcl9nb3Zlcm5vciB0aGVuCiBhZGp1c3RfcmF5X2J1ZGdldChyZWNlbnRfY3B1IG9y
-IGNwdV9zYW1wbGUpCmVuZApsYXN0X2NwdV9zYW1wbGU9Y3B1X3NhbXBsZQpkaWFnX2FjdGl2ZV9y
-YXlzPWFjdGl2ZV9yYXlfY291bnQKIAogLS0gei1idWZmZXIgaGVscGVycyAodXNlIGZyYW1lLXN0
-YW1wLCBkZWZpbmVkIG9uY2UpCiBpZiBub3QgenJlYWQgdGhlbgogIGZ1bmN0aW9uIHpyZWFkKHgp
-CiAgIC0tIHggaXMgMC1iYXNlZDsgcmV0dXJuIDk5OSB1bmxlc3Mgc3RhbXBlZCB0aGlzIGZyYW1l
-CiAgIGxvY2FsIHN0YW1wPXpzdGFtcDpnZXQoeCkgb3IgMAogICBpZiBzdGFtcD09ZGlhZ19mcmFt
-ZV9jb3VudCB0aGVuCiAgICBsb2NhbCB6PXpidWY6Z2V0KHgpCiAgICByZXR1cm4geiBvciA5OTkK
-ICAgZW5kCiAgIHJldHVybiA5OTkKICBlbmQKICBmdW5jdGlvbiB6d3JpdGUoeCx6KQogICB6YnVm
-OnNldCh4LHopCiAgIHpzdGFtcDpzZXQoeCxkaWFnX2ZyYW1lX2NvdW50KQogIGVuZAogZW5kCiAK
-IC0tIGNhY2hlIHNpbi9jb3MgZm9yIGVudGlyZSBmcmFtZSB0byBhdm9pZCByZWNvbXB1dGF0aW9u
-CiBzYV9jYWNoZWQ9c2luKHBsYXllci5hKQogY2FfY2FjaGVkPWNvcyhwbGF5ZXIuYSkKIAogaWYg
-dmlld19tb2RlPT0iM2QiIHRoZW4KICByYXljYXN0X3NjZW5lKCkKICBsb2NhbCB0X3JheWNhc3Q9
-dGltZSgpCiAgcmVuZGVyX2Zsb29yX2NlaWxpbmcoKSAgLS0gTm93IGluY2x1ZGVzIHdhbGwgcmVu
-ZGVyaW5nCiAgbG9jYWwgdF9mbG9vcl93YWxscz10aW1lKCkKICByZW5kZXJfc3ByaXRlcygpCiAg
-bG9jYWwgdF9zcHJpdGVzPXRpbWUoKQogIAogIGxvY2FsIG1zX3JheWNhc3Q9KHRfcmF5Y2FzdC1m
-cmFtZV9zdGFydCkqMTAwMAogIGxvY2FsIG1zX2Zsb29yX3dhbGxzPSh0X2Zsb29yX3dhbGxzLXRf
-cmF5Y2FzdCkqMTAwMAogIGxvY2FsIG1zX3Nwcml0ZXM9KHRfc3ByaXRlcy10X2Zsb29yX3dhbGxz
-KSoxMDAwCiAgbG9jYWwgZnJhbWVfbXM9KHRfc3ByaXRlcy1mcmFtZV9zdGFydCkqMTAwMAogIAog
-IC0tIGh1ZCAobWluaW1hbCkKICBwcmludCgicG9zOiIuLmZscihwbGF5ZXIueCkuLiIsIi4uZmxy
-KHBsYXllci55KSwyLDIsNykKICBwcmludCgiYW5nOiIuLihmbHIocGxheWVyLmEqMTAwKS8xMDAp
-LDIsMTAsNykKICBwcmludCgiZnBzOiIuLnN0YXQoNyksMiwxOCw3KQogIHByaW50KCJocDoiLi5w
-bGF5ZXIuaHAsMiwyNiw3KQogIAogIC0tIGludGVyYWN0aW9uIHByb21wdAogIGlmIGludGVyYWN0
-aW9uX2FjdGl2ZSBhbmQgY3VycmVudF9pbnRlcmFjdCB0aGVuCiAgIHByaW50KCJbRV0vWjogaW50
-ZXJhY3QiLHNjcmVlbl9jZW50ZXJfeC00MCxzY3JlZW5faGVpZ2h0LTIwLDExKQogIGVuZAogIAog
-IC0tIHRyYXAgbWVzc2FnZQogIGlmIHRyYXBfbXNnX3RpbWVyPjAgdGhlbgogICBwcmludCgidHJh
-cCBzcHJ1bmchIixzY3JlZW5fY2VudGVyX3gtMzAsc2NyZWVuX2NlbnRlcl95LDgpCiAgZW5kCiAg
-CiAtLVtbIERFQlVHIFBBTkVMIFJFTU9WRUQgRk9SIFBST0RVQ1RJT04gUEVSRk9STUFOQ0UKIGlm
-IGRlYnVnX21vZGUgdGhlbgogIC0tIHJlbW92ZWQKIGVuZAogXV0KICAKIC0tW1sgUEVSSU9ESUMg
-TE9HR0lORyBSRU1PVkVEIEZPUiBQUk9EVUNUSU9OIFBFUkZPUk1BTkNFCiBpZiBlbmFibGVfZGlh
-Z25vc3RpY3NfbG9nZ2luZyBhbmQgZGlhZ19mcmFtZV9jb3VudCU2MD09MCB0aGVuCiAgLS0gcmVt
-b3ZlZAogZW5kCiBdXQogIAogIC0tIG1pbmltYXAgSFVEIG92ZXJsYXkKICBkcmF3X21pbmltYXBf
-aHVkKCkKIGVsc2UKICBkcmF3X21pbmltYXAoKQogZW5kCiAKIC0tIGNvbWJhdCBvdmVybGF5CiBp
-ZiBpbl9jb21iYXQgdGhlbgogIHJlY3RmaWxsKDAsc2NyZWVuX2hlaWdodC00MCxzY3JlZW5fd2lk
-dGgsc2NyZWVuX2hlaWdodCwwKQogIHByaW50KCJlbnRlcmluZyBjb21iYXQuLi4iLHNjcmVlbl9j
-ZW50ZXJfeC00MCxzY3JlZW5fY2VudGVyX3ksOCkKICBwcmludCgiW2VudGVyXSBleGl0ICh0ZW1w
-KSIsc2NyZWVuX2NlbnRlcl94LTQwLHNjcmVlbl9jZW50ZXJfeSsxMCw3KQogZW5kCiAKIC0tIHJl
-c3RvcmUgcGFsZXR0ZSBmcm9tIGZvZyByZW1hcHBpbmcgKHNpbmdsZSByZXN0b3JlIHBlciBmcmFt
-ZSkKIHBhbCgpCiAtLSByZXNldCBmb2cgc3RhdGUgc28gZmlyc3Qgc2V0X2ZvZyBhcHBsaWVzIG1h
-cHBpbmcgbmV4dCBmcmFtZQogbGFzdF9mb2dfbGV2ZWw9LTEKIHByZXZfcGFsPXt9CgppZiBkZWJ1
-Z19tb2RlIHRoZW4KIGRyYXdfZGlhZ25vc3RpY3NfcGFuZWwoZnJhbWVfbXMsIGNwdV9zYW1wbGUp
-CiBlbmQKZW5kCgpmdW5jdGlvbiBkcmF3X2RpYWdub3N0aWNzX3BhbmVsKGZyYW1lX21zLCBjcHVf
-c2FtcGxlKQogZnJhbWVfbXMgPSBmcmFtZV9tcyBvciAwCiBjcHVfc2FtcGxlID0gY3B1X3NhbXBs
-ZSBvciBsYXN0X2NwdV9zYW1wbGUgb3IgMAogbG9jYWwgY3B1X3BjdD1mbHIoY3B1X3NhbXBsZSox
-MDAwKzAuNSkvMTAKIGxvY2FsIGZyYW1lX21zX2ZtdD1mbHIoZnJhbWVfbXMqMTArMC41KS8xMAog
-bG9jYWwgcmF5c190ZXh0PShkaWFnX2FjdGl2ZV9yYXlzIG9yIGFjdGl2ZV9yYXlfY291bnQgb3Ig
-MCkgLi4gIi8iIC4uIHJheV9jb3VudAogbG9jYWwgd2FsbF90ZXg9ZGlhZ193YWxsX2NvbHVtbnMg
-b3IgMAogbG9jYWwgd2FsbF9sb2Q9ZGlhZ193YWxsX2xvZF9jb2x1bW5zIG9yIDAKIGxvY2FsIHdh
-bGxfdG90YWw9d2FsbF90ZXgrd2FsbF9sb2QKIGxvY2FsIGxvZF9wY3Q9d2FsbF90b3RhbD4wIGFu
-ZCBmbHIoKHdhbGxfbG9kL3dhbGxfdG90YWwpKjEwMCswLjUpIG9yIDAKIGxvY2FsIGxpbmVzPXsK
-ICB7dGV4dD0iZGlhZzogbWV0cmljcyIsY29sb3I9MTF9LAogIHt0ZXh0PSJmcmFtZV9tczogIi4u
-ZnJhbWVfbXNfZm10LGNvbG9yPTExfSwKICB7dGV4dD0iY3B1JTogIi4uY3B1X3BjdCxjb2xvcj0g
-Y3B1X3BjdD45MCBhbmQgOCBvciAoY3B1X3BjdD43MCBhbmQgMTAgb3IgMTEpfSwKICB7dGV4dD0i
-cmF5czogIi4ucmF5c190ZXh0LGNvbG9yPTd9LAogIHt0ZXh0PSJyb3dfc3RyaWRlOiAiLi4ocm93
-X3N0cmlkZV9keW5hbWljIG9yIHJvd19zdHJpZGUpLGNvbG9yPTd9LAogIHt0ZXh0PSJmbG9vciBy
-b3dzOiAiLi4oZGlhZ19mbG9vcl9yb3dzIG9yIDApLGNvbG9yPTd9LAogIHt0ZXh0PSJmbG9vciBk
-cmF3czogIi4uKGRpYWdfZmxvb3JfYmF0Y2hlcyBvciAwKSxjb2xvcj03fSwKICB7dGV4dD0id2Fs
-bCB0ZXg6ICIuLndhbGxfdGV4LGNvbG9yPTd9LAogIHt0ZXh0PSJ3YWxsIGxvZDogIi4ud2FsbF9s
-b2QuLiIgKCIuLmxvZF9wY3QuLiIlKSIsY29sb3I9N30sCiAge3RleHQ9InNwcml0ZSB0ZXg6ICIu
-LihkaWFnX3Nwcml0ZV9jb2x1bW5zIG9yIDApLGNvbG9yPTd9LAogIHt0ZXh0PSJzcHJpdGUgbG9k
-OiAiLi4oZGlhZ19zcHJpdGVfaW1wb3N0b3JfY29sdW1ucyBvciAwKSxjb2xvcj03fQogfQogbG9j
-YWwgbWF4X2xlbj0wCiBmb3IgZW50cnkgaW4gYWxsKGxpbmVzKSBkbwogIGlmICNlbnRyeS50ZXh0
-Pm1heF9sZW4gdGhlbiBtYXhfbGVuPSNlbnRyeS50ZXh0IGVuZAogZW5kCiBsb2NhbCBwYW5lbF94
-PTQKIGxvY2FsIHBhbmVsX3k9ODAKIGxvY2FsIHBhbmVsX3c9bWF4X2xlbio0KzYKIGxvY2FsIHBh
-bmVsX2g9I2xpbmVzKjgrNgogcmVjdGZpbGwocGFuZWxfeC0yLHBhbmVsX3ktMixwYW5lbF94K3Bh
-bmVsX3cscGFuZWxfeStwYW5lbF9oLDEpCiByZWN0KHBhbmVsX3gtMyxwYW5lbF95LTMscGFuZWxf
-eCtwYW5lbF93KzEscGFuZWxfeStwYW5lbF9oKzEsNykKIGZvciBpPTEsI2xpbmVzIGRvCiAgbG9j
-YWwgZW50cnk9bGluZXNbaV0KICBwcmludChlbnRyeS50ZXh0LHBhbmVsX3gscGFuZWxfeSsoaS0x
-KSo4LGVudHJ5LmNvbG9yKQogZW5kCmVuZAoKbG9jYWwgZnVuY3Rpb24gZ2VuZXJhdGVfbGFiX2R1
-bmdlb24oc3RhdGUsc2VlZCkKIGxvY2FsIHRhcmdldF9zZWVkPXNlZWQgb3IgKDErZmxyKHJuZCg5
-OTk5OTkpKSkKIGlmIHRhcmdldF9zZWVkPDEgdGhlbiB0YXJnZXRfc2VlZD0xIGVuZAogc3RhcnRf
-cG9zLGdlbl9zdGF0cz1nZW5lcmF0ZV9kdW5nZW9uKHtzZWVkPXRhcmdldF9zZWVkfSkKIHN0YXRl
-LnNlZWQ9Z2VuX3N0YXRzLnNlZWQKIHN0YXRlLmdlbl9zdGF0cz1nZW5fc3RhdHMKIHN0YXRlLmhp
-c3Rvcnk9Z2VuX3N0YXRzLmhpc3Rvcnkgb3Ige30KIHN0YXRlLmhpc3RvcnlfY3Vyc29yPW1heCgw
-LCNzdGF0ZS5oaXN0b3J5LTIwKQogc3RhdGUuaGFybmVzc19yZXN1bHQ9c3RhdGUuaGFybmVzc19y
-ZXN1bHQgb3IgbmlsCiB2aWV3X21vZGU9IjJkIgplbmQKCmxvY2FsIGZ1bmN0aW9uIGRyYXdfbGFi
-X21hcChzdGF0ZSkKIGxvY2FsIHNjYWxlPTMKIGxvY2FsIG94PTgKIGxvY2FsIG95PTgKIGxvY2Fs
-IG1hcF9weD1tYXBfc2l6ZSpzY2FsZQogcmVjdGZpbGwoMCwwLHNjcmVlbl93aWR0aC0xLHNjcmVl
-bl9oZWlnaHQtMSwwKQogcmVjdGZpbGwob3gtMixveS0yLG94K21hcF9weCsxLG95K21hcF9weCsx
-LDEpCiBmb3IgeD0wLG1hcF9zaXplLTEgZG8KICBmb3IgeT0wLG1hcF9zaXplLTEgZG8KICAgbG9j
-YWwgd2FsbD1nZXRfd2FsbCh4LHkpCiAgIGxvY2FsIGZsb29yX3ZhbD1nZXRfZmxvb3IoeCx5KQog
-ICBsb2NhbCBjb2xvcgogICBpZiB3YWxsPjAgdGhlbgogICAgY29sb3I9NQogICBlbHNlaWYgZmxv
-b3JfdmFsPjAgdGhlbgogICAgY29sb3I9NgogICBlbHNlCiAgICBjb2xvcj0wCiAgIGVuZAogICBy
-ZWN0ZmlsbChveCt4KnNjYWxlLG95K3kqc2NhbGUsb3greCpzY2FsZStzY2FsZS0xLG95K3kqc2Nh
-bGUrc2NhbGUtMSxjb2xvcikKICBlbmQKIGVuZAogZm9yIG5vZGUgaW4gYWxsKGdlbl9ub2Rlcykg
-ZG8KICBsb2NhbCByPW5vZGUucmVjdAogIHJlY3Qob3grclsxXSpzY2FsZSxveStyWzJdKnNjYWxl
-LG94K3JbM10qc2NhbGUsb3krcls0XSpzY2FsZSwxMSkKIGVuZAogZm9yIGVkZ2UgaW4gYWxsKGdl
-bl9lZGdlcykgZG8KICBsb2NhbCBjPWVkZ2UubG9ja2VkIGFuZCA4IG9yIDEyCiAgbG9jYWwgeDE9
-b3grZWRnZS5uMS5taWR4KnNjYWxlCiAgbG9jYWwgeTE9b3krZWRnZS5uMS5taWR5KnNjYWxlCiAg
-bG9jYWwgeDI9b3grZWRnZS5uMi5taWR4KnNjYWxlCiAgbG9jYWwgeTI9b3krZWRnZS5uMi5taWR5
-KnNjYWxlCiAgbGluZSh4MSx5MSx4Mix5MixjKQogIGlmIGVkZ2UuYjEgdGhlbgogICByZWN0Zmls
-bChveCtlZGdlLmIxLngqc2NhbGUsb3krZWRnZS5iMS55KnNjYWxlLG94K2VkZ2UuYjEueCpzY2Fs
-ZStzY2FsZS0xLG95K2VkZ2UuYjEueSpzY2FsZStzY2FsZS0xLGMpCiAgZW5kCiAgaWYgZWRnZS5i
-MiB0aGVuCiAgIHJlY3RmaWxsKG94K2VkZ2UuYjIueCpzY2FsZSxveStlZGdlLmIyLnkqc2NhbGUs
-b3grZWRnZS5iMi54KnNjYWxlK3NjYWxlLTEsb3krZWRnZS5iMi55KnNjYWxlK3NjYWxlLTEsYykK
-ICBlbmQKIGVuZAogZm9yIGRvb3IgaW4gYWxsKGRvb3JzKSBkbwogIGxvY2FsIGM9ZG9vci5kdHlw
-ZT09ZG9vcl9sb2NrZWQgYW5kIDggb3IgMTAKICByZWN0ZmlsbChveCtkb29yLngqc2NhbGUsb3kr
-ZG9vci55KnNjYWxlLG94K2Rvb3IueCpzY2FsZStzY2FsZS0xLG95K2Rvb3IueSpzY2FsZStzY2Fs
-ZS0xLGMpCiBlbmQKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi5wb3MgdGhlbgog
-ICBsb2NhbCBjeD1veCtvYi5wb3NbMV0qc2NhbGUKICAgbG9jYWwgY3k9b3krb2IucG9zWzJdKnNj
-YWxlCiAgIGxvY2FsIGNvbG9yPTcKICAgaWYgb2IudHlwPT1vYmpfdHlwZXMua2V5IHRoZW4gY29s
-b3I9OQogICBlbHNlaWYgb2IudHlwPT1vYmpfdHlwZXMuaG9zdGlsZV9ucGMgdGhlbiBjb2xvcj04
-CiAgIGVsc2VpZiBvYi50eXA9PW9ial90eXBlcy5ub25faG9zdGlsZV9ucGMgdGhlbiBjb2xvcj0x
-MwogICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVyYWN0YWJsZSIgdGhlbiBj
-b2xvcj0xMgogICBlbmQKICAgY2lyY2ZpbGwoY3gsY3ksMSxjb2xvcikKICBlbmQKIGVuZAogcHJp
-bnQoInNlZWQ6Ii4uKHN0YXRlLnNlZWQgb3IgIj8iKSxveCttYXBfcHgrOCxveSw3KQogcHJpbnQo
-InJvb21zOiIuLigjZ2VuX25vZGVzIG9yIDApLG94K21hcF9weCs4LG95KzgsNykKIGxvY2FsIGxv
-Y2tlZF9jb3VudD0wCiBpZiBnZW5fbG9ja2VkX2VkZ2VzIHRoZW4KICBmb3IgZSBpbiBhbGwoZ2Vu
-X2xvY2tlZF9lZGdlcykgZG8KICAgaWYgZS5sb2NrZWQgdGhlbiBsb2NrZWRfY291bnQrPTEgZW5k
-CiAgZW5kCiBlbmQKIHByaW50KCJsb2NrZWQgZWRnZXM6Ii4ubG9ja2VkX2NvdW50LG94K21hcF9w
-eCs4LG95KzE2LDcpCiBwcmludCgiW3pdIHJhbmRvbSAgW3hdIHJlcGxheSAgW_KGkC-ihpJdIHNl
-ZWQgIFtoXSBoYXJuZXNzICBbai9rXSBsb2cgIFttXSBtZW51Iiw4LHNjcmVlbl9oZWlnaHQtMTYs
-NykKZW5kCgpsb2NhbCBmdW5jdGlvbiBkcmF3X2xhYl9oaXN0b3J5KHN0YXRlKQogbG9jYWwgaGlz
-dG9yeT1zdGF0ZS5oaXN0b3J5IG9yIHt9CiBsb2NhbCBjdXJzb3I9c3RhdGUuaGlzdG9yeV9jdXJz
-b3Igb3IgMAogbG9jYWwgbGluZXM9MTUKIGxvY2FsIHN0YXJ0PW1heCgxLCNoaXN0b3J5LWxpbmVz
-KzEpCiBjdXJzb3I9bWF4KDAsbWluKGN1cnNvciwjaGlzdG9yeS1saW5lcykpCiBsb2NhbCB5PTI0
-CiBwcmludCgiZ2VuZXJhdGlvbiBsb2c6IixzY3JlZW5fd2lkdGgtMTQwLHksMTEpCiB5Kz04CiBm
-b3IgaT1jdXJzb3IrMSxtaW4oI2hpc3RvcnksY3Vyc29yK2xpbmVzKSBkbwogIGxvY2FsIGxpbmU9
-aGlzdG9yeVtpXQogIGlmIGxpbmUgdGhlbgogICBwcmludChzdHJpbmcuc3ViKGxpbmUsMSwyOCks
-c2NyZWVuX3dpZHRoLTE0MCx5LDcpCiAgIHkrPTgKICBlbmQKIGVuZAogc3RhdGUuaGlzdG9yeV9j
-dXJzb3I9Y3Vyc29yCiBpZiAjaGlzdG9yeT5saW5lcyB0aGVuCiAgcHJpbnQoImxvZyBzY3JvbGwg
-W0ovS10iLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC0zMiw3KQogZW5kCiBpZiBzdGF0
-ZS5oYXJuZXNzX3Jlc3VsdCB0aGVuCiAgbG9jYWwgcmVzPXN0YXRlLmhhcm5lc3NfcmVzdWx0CiAg
-bG9jYWwgZmFpbHVyZXM9cmVzLmZhaWx1cmVzIG9yIDAKICBsb2NhbCBjb2xvcj1mYWlsdXJlcz4w
-IGFuZCA4IG9yIDExCiAgcHJpbnQoImhhcm5lc3M6ICIuLihyZXMudG90YWwgb3IgMCkuLiIgc2Vl
-ZHMiLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC00OCxjb2xvcikKICBwcmludCgiZmFp
-bHVyZXM6ICIuLmZhaWx1cmVzLHNjcmVlbl93aWR0aC0xNDAsc2NyZWVuX2hlaWdodC00MCxjb2xv
-cikKIGVuZAplbmQKCnNjZW5lcy5tZW51PXsKIGVudGVyPWZ1bmN0aW9uKHN0YXRlKQogIHN0YXRl
-Lm9wdGlvbnM9eyJTdGFydCBHYW1lcGxheSIsIkR1bmdlb24gTGFiIn0KICBzdGF0ZS5pbmRleD1z
-dGF0ZS5pbmRleCBvciAxCiAgc3RhdGUubWVzc2FnZT0iIgogZW5kLAogdXBkYXRlPWZ1bmN0aW9u
-KHN0YXRlKQogIGxvY2FsIG1vdmVfdXA9YnRucCgyKSBvciBrZXlwKCJ1cCIpIG9yIGtleXAoInci
-KQogIGxvY2FsIG1vdmVfZG93bj1idG5wKDMpIG9yIGtleXAoImRvd24iKSBvciBrZXlwKCJzIikK
-ICBpZiBtb3ZlX3VwIHRoZW4KICAgc3RhdGUuaW5kZXg9bWF4KDEsc3RhdGUuaW5kZXgtMSkKICBl
-bHNlaWYgbW92ZV9kb3duIHRoZW4KICAgc3RhdGUuaW5kZXg9bWluKCNzdGF0ZS5vcHRpb25zLHN0
-YXRlLmluZGV4KzEpCiAgZW5kCgogIGxvY2FsIGNvbmZpcm09YnRucCg0KSBvciBidG5wKDUpIG9y
-IGtleXAoInoiKSBvciBrZXlwKCJ4Iikgb3Iga2V5cCgiZW50ZXIiKSBvciBrZXlwKCJyZXR1cm4i
-KQogIGlmIGNvbmZpcm0gdGhlbgogICBsb2NhbCBjaG9pY2U9c3RhdGUub3B0aW9uc1tzdGF0ZS5p
-bmRleF0KICAgaWYgY2hvaWNlPT0iU3RhcnQgR2FtZXBsYXkiIHRoZW4KICAgIHN3aXRjaF9zY2Vu
-ZSgiZ2FtZXBsYXkiLHt9KQogICBlbHNlaWYgY2hvaWNlPT0iRHVuZ2VvbiBMYWIiIHRoZW4KICAg
-IHN3aXRjaF9zY2VuZSgiZHVuZ2Vvbl9sYWIiLHt9KQogICBlbmQKICBlbmQKIGVuZCwKIGRyYXc9
-ZnVuY3Rpb24oc3RhdGUpCiAgY2xzKDApCiAgcHJpbnQoIlJheWNhc3QgRW5naW5lIixzY3JlZW5f
-Y2VudGVyX3gtNDgsNDAsMTEpCiAgcHJpbnQoIk1haW4gTWVudSIsc2NyZWVuX2NlbnRlcl94LTMy
-LDU2LDcpCiAgZm9yIGlkeCxvcHQgaW4gaXBhaXJzKHN0YXRlLm9wdGlvbnMpIGRvCiAgIGxvY2Fs
-IHk9ODArKGlkeC0xKSoxMgogICBsb2NhbCBjb2xvcj0oaWR4PT1zdGF0ZS5pbmRleCkgYW5kIDEw
-IG9yIDcKICAgcHJpbnQoKGlkeD09c3RhdGUuaW5kZXggYW5kICI_IiBvciAiICIpLi4iICIuLm9w
-dCxzY3JlZW5fY2VudGVyX3gtNDAseSxjb2xvcikKICBlbmQKICBwcmludCgiW1pdIGNvbmZpcm0g
-IFtVUC9ET1dOXSBuYXZpZ2F0ZSIsc2NyZWVuX2NlbnRlcl94LTY0LHNjcmVlbl9oZWlnaHQtMzIs
-NykKIGVuZAp9CgpzY2VuZXMuZ2FtZXBsYXk9ewogZW50ZXI9ZnVuY3Rpb24oc3RhdGUscGFyYW1z
-KQogIGxvY2FsIHNlZWQ9cGFyYW1zIGFuZCBwYXJhbXMuc2VlZAogIHN0YXJ0X3BvcyxnZW5fc3Rh
-dHM9Z2VuZXJhdGVfZHVuZ2Vvbih7c2VlZD1zZWVkfSkKICBwbGF5ZXIueD1zdGFydF9wb3MueAog
-IHBsYXllci55PXN0YXJ0X3Bvcy55CiAgdmlld19tb2RlPSIzZCIKICBzdGF0ZS5zZWVkPWdlbl9z
-dGF0cy5zZWVkCiBlbmQsCiB1cGRhdGU9ZnVuY3Rpb24oc3RhdGUpCiAgaWYga2V5cCgibSIpIHRo
-ZW4KICAgc3dpdGNoX3NjZW5lKCJtZW51IikKICAgcmV0dXJuCiAgZW5kCiAgdXBkYXRlX2dhbWVw
-bGF5KCkKIGVuZCwKIGRyYXc9ZnVuY3Rpb24oc3RhdGUpCiAgZHJhd19nYW1lcGxheSgpCiAgcHJp
-bnQoIltNXSBtZW51IixzY3JlZW5fd2lkdGgtNTYsc2NyZWVuX2hlaWdodC0xMCw3KQogZW5kCn0K
-CnNjZW5lcy5kdW5nZW9uX2xhYj17CiBlbnRlcj1mdW5jdGlvbihzdGF0ZSxwYXJhbXMpCiAgc3Rh
-dGUuc2VlZD1wYXJhbXMgYW5kIHBhcmFtcy5zZWVkCiAgZ2VuZXJhdGVfbGFiX2R1bmdlb24oc3Rh
-dGUsc3RhdGUuc2VlZCkKIGVuZCwKIHVwZGF0ZT1mdW5jdGlvbihzdGF0ZSkKICBpZiBrZXlwKCJt
-IikgdGhlbgogICBzd2l0Y2hfc2NlbmUoIm1lbnUiKQogICByZXR1cm4KICBlbmQKICBpZiBrZXlw
-KCJ6IikgdGhlbgogICBnZW5lcmF0ZV9sYWJfZHVuZ2VvbihzdGF0ZSxuaWwpCiAgZWxzZWlmIGtl
-eXAoIngiKSB0aGVuCiAgIGdlbmVyYXRlX2xhYl9kdW5nZW9uKHN0YXRlLHN0YXRlLnNlZWQpCiAg
-ZWxzZWlmIGtleXAoImxlZnQiKSBvciBidG5wKDApIHRoZW4KICAgbG9jYWwgc2VlZD0oc3RhdGUu
-c2VlZCBvciAxKS0xCiAgIGlmIHNlZWQ8MSB0aGVuIHNlZWQ9MSBlbmQKICAgZ2VuZXJhdGVfbGFi
-X2R1bmdlb24oc3RhdGUsc2VlZCkKICBlbHNlaWYga2V5cCgicmlnaHQiKSBvciBidG5wKDEpIHRo
-ZW4KICAgbG9jYWwgc2VlZD0oc3RhdGUuc2VlZCBvciAxKSsxCiAgIGdlbmVyYXRlX2xhYl9kdW5n
-ZW9uKHN0YXRlLHNlZWQpCiAgZWxzZWlmIGtleXAoImgiKSB0aGVuCiAgIGxvY2FsIHByZXZpb3Vz
-X3NlZWQ9c3RhdGUuc2VlZAogICBzdGF0ZS5oYXJuZXNzX3Jlc3VsdD1kdW5nZW9uX2hhcm5lc3Mu
-cnVuKCkKICAgZ2VuZXJhdGVfbGFiX2R1bmdlb24oc3RhdGUscHJldmlvdXNfc2VlZCkKICBlbHNl
-aWYga2V5cCgiaiIpIHRoZW4KICAgc3RhdGUuaGlzdG9yeV9jdXJzb3I9bWF4KDAsKHN0YXRlLmhp
-c3RvcnlfY3Vyc29yIG9yIDApLTMpCiAgZWxzZWlmIGtleXAoImsiKSB0aGVuCiAgIGxvY2FsIGhp
-c3Rvcnk9c3RhdGUuaGlzdG9yeSBvciB7fQogICBzdGF0ZS5oaXN0b3J5X2N1cnNvcj1taW4obWF4
-KDAsI2hpc3RvcnktMjApLChzdGF0ZS5oaXN0b3J5X2N1cnNvciBvciAwKSszKQogIGVuZAogZW5k
-LAogZHJhdz1mdW5jdGlvbihzdGF0ZSkKICBkcmF3X2xhYl9tYXAoc3RhdGUpCiAgZHJhd19sYWJf
-aGlzdG9yeShzdGF0ZSkKIGVuZAp9CgpmdW5jdGlvbiBfdXBkYXRlKCkKIHNjZW5lX3VwZGF0ZSgp
-CmVuZAoKZnVuY3Rpb24gX2RyYXcoKQogc2NlbmVfZHJhdygpCmVuZAoKLS0gZHJhdyAyZCBtaW5p
-bWFwIGZvciB0ZXN0aW5nCi0tIFB1cnBvc2U6IFJlbmRlciAyRCB0b3AtZG93biBkZWJ1ZyB2aWV3
-IG9mIGR1bmdlb24KLS0gQWxnb3JpdGhtOiBTY2FsZSAxMjjDlzEyOCBtYXAgdG8gMjU2w5cyNTYg
-cGl4ZWxzIChzY2FsZT0yKQotLSBEaXNwbGF5czogV2FsbHMsIHJvb21zLCBkb29ycywgb2JqZWN0
-cywgcGxheWVyIHBvc2l0aW9uIGFuZCBmYWNpbmcKLS0gTm90ZXM6IFRvZ2dsZWQgd2l0aCBYIGJ1
-dHRvbiwgdXNlZnVsIGZvciBkZWJ1Z2dpbmcgZ2VuZXJhdGlvbgpmdW5jdGlvbiBkcmF3X21pbmlt
-YXAoKQogbG9jYWwgc2NhbGU9MgogbG9jYWwgb3gsb3k9MTAsMTAKIAogLS0gYmF0Y2ggYWxsIHRp
-bGUgZHJhd2luZyB0byByZWR1Y2UgZHJhdyBjYWxsIGNvdW50CiByYmF0Y2hfcmVzZXQoKQogCiAt
-LSBkcmF3IHdhbGxzIGZyb20gbWFwLndhbGxzIHVzZXJkYXRhIHdpdGggZmxvb3IgZGF0YSB0byBk
-aXN0aW5ndWlzaCBjb3JyaWRvcnMgZnJvbSB2b2lkCiBmb3IgeD0wLDEyNyBkbwogIGZvciB5PTAs
-MTI3IGRvCiAgIGxvY2FsIHdhbGw9Z2V0X3dhbGwoeCx5KQogICBsb2NhbCBmbG9vcl92YWw9Z2V0
-X2Zsb29yKHgseSkKICAgbG9jYWwgY29sb3IKICAgaWYgd2FsbD4wIHRoZW4KICAgIC0tIHdhbGwg
-dGlsZQogICAgY29sb3I9NQogICBlbHNlaWYgZmxvb3JfdmFsPjAgdGhlbgogICAgLS0gY2FydmVk
-IGNvcnJpZG9yL3Jvb20gZmxvb3IgKGZsb29yIHR5cGUgc2V0IGR1cmluZyBnZW5lcmF0aW9uKQog
-ICAgY29sb3I9NgogICBlbHNlCiAgICAtLSB1bmNhcnZlZCB2b2lkICh3YWxsPTAsIGZsb29yPTAp
-CiAgICBjb2xvcj0xCiAgIGVuZAogICByYmF0Y2hfcHVzaChveCt4KnNjYWxlLG95K3kqc2NhbGUs
-b3greCpzY2FsZStzY2FsZS0xLG95K3kqc2NhbGUrc2NhbGUtMSxjb2xvcikKICBlbmQKIGVuZAog
-CiByYmF0Y2hfc3VibWl0KCkKIAogLS0gZHJhdyByb29tcwogZm9yIG5vZGUgaW4gYWxsKGdlbl9u
-b2RlcykgZG8KICBsb2NhbCByPW5vZGUucmVjdAogIHJlY3Qob3grclsxXSpzY2FsZSxveStyWzJd
-KnNjYWxlLG94K3JbM10qc2NhbGUsb3krcls0XSpzY2FsZSwxMSkKIGVuZAogCiAtLSBiYXRjaCBk
-b29yIGRyYXdpbmcKIHJiYXRjaF9yZXNldCgpCiBmb3IgZG9vciBpbiBhbGwoZG9vcnMpIGRvCiAg
-bG9jYWwgYz1kb29yLmR0eXBlPT1kb29yX2xvY2tlZCBhbmQgOCBvciAxMgogIHJiYXRjaF9wdXNo
-KG94K2Rvb3IueCpzY2FsZSxveStkb29yLnkqc2NhbGUsb3grZG9vci54KnNjYWxlK3NjYWxlLTEs
-b3krZG9vci55KnNjYWxlK3NjYWxlLTEsYykKIGVuZAogcmJhdGNoX3N1Ym1pdCgpCiAKIC0tIGRy
-YXcgb2JqZWN0cwogZm9yIG9iIGluIGFsbChvYmplY3RzKSBkbwogIGxvY2FsIGM9NwogIGlmIG9i
-LnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJob3N0aWxlX25wYyIgdGhlbiBjPTgKICBlbHNlaWYgb2Iu
-dHlwIGFuZCBvYi50eXAua2luZD09ImRpcmVjdF9waWNrdXAiIHRoZW4KICAgaWYgb2IudHlwLnN1
-YnR5cGU9PSJoZWFydCIgdGhlbiBjPTE0CiAgIGVsc2VpZiBvYi50eXAuc3VidHlwZT09ImtleSIg
-dGhlbiBjPTkKICAgZW5kCiAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJpbnRlcmFj
-dGFibGUiIHRoZW4KICAgaWYgb2IudHlwLnN1YnR5cGU9PSJleGl0IiB0aGVuIGM9MTIgZW5kCiAg
-ZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJkZWNvcmF0aXZlIiB0aGVuIGM9MTMKICBl
-bmQKICBsb2NhbCB4PW9iLnBvc1sxXQogIGxvY2FsIHk9b2IucG9zWzJdCiAgY2lyY2ZpbGwob3gr
-eCpzY2FsZSxveSt5KnNjYWxlLDEsYykKIGVuZAogCiAtLSBkcmF3IHBsYXllcgogbG9jYWwgcHgs
-cHk9b3grcGxheWVyLngqc2NhbGUsb3krcGxheWVyLnkqc2NhbGUKIGNpcmNmaWxsKHB4LHB5LDIs
-MTApCiBsb2NhbCBzYSxjYT1zaW4ocGxheWVyLmEpLGNvcyhwbGF5ZXIuYSkKIGxpbmUocHgscHks
-cHgrY2EqNixweStzYSo2LDEwKQogCiAtLSBzdGF0cwogcHJpbnQoIjJkIG1hcCB2aWV3IiwxMCwy
-LDcpCiBwcmludCgicm9vbXM6ICIuLmdlbl9zdGF0cy5yb29tcywxMCwxMCw3KQogcHJpbnQoIm9i
-amVjdHM6ICIuLmdlbl9zdGF0cy5vYmplY3RzLDEwLDE4LDcpCiBwcmludCgic2VlZDogIi4uZ2Vu
-X3N0YXRzLnNlZWQsMTAsMjYsNykKIGlmIGRlYnVnX21vZGUgdGhlbgogIHByaW50KCJbeF0gdG9n
-Z2xlIDNkIiwxMCwzNCw3KQogZW5kCmVuZAoKLS0gZHJhdyBodWQgbWluaW1hcCBvdmVybGF5Ci0t
-IFB1cnBvc2U6IFJlbmRlciBzY3JvbGxpbmcgdmlld3BvcnQgbWluaW1hcCBpbiB0b3AtcmlnaHQg
-Y29ybmVyIGR1cmluZyAzRCB2aWV3Ci0tIEFsZ29yaXRobTogUGxheWVyLWNlbnRlcmVkIGNhbWVy
-YSB3aXRoIGNsaXBwZWQgZHJhd2luZyBvZiB2aXNpYmxlIHRpbGVzIG9ubHkKLS0gRGlzcGxheXM6
-IFdhbGxzLCBmbG9vcnMsIGRvb3JzLCBvYmplY3RzLCBwbGF5ZXIgKGF1dG8tc2Nyb2xscyBhcyBw
-bGF5ZXIgbW92ZXMpCi0tIE5vdGVzOiBGaXhlZCAxMjDDlzY4cHggdmlld3BvcnQgYXQgdG9wLXJp
-Z2h0LCBzY2FsZT0yLCBvbmx5IGRyYXdzIHZpc2libGUgdGlsZSByYW5nZQpmdW5jdGlvbiBkcmF3
-X21pbmltYXBfaHVkKCkKIGxvY2FsIGh1ZF93PWNlaWwoc2NyZWVuX3dpZHRoKjAuMjUpCiBsb2Nh
-bCBodWRfaD1jZWlsKHNjcmVlbl9oZWlnaHQqMC4yNSkKIGxvY2FsIGh1ZF94PXNjcmVlbl93aWR0
-aC1odWRfdy04CiBsb2NhbCBodWRfeT04CiBsb2NhbCBzY2FsZT0yCiAKIC0tIGNhbWVyYSBvZmZz
-ZXQgdG8gY2VudGVyIHBsYXllciBpbiB2aWV3cG9ydAogbG9jYWwgY2FtX3g9cGxheWVyLngqc2Nh
-bGUtaHVkX3cvMgogbG9jYWwgY2FtX3k9cGxheWVyLnkqc2NhbGUtaHVkX2gvMgogCiAtLSBjYWxj
-dWxhdGUgdmlzaWJsZSB0aWxlIHJhbmdlCiBsb2NhbCB4X21pbj1tYXgoMCxmbHIoY2FtX3gvc2Nh
-bGUpKQogbG9jYWwgeF9tYXg9bWluKDEyNyxmbHIoKGNhbV94K2h1ZF93KS9zY2FsZSkpCiBsb2Nh
-bCB5X21pbj1tYXgoMCxmbHIoY2FtX3kvc2NhbGUpKQogbG9jYWwgeV9tYXg9bWluKDEyNyxmbHIo
-KGNhbV95K2h1ZF9oKS9zY2FsZSkpCiAKIC0tIHNldCBjbGlwIHJlZ2lvbgogY2xpcChodWRfeCxo
-dWRfeSxodWRfdyxodWRfaCkKIAogLS0gZHJhdyBiYWNrZ3JvdW5kCiByZWN0ZmlsbChodWRfeCxo
-dWRfeSxodWRfeCtodWRfdy0xLGh1ZF95K2h1ZF9oLTEsMCkKIAogLS0gYmF0Y2ggbWFwIHRpbGVz
-IChvbmx5IHZpc2libGUgcmFuZ2UpCiByYmF0Y2hfcmVzZXQoKQogZm9yIHg9eF9taW4seF9tYXgg
-ZG8KICBmb3IgeT15X21pbix5X21heCBkbwogICBsb2NhbCBzeD1odWRfeCsoeCpzY2FsZS1jYW1f
-eCkKICAgbG9jYWwgc3k9aHVkX3krKHkqc2NhbGUtY2FtX3kpCiAgIAogICAtLSBhZGRpdGlvbmFs
-IGJvdW5kcyBjaGVjawogICBpZiBzeD49aHVkX3ggYW5kIHN4PGh1ZF94K2h1ZF93IGFuZCBzeT49
-aHVkX3kgYW5kIHN5PGh1ZF95K2h1ZF9oIHRoZW4KICAgIGxvY2FsIHdhbGw9Z2V0X3dhbGwoeCx5
-KQogICAgbG9jYWwgZmxvb3JfdmFsPWdldF9mbG9vcih4LHkpCiAgICBsb2NhbCBjb2xvcgogICAg
-CiAgICBpZiB3YWxsPjAgdGhlbgogICAgIGNvbG9yPTUKICAgIGVsc2VpZiBmbG9vcl92YWw_MCB0
-aGVuCiAgICAgY29sb3I9NgogICAgZWxzZQogICAgIGNvbG9yPTEKICAgIGVuZAogICAgCiAgICBy
-YmF0Y2hfcHVzaChzeCxzeSxzeCtzY2FsZS0xLHN5K3NjYWxlLTEsY29sb3IpCiAgIGVuZAogIGVu
-ZAogZW5kCiByYmF0Y2hfc3VibWl0KCkKIAogLS0gYmF0Y2ggZG9vciBkcmF3aW5nIHZpYSBzcGF0
-aWFsIHF1ZXJ5IG92ZXIgdmlzaWJsZSB0aWxlcwogcmJhdGNoX3Jlc2V0KCkKIGZvciB4PXhfbWlu
-LHhfbWF4IGRvCiAgZm9yIHk9eV9taW4seV9tYXggZG8KICAgbG9jYWwgZG9vcj1kb29yZ3JpZFt4
-XSBhbmQgZG9vcmdyaWRbeF1beV0gb3IgbmlsCiAgIGlmIGRvb3IgdGhlbgogICAgbG9jYWwgc3g9
-aHVkX3grKHgqc2NhbGUtY2FtX3gpCiAgICBsb2NhbCBzeT1odWRfeSsoeSpzY2FsZS1jYW1feSkK
-ICAgIGlmIHN4Pj1odWRfeCBhbmQgc3g8aHVkX3graHVkX3cgYW5kIHN5Pj1odWRfeSBhbmQgc3k8
-aHVkX3kraHVkX2ggdGhlbgogICAgIGxvY2FsIGM9ZG9vci5kdHlwZT09ZG9vcl9sb2NrZWQgYW5k
-IDggb3IgMTIKICAgICByYmF0Y2hfcHVzaChzeCxzeSxzeCtzY2FsZS0xLHN5K3NjYWxlLTEsYykK
-ICAgIGVuZAogICBlbmQKICBlbmQKIGVuZAogcmJhdGNoX3N1Ym1pdCgpCiAKIC0tIGRyYXcgb2Jq
-ZWN0cyB2aWEgZmxhdCBhcnJheSBpdGVyYXRpb24gd2l0aGluIHZpZXdwb3J0IGJvdW5kcwogZm9y
-IG9iIGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9iLnBvcyB0aGVuCiAgIGxvY2FsIHN4PWh1ZF94
-KyhvYi5wb3NbMV0qc2NhbGUtY2FtX3gpCiAgIGxvY2FsIHN5PWh1ZF95KyhvYi5wb3NbMl0qc2Nh
-bGUtY2FtX3kpCiAgIGlmIHN4Pj1odWRfeCBhbmQgc3g8aHVkX3graHVkX3cgYW5kIHN5Pj1odWRf
-eSBhbmQgc3k8aHVkX3kraHVkX2ggdGhlbgogICAgbG9jYWwgYz03CiAgICBpZiBvYi50eXAgYW5k
-IG9iLnR5cC5raW5kPT0iaG9zdGlsZV9ucGMiIHRoZW4gYz04CiAgICBlbHNlaWYgb2IudHlwIGFu
-ZCBvYi50eXAua2luZD09ImRpcmVjdF9waWNrdXAiIHRoZW4KICAgICBpZiBvYi50eXAuc3VidHlw
-ZT09ImhlYXJ0IiB0aGVuIGM9MTQKICAgICBlbHNlaWYgb2IudHlwLnN1YnR5cGU9PSJrZXkiIHRo
-ZW4gYz05CiAgICAgZW5kCiAgICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVy
-YWN0YWJsZSIgdGhlbgogICAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0iZXhpdCIgdGhlbiBjPTEyIGVu
-ZAogICAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJkZWNvcmF0aXZlIiB0aGVuIGM9
-MTMKICAgIGVuZAogICAgY2lyY2ZpbGwoc3gsc3ksMSxjKQogICBlbmQKICBlbmQKIGVuZAogCiAt
-LSBkcmF3IHBsYXllciAoYWx3YXlzIGNlbnRlcmVkIGJ5IGNhbWVyYSBkZXNpZ24pCiBsb2NhbCBw
-eD1odWRfeCsocGxheWVyLngqc2NhbGUtY2FtX3gpCiBsb2NhbCBweT1odWRfeSsocGxheWVyLnkq
-c2NhbGUtY2FtX3kpCiBjaXJjZmlsbChweCxweSwyLDEwKQogbGluZShweCxweSxweCtjYV9jYWNo
-ZWQqNixweStzYV9jYWNoZWQqNiwxMCkKIAogLS0gb3B0aW9uYWwgZnJhbWUKIHJlY3QoaHVkX3gs
-aHVkX3ksaHVkX3graHVkX3ctMSxodWRfeStodWRfaC0xLDcpCiAKIC0tIHJlc2V0IGNsaXAKIGNs
-aXAoKQplbmQKCi0tIHVuaWZpZWQgY29sbGlzaW9uIGNoZWNrIGZvciB3YWxscywgZG9vcnMsIGFu
-ZCBvYmplY3RzCi0tIFB1cnBvc2U6IFVuaWZpZWQgY29sbGlzaW9uIGRldGVjdGlvbiBmb3Igd2Fs
-bHMsIGRvb3JzLCBhbmQgb2JqZWN0cwotLSBQYXJhbWV0ZXJzOiBweCwgcHkgKHdvcmxkIHBvc2l0
-aW9uKSwgcmFkaXVzIChjb2xsaXNpb24gcmFkaXVzKSwgb3BlbmRvb3JzIChhdXRvLW9wZW4gZG9v
-cnMpLCBpc3BsYXllciAoZW5hYmxlIGtleSBjaGVja2luZykKLS0gUmV0dXJuczogYm9vbGVhbiAo
-dHJ1ZSBpZiBjb2xsaXNpb24gZGV0ZWN0ZWQpCi0tIEFsZ29yaXRobTogR3JpZC1iYXNlZCB3YWxs
-IGNoZWNrICsgc3BhdGlhbCBwYXJ0aXRpb25pbmcgZm9yIG9iamVjdHMKLS0gU2lkZSBlZmZlY3Rz
-OiBPcGVucyBkb29ycywgcHJldmVudHMgZG9vciBjbG9zaW5nIHdoZW4gcGxheWVyIGluc2lkZQpm
-dW5jdGlvbiBpc2NvbChweCxweSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKQogbG9jYWwgY29s
-PWZhbHNlCiBvcGVuZG9vcnM9b3BlbmRvb3JzIG9yIGZhbHNlCiBpc3BsYXllcj1pc3BsYXllciBv
-ciBmYWxzZQogCiAtLSBjaGVjayBncmlkIGNlbGxzIGFyb3VuZCBwb3NpdGlvbgogZm9yIHg9Zmxy
-KHB4LXJhZGl1cyksZmxyKHB4K3JhZGl1cykgZG8KICBmb3IgeT1mbHIocHktcmFkaXVzKSxmbHIo
-cHkrcmFkaXVzKSBkbwogICAtLSBib3VuZHMgY2hlY2sKICAgaWYgeDwwIG9yIHg_PTEyOCBvciB5
-PDAgb3IgeT49MTI4IHRoZW4KICAgIGNvbD10cnVlCiAgICBicmVhawogICBlbHNlCiAgICBsb2Nh
-bCB0aWxlPWdldF93YWxsKHgseSkKICAgIAogICAgLS0gY2hlY2sgaWYgZG9vciB0aWxlCiAgICBp
-ZiB0aWxlPT1kb29yX25vcm1hbCBvciB0aWxlPT1kb29yX2xvY2tlZCBvciB0aWxlPT1kb29yX3N0
-YXlfb3BlbiB0aGVuCiAgICAgbG9jYWwgZG9vcj1kb29yZ3JpZFt4XVt5XQogICAgIGlmIGRvb3Ig
-dGhlbgogICAgICBpZiBkb29yLm9wZW49PTEgdGhlbgogICAgICAgLS0gZnVsbHkgb3BlbjogcHJl
-dmVudCBjbG9zaW5nCiAgICAgICBkb29yLm9wZW5pbmc9dHJ1ZQogICAgICBlbHNlCiAgICAgICAt
-LSBkb29yIHBhcnRpYWxseSBvcGVuIG9yIGNsb3NlZDogY29sbGlzaW9uIGRldGVjdGVkCiAgICAg
-ICBjb2w9dHJ1ZQogICAgICAgLS0gaGFuZGxlIHVubG9ja2luZy9vcGVuaW5nIGJlZm9yZSBleGl0
-aW5nIGlubmVyIGxvb3AKICAgICAgIGlmIG9wZW5kb29ycyB0aGVuCiAgICAgICAgaWYgZG9vci5r
-ZXludW0gdGhlbgogICAgICAgICAtLSBjaGVjayBpbnZlbnRvcnkgZm9yIGtleQogICAgICAgICBp
-ZiBpc3BsYXllciB0aGVuCiAgICAgICAgICBmb3IgaSxpdGVtIGluIGlwYWlycyhwbGF5ZXIua2V5
-cykgZG8KICAgICAgICAgICBpZiBpdGVtLmtleW51bT09ZG9vci5rZXludW0gdGhlbgogICAgICAg
-ICAgICAtLSByZW1vdmUga2V5CiAgICAgICAgICAgIGRlbGkocGxheWVyLmtleXMsaSkKICAgICAg
-ICAgICAgZG9vci5rZXludW09bmlsCiAgICAgICAgICAgIGRvb3Iub3BlbmluZz10cnVlCiAgICAg
-ICAgICAgIC0tIGtlZXAgY29sPXRydWUsIGRvbid0IGNsZWFyIGltbWVkaWF0ZWx5CiAgICAgICAg
-ICAgIGJyZWFrCiAgICAgICAgICAgZW5kCiAgICAgICAgICBlbmQKICAgICAgICAgZW5kCiAgICAg
-ICAgZWxzZQogICAgICAgICAtLSB1bmxvY2tlZAogICAgICAgICBkb29yLm9wZW5pbmc9dHJ1ZQog
-ICAgICAgICAtLSBrZWVwIGNvbD10cnVlLCBkb24ndCBjbGVhciBpbW1lZGlhdGVseQogICAgICAg
-IGVuZAogICAgICAgZW5kCiAgICAgICAtLSBlYXJseSBleGl0IGZyb20gaW5uZXIgbG9vcCBvbiBj
-b2xsaXNpb24gKGFmdGVyIG9wZW5kb29ycyBoYW5kbGluZykKICAgICAgIGJyZWFrCiAgICAgIGVu
-ZAogICAgIGVuZAogICAgLS0gY2hlY2sgaWYgZXhpdCBwb3J0YWwKICAgIGVsc2VpZiAodGlsZT09
-ZXhpdF9zdGFydCBvciB0aWxlPT1leGl0X2VuZCkgYW5kIGlzcGxheWVyIHRoZW4KICAgICAtLSBw
-bGFjZWhvbGRlciBmb3IgbGV2ZWwgY29tcGxldGlvbgogICAgLS0gY2hlY2sgaWYgd2FsbAogICAg
-ZWxzZWlmIHRpbGU_MCB0aGVuCiAgICAgY29sPXRydWUKICAgICBicmVhawogICAgZW5kCiAgIGVu
-ZAogIGVuZAogIGlmIGNvbCB0aGVuIGJyZWFrIGVuZAogZW5kCiAKIC0tIGNoZWNrIHNvbGlkIG9i
-amVjdHMgYXJvdW5kIHBvc2l0aW9uIHZpYSBmbGF0IGFycmF5IHdpdGggZWFybHkgZGlzdGFuY2Ug
-Y3VsbAogZm9yIG9iIGluIGFsbChvYmplY3RzKSBkbwogIGlmIG9iLnR5cCBhbmQgb2IudHlwLnNv
-bGlkIGFuZCBvYi5wb3MgdGhlbgogICBsb2NhbCBveD1vYi5wb3NbMV0tcHgKICAgbG9jYWwgb3k9
-b2IucG9zWzJdLXB5CiAgIC0tIGVhcmx5IGF4aXMtYWxpZ25lZCBjdWxsCiAgIGlmIGFicyhveCk8
-KHJhZGl1cysob2IudHlwLncgb3IgMCkpIGFuZCBhYnMob3kpPChyYWRpdXMrKG9iLnR5cC53IG9y
-IDApKSB0aGVuCiAgICBpZiBtYXgoYWJzKG94KSxhYnMob3kpKTwob2IudHlwLncgb3IgMCkgdGhl
-bgogICAgIGNvbD10cnVlCiAgICAgLS0gdHJpZ2dlciBpbnRlcmFjdGlvbiBvbiBzb2xpZCBjb250
-YWN0IGlmIHBsYXllcgogICAgIGlmIGlzcGxheWVyIHRoZW4KICAgICAgY2hlY2tfaW50ZXJhY3Rp
-b25zX2F0KHB4LHB5KQogICAgIGVuZAogICAgIGJyZWFrCiAgICBlbmQKICAgZW5kCiAgZW5kCiBl
-bmQKIAogcmV0dXJuIGNvbAplbmQKCi0tIG1vdmVtZW50IHdyYXBwZXIgd2l0aCBzbGlkaW5nIGNv
-bGxpc2lvbgotLSBQdXJwb3NlOiBNb3ZlbWVudCB3aXRoIHNsaWRpbmcgY29sbGlzaW9uICh0cnkg
-ZGlhZ29uYWwsIHRoZW4gWCwgdGhlbiBZKQotLSBQYXJhbWV0ZXJzOiBwb3MgKHRhYmxlIHdpdGgg
-eCx5KSwgdGFyZ2V0X3gsIHRhcmdldF95LCByYWRpdXMsIG9wZW5kb29ycywgaXNwbGF5ZXIKLS0g
-UmV0dXJuczogYm9vbGVhbiAodHJ1ZSBpZiBhbnkgbW92ZW1lbnQgc3VjY2VlZGVkKQotLSBBbGdv
-cml0aG06IFRocmVlLXBoYXNlIGNvbGxpc2lvbiBjaGVjayBmb3Igc21vb3RoIHdhbGwgc2xpZGlu
-ZwpmdW5jdGlvbiB0cnltb3ZldG8ocG9zLHRhcmdldF94LHRhcmdldF95LHJhZGl1cyxvcGVuZG9v
-cnMsaXNwbGF5ZXIpCiByYWRpdXM9cmFkaXVzIG9yIHBsYXllcl9jb2xsaXNpb25fcmFkaXVzCiBv
-cGVuZG9vcnM9b3BlbmRvb3JzIG9yIGZhbHNlCiBpc3BsYXllcj1pc3BsYXllciBvciBmYWxzZQog
-CiAtLSB0cnkgZGlyZWN0IG1vdmVtZW50CiBpZiBub3QgcmFkaXVzIG9yIG5vdCBpc2NvbCh0YXJn
-ZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zLngscG9z
-Lnk9dGFyZ2V0X3gsdGFyZ2V0X3kKICByZXR1cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB4LW9ubHkg
-bW92ZW1lbnQKIGlmIGFicyhwb3MueC10YXJnZXRfeCk_MC4wMSBhbmQgbm90IGlzY29sKHRhcmdl
-dF94LHBvcy55LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpIHRoZW4KICBwb3MueD10YXJnZXRf
-eAogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHktb25seSBtb3ZlbWVudAogaWYgYWJzKHBv
-cy55LXRhcmdldF95KT4wLjAxIGFuZCBub3QgaXNjb2wocG9zLngsdGFyZ2V0X3kscmFkaXVzLG9w
-ZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvcy55PXRhcmdldF95CiAgcmV0dXJuIHRydWUKIGVu
-ZAogCiByZXR1cm4gZmFsc2UKZW5kCgotLSBtb3ZlbWVudCB3cmFwcGVyIGZvciBwb3NbMV0vcG9z
-WzJdIGFycmF5IHBvc2l0aW9ucwpmdW5jdGlvbiB0cnltb3ZldG9fcG9zKHBvc19hcnJheSx0YXJn
-ZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKQogcmFkaXVzPXJhZGl1cyBv
-ciBwbGF5ZXJfY29sbGlzaW9uX3JhZGl1cwogb3BlbmRvb3JzPW9wZW5kb29ycyBvciBmYWxzZQog
-aXNwbGF5ZXI9aXNwbGF5ZXIgb3IgZmFsc2UKIAogLS0gdHJ5IGRpcmVjdCBtb3ZlbWVudAogaWYg
-bm90IHJhZGl1cyBvciBub3QgaXNjb2wodGFyZ2V0X3gsdGFyZ2V0X3kscmFkaXVzLG9wZW5kb29y
-cyxpc3BsYXllcikgdGhlbgogIHBvc19hcnJheVsxXSxwb3NfYXJyYXlbMl09dGFyZ2V0X3gsdGFy
-Z2V0X3kKICByZXR1cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB4LW9ubHkgbW92ZW1lbnQKIGlmIGFi
-cyhwb3NfYXJyYXlbMV0tdGFyZ2V0X3gpPjAuMDEgYW5kIG5vdCBpc2NvbCh0YXJnZXRfeCxwb3Nf
-YXJyYXlbMl0scmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvc19hcnJheVsxXT10
-YXJnZXRfeAogIHJldHVybiB0cnVlCiBlbmQKIAogLS0gdHJ5IHktb25seSBtb3ZlbWVudAogaWYg
-YWJzKHBvc19hcnJheVsyXS10YXJnZXRfeSk_MC4wMSBhbmQgbm90IGlzY29sKHBvc19hcnJheVsx
-XSx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zX2FycmF5WzJd
-PXRhcmdldF95CiAgcmV0dXJuIHRydWUKIGVuZAogCiByZXR1cm4gZmFsc2UKZW5kCgpmdW5jdGlv
-biB1cGRhdGVfaW5wdXQoKQogbG9jYWwgc2EsY2E9c2luKHBsYXllci5hKSxjb3MocGxheWVyLmEp
-CiAKIC0tIG1vdmVtZW50CiAtLSBjb21iaW5lIGtleXMgdG8gYXZvaWQgZG91YmxlLXByb2Nlc3Np
-bmcgYW5kIGZpeCBkaXJlY3Rpb246CiAtLSBwb3NpdGl2ZSB0dXJuID0gbGVmdCwgbmVnYXRpdmUg
-dHVybiA9IHJpZ2h0CiBsb2NhbCB0dXJuPShidG4oMCkgYW5kIDEgb3IgMCktKGJ0bigxKSBhbmQg
-MSBvciAwKQogaWYgdHVybn49MCB0aGVuCiAgcGxheWVyLmErPXR1cm4qcGxheWVyX3JvdGF0aW9u
-X3NwZWVkCiBlbmQKIGlmIGJ0bigyKSB0aGVuIC0tIHVwCiAgbG9jYWwgbng9cGxheWVyLngrY2Eq
-cGxheWVyLnNwZAogIGxvY2FsIG55PXBsYXllci55K3NhKnBsYXllci5zcGQKICB0cnltb3ZldG8o
-cGxheWVyLG54LG55LHBsYXllcl9jb2xsaXNpb25fcmFkaXVzLHRydWUsdHJ1ZSkKIGVuZAogaWYg
-YnRuKDMpIHRoZW4gLS0gZG93bgogIGxvY2FsIG54PXBsYXllci54LWNhKnBsYXllci5zcGQKICBs
-b2NhbCBueT1wbGF5ZXIueS1zYSpwbGF5ZXIuc3BkCiAgdHJ5bW92ZXRvKHBsYXllcixueCxueSxw
-bGF5ZXJfY29sbGlzaW9uX3JhZGl1cyx0cnVlLHRydWUpCiBlbmQKIAogLS0gY2hlY2sgZm9yIGlu
-dGVyYWN0aW9ucyBldmVyeSBmcmFtZQogY2hlY2tfaW50ZXJhY3Rpb25zKCkKIAogLS0gaW50ZXJh
-Y3Rpb24gaW5wdXQ6IEUga2V5IG9yIFogYnV0dG9uCiBpZiBrZXlwKCJlIikgb3IgYnRucCg0KSB0
-aGVuCiAgaGFuZGxlX2ludGVyYWN0KCkKIGVuZAplbmQKCiAKCi0tIGNoZWNrIGludGVyYWN0aW9u
-cyBhcm91bmQgcGxheWVyIHBvc2l0aW9uCi0tIFB1cnBvc2U6IFNjYW4gbmVhcmJ5IG9iamVjdHMg
-Zm9yIHByb3hpbWl0eS1iYXNlZCBpbnRlcmFjdGlvbnMKLS0gQWxnb3JpdGhtOiAzw5czIG9iamdy
-aWQgY2VsbCBzY2FuIGFyb3VuZCBwbGF5ZXIKLS0gU2lkZSBlZmZlY3RzOiBBdXRvLWNvbGxlY3Rz
-IHBpY2t1cHMsIHRyaWdnZXJzIGNvbWJhdCwgc2V0cyBpbnRlcmFjdGlvbiBmbGFncwotLSBOb3Rl
-czogQ2FsbGVkIGV2ZXJ5IGZyYW1lIGluIF91cGRhdGUoKQpmdW5jdGlvbiBjaGVja19pbnRlcmFj
-dGlvbnMoKQogY2hlY2tfaW50ZXJhY3Rpb25zX2F0KHBsYXllci54LHBsYXllci55KQplbmQKCi0t
-IGNoZWNrIGludGVyYWN0aW9ucyBhdCBzcGVjaWZpYyBwb3NpdGlvbiAoYXZvaWRzIHJlY3Vyc2lv
-bikKZnVuY3Rpb24gY2hlY2tfaW50ZXJhY3Rpb25zX2F0KHB4LHB5KQogLS0gc2NhbiBhbGwgb2Jq
-ZWN0cyB3aXRoIGRpc3RhbmNlIGN1bGxpbmcKIGxvY2FsIGNsb3Nlc3RfaW50ZXJhY3Q9bmlsCiBs
-b2NhbCBjbG9zZXN0X2Rpc3Q9OTk5CiAKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBv
-Yi5wb3MgYW5kIG9iLnR5cCB0aGVuCiAgIGxvY2FsIGR4PW9iLnBvc1sxXS1weAogICBsb2NhbCBk
-eT1vYi5wb3NbMl0tcHkKICAgbG9jYWwgZGlzdD1hYnMoZHgpK2FicyhkeSkKICAgCiAgIC0tIGRp
-cmVjdCBwaWNrdXA6IGF1dG8tY29sbGVjdAogICBpZiBvYi50eXAua2luZD09ImRpcmVjdF9waWNr
-dXAiIGFuZCBkaXN0PGludGVyYWN0aW9uX3JhbmdlIHRoZW4KICAgIGNvbGxlY3RfaXRlbShvYikK
-ICAgIGRlbChvYmplY3RzLG9iKQogICAgaWYgb2IuYXV0b2FuaW0gdGhlbiBkZWwoYW5pbWF0ZWRf
-b2JqZWN0cyxvYikgZW5kCiAgIAogICAtLSBob3N0aWxlIG5wYzogdHJpZ2dlciBjb21iYXQKICAg
-ZWxzZWlmIG9iLnR5cC5raW5kPT0iaG9zdGlsZV9ucGMiIGFuZCBkaXN0PGNvbWJhdF90cmlnZ2Vy
-X3JhbmdlIHRoZW4KICAgIGluX2NvbWJhdD10cnVlCiAgICBjdXJyZW50X3RhcmdldD1vYgogICAK
-ICAgLS0gaW50ZXJhY3RhYmxlOiBzZXQgZmxhZyBmb3IgY2xvc2VzdAogICBlbHNlaWYgb2IudHlw
-LmtpbmQ9PSJpbnRlcmFjdGFibGUiIGFuZCBkaXN0PGludGVyYWN0aW9uX3JhbmdlIHRoZW4KICAg
-IC0tIHRyYXA6IGltbWVkaWF0ZSBlZmZlY3QKICAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0idHJhcCIg
-dGhlbgogICAgIHBsYXllci5ocD1tYXgoMCxwbGF5ZXIuaHAtMTApCiAgICAgdHJhcF9tc2dfdGlt
-ZXI9NjAKICAgICBkZWwob2JqZWN0cyxvYikKICAgICBpZiBvYi5hdXRvYW5pbSB0aGVuIGRlbChh
-bmltYXRlZF9vYmplY3RzLG9iKSBlbmQKICAgIGVsc2VpZiBkaXN0PGNsb3Nlc3RfZGlzdCB0aGVu
-CiAgICAgY2xvc2VzdF9pbnRlcmFjdD1vYgogICAgIGNsb3Nlc3RfZGlzdD1kaXN0CiAgICBlbmQK
-ICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gdXBkYXRlIGludGVyYWN0aW9uIHN0YXRlCiBpZiBjbG9z
-ZXN0X2ludGVyYWN0IHRoZW4KICBpbnRlcmFjdGlvbl9hY3RpdmU9dHJ1ZQogIGN1cnJlbnRfaW50
-ZXJhY3Q9Y2xvc2VzdF9pbnRlcmFjdAogZWxzZQogIGludGVyYWN0aW9uX2FjdGl2ZT1mYWxzZQog
-IGN1cnJlbnRfaW50ZXJhY3Q9bmlsCiBlbmQKZW5kCgotLSBjb2xsZWN0IGl0ZW0gKHBpY2t1cCkK
-LS0gUHVycG9zZTogSGFuZGxlIHBpY2t1cCBjb2xsZWN0aW9uIGFuZCBpbnZlbnRvcnkgdXBkYXRl
-cwotLSBQYXJhbWV0ZXJzOiBvYiAob2JqZWN0IHdpdGggdHlwLnN1YnR5cGUpCi0tIFNpZGUgZWZm
-ZWN0czogQWRkcyB0byBwbGF5ZXIua2V5cywgaW5jcmVhc2VzIHBsYXllci5ocAotLSBOb3Rlczog
-Q2FsbGVkIGJ5IGNoZWNrX2ludGVyYWN0aW9uc19hdCgpIGZvciBkaXJlY3RfcGlja3VwIG9iamVj
-dHMKZnVuY3Rpb24gY29sbGVjdF9pdGVtKG9iKQogaWYgb2IudHlwLnN1YnR5cGU9PSJrZXkiIGFu
-ZCBvYi5rZXludW0gdGhlbgogIGFkZChwbGF5ZXIua2V5cyx7a2V5bnVtPW9iLmtleW51bX0pCiAg
-cHJpbnRoKCJjb2xsZWN0ZWQga2V5ICIuLm9iLmtleW51bSkKIGVsc2VpZiBvYi50eXAuc3VidHlw
-ZT09ImhlYXJ0IiB0aGVuCiAgcGxheWVyLmhwPW1pbigxMDAscGxheWVyLmhwKzIwKQogIHByaW50
-aCgiY29sbGVjdGVkIGhlYXJ0IikKIGVsc2UKICBwcmludGgoImNvbGxlY3RlZCBpdGVtIikKIGVu
-ZAplbmQKCi0tIGhhbmRsZSBpbnRlcmFjdGlvbiB3aGVuIHBsYXllciBwcmVzc2VzIEUvWgotLSBQ
-dXJwb3NlOiBQcm9jZXNzIHBsYXllci1pbml0aWF0ZWQgaW50ZXJhY3Rpb25zIChFIGtleSAvIFog
-YnV0dG9uKQotLSBBbGdvcml0aG06IFN3aXRjaCBvbiBjdXJyZW50X2ludGVyYWN0LnR5cC5zdWJ0
-eXBlCi0tIFNpZGUgZWZmZWN0czogT3BlbnMgY2hlc3RzLCBhY3RpdmF0ZXMgc2hyaW5lcywgcmVh
-ZHMgbm90ZXMsIHRyaWdnZXJzIGZsb29yIHRyYW5zaXRpb24KLS0gTm90ZXM6IE9ubHkgcnVucyB3
-aGVuIGludGVyYWN0aW9uX2FjdGl2ZSBmbGFnIGlzIHRydWUKZnVuY3Rpb24gaGFuZGxlX2ludGVy
-YWN0KCkKIGlmIG5vdCBpbnRlcmFjdGlvbl9hY3RpdmUgb3Igbm90IGN1cnJlbnRfaW50ZXJhY3Qg
-dGhlbiByZXR1cm4gZW5kCiAKIGxvY2FsIHN1YnR5cGU9Y3VycmVudF9pbnRlcmFjdC50eXAgYW5k
-IGN1cnJlbnRfaW50ZXJhY3QudHlwLnN1YnR5cGUgb3IgInVua25vd24iCiAKIGlmIHN1YnR5cGU9
-PSJjaGVzdCIgdGhlbgogIC0tIG9wZW4gY2hlc3QgKHBsYWNlaG9sZGVyKQogIHBsYXllci5ocD1t
-aW4oMTAwLHBsYXllci5ocCsxMCkKICBwcmludGgoIm9wZW5lZCBjaGVzdCIpCiAgZGVsKG9iamVj
-dHMsY3VycmVudF9pbnRlcmFjdCkKICBpZiBjdXJyZW50X2ludGVyYWN0LmF1dG9hbmltIHRoZW4g
-ZGVsKGFuaW1hdGVkX29iamVjdHMsY3VycmVudF9pbnRlcmFjdCkgZW5kCiAgCiBlbHNlaWYgc3Vi
-dHlwZT09InNocmluZSIgdGhlbgogIC0tIGFjdGl2YXRlIHNocmluZSAocGxhY2Vob2xkZXIpCiAg
-cGxheWVyLmhwPTEwMAogIHByaW50aCgiYWN0aXZhdGVkIHNocmluZSIpCiAgCiBlbHNlaWYgc3Vi
-dHlwZT09Im5vdGUiIHRoZW4KICAtLSByZWFkIG5vdGUgKHBsYWNlaG9sZGVyKQogIHByaW50aCgi
-cmVhZCBub3RlIikKICBkZWwob2JqZWN0cyxjdXJyZW50X2ludGVyYWN0KQogIGlmIGN1cnJlbnRf
-aW50ZXJhY3QuYXV0b2FuaW0gdGhlbiBkZWwoYW5pbWF0ZWRfb2JqZWN0cyxjdXJyZW50X2ludGVy
-YWN0KSBlbmQKICAKIGVsc2VpZiBzdWJ0eXBlPT0iZXhpdCIgdGhlbgogIC0tIHRyaWdnZXIgbmV4
-dCBmbG9vcgogIHByaW50aCgidXNpbmcgZXhpdCBwb3J0YWwiKQogIGdlbmVyYXRlX25ld19mbG9v
-cigpCiAgCiBlbmQKIAogLS0gY2xlYXIgaW50ZXJhY3Rpb24gc3RhdGUgYWZ0ZXIgaGFuZGxpbmcK
-IGludGVyYWN0aW9uX2FjdGl2ZT1mYWxzZQogY3VycmVudF9pbnRlcmFjdD1uaWwKZW5kCgotLSBn
-ZW5lcmF0ZSBuZXcgZmxvb3IgKHJlZ2VuZXJhdGUgZHVuZ2VvbikKZnVuY3Rpb24gZ2VuZXJhdGVf
-bmV3X2Zsb29yKCkKIC0tIGluY3JlbWVudCBkaWZmaWN1bHR5CiBnZW5fcGFyYW1zLmRpZmZpY3Vs
-dHk9bWluKGdlbl9wYXJhbXMubWF4X2RpZmZpY3VsdHksZ2VuX3BhcmFtcy5kaWZmaWN1bHR5KzEp
-CiAKIC0tIGNsZWFyIGV4aXN0aW5nIG9iamVjdHMKIG9iamVjdHM9e30KIGFuaW1hdGVkX29iamVj
-dHM9e30KIGRvb3JzPXt9CiAtLSBhbHNvIGNsZWFyIGRvb3JncmlkIHRvIHByZXZlbnQgc3RhbGUg
-cmVmZXJlbmNlcwogZm9yIGk9MCwxMjcgZG8KICBpZiBkb29yZ3JpZFtpXSB0aGVuCiAgIGZvciBq
-PTAsMTI3IGRvCiAgICBkb29yZ3JpZFtpXVtqXT1uaWwKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0g
-cmVnZW5lcmF0ZSBkdW5nZW9uCiBzdGFydF9wb3MsZ2VuX3N0YXRzPWdlbmVyYXRlX2R1bmdlb24o
-KQotLSBUcmlnZ2VyIEdDIGFmdGVyIGR1bmdlb24gZ2VuZXJhdGlvbiAoUGljb3Ryb24gZ3VpZGVs
-aW5lOiBhdm9pZCBtaWQtZ2FtZXBsYXkgc3R1dHRlcikKc3RhdCgwKQogLS0gaW52YWxpZGF0ZSBw
-ZXJzaXN0ZW50IHJlbmRlciBjYWNoZXMgZm9yIG5ldyBmbG9vcgotLSBQcm9kdWN0aW9uOiBjbGVh
-ciBjYWNoZSBvbiBsZXZlbCBsb2FkIHRvIHByZXZlbnQgc3RhbGUgdGV4dHVyZSByZWZlcmVuY2Vz
-CmlmIGNsZWFyX3RleHR1cmVfY2FjaGVzIHRoZW4gY2xlYXJfdGV4dHVyZV9jYWNoZXMoKSBlbmQK
-IAogcHJpbnRoKCJmbG9vciBjb21wbGV0ZSEgZGlmZmljdWx0eTogIi4uZ2VuX3BhcmFtcy5kaWZm
-aWN1bHR5KQogCiAtLSBsZXZlbCBsb2FkIGRpYWdub3N0aWMgc3VtbWFyeQogcHJpbnRoKCI9PT0g
-TEVWRUwgTE9BRCBESUFHTk9TVElDUyA9PT0iKQogcHJpbnRoKCJGbG9vcjogIi4uKGN1cnJlbnRf
-Zmxvb3Igb3IgInVua25vd24iKSkKIHByaW50aCgiRGlmZmljdWx0eTogIi4uZ2VuX3BhcmFtcy5k
-aWZmaWN1bHR5KQogcHJpbnRoKCJSb29tczogIi4uZ2VuX3N0YXRzLnJvb21zKQogcHJpbnRoKCJP
-YmplY3RzOiAiLi5nZW5fc3RhdHMub2JqZWN0cykKIHByaW50aCgiU2VlZDogIi4uZ2VuX3N0YXRz
-LnNlZWQpCmVuZAoKLS0gdXBkYXRlIGNvbWJhdCAocGxhY2Vob2xkZXIpCmZ1bmN0aW9uIHVwZGF0
-ZV9jb21iYXQoKQogLS0gdGVtcCBleGl0OiBwcmVzcyBRIG9yIEVudGVyCiBpZiBrZXlwKCJxIikg
-b3Iga2V5cCgiZW50ZXIiKSB0aGVuCiAgaW5fY29tYmF0PWZhbHNlCiAgY3VycmVudF90YXJnZXQ9
-bmlsCiAgcHJpbnRoKCJleGl0ZWQgY29tYmF0IikKIGVuZAplbmQKCi0tIHVwZGF0ZSBucGMgYWkg
-KGJhc2ljIHBhdHJvbCBhbmQgZm9sbG93KQpmdW5jdGlvbiB1cGRhdGVfbnBjX2FpKCkKIGZvciBv
-YiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5kIG9iLnR5cC5raW5kPT0iaG9zdGls
-ZV9ucGMiIGFuZCBvYi5haV90eXBlIHRoZW4KICAgbG9jYWwgb2xkX3gsb2xkX3k9b2IucG9zWzFd
-LG9iLnBvc1syXQogICAKICAgaWYgb2IuYWlfdHlwZT09InBhdHJvbCIgdGhlbgogICAgLS0gcGF0
-cm9sOiBjeWNsZSB0aHJvdWdoIHBhdHJvbF9wb2ludHMKICAgIGlmIG9iLnBhdHJvbF9wb2ludHMg
-YW5kICNvYi5wYXRyb2xfcG9pbnRzPjAgdGhlbgogICAgIC0tIGluaXRpYWxpemUgcGF0cm9sX2lu
-ZGV4IGlmIG5pbCBvciAwCiAgICAgaWYgbm90IG9iLnBhdHJvbF9pbmRleCBvciBvYi5wYXRyb2xf
-aW5kZXg9PTAgdGhlbgogICAgICBvYi5wYXRyb2xfaW5kZXg9MQogICAgIGVuZAogICAgIAogICAg
-IGxvY2FsIHRhcmdldD1vYi5wYXRyb2xfcG9pbnRzW29iLnBhdHJvbF9pbmRleF0KICAgICBpZiB0
-YXJnZXQgdGhlbgogICAgICBsb2NhbCBkeD10YXJnZXQueC1vYi5wb3NbMV0KICAgICAgbG9jYWwg
-ZHk9dGFyZ2V0Lnktb2IucG9zWzJdCiAgICAgIGxvY2FsIGRpc3Q9c3FydChkeCpkeCtkeSpkeSkK
-ICAgICAgCiAgICAgIC0tIHJlYWNoZWQgd2F5cG9pbnQ6IGFkdmFuY2UgdG8gbmV4dAogICAgICBp
-ZiBkaXN0PDAuMSB0aGVuCiAgICAgICBvYi5wYXRyb2xfaW5kZXg9KG9iLnBhdHJvbF9pbmRleCUj
-b2IucGF0cm9sX3BvaW50cykrMQogICAgICBlbHNlCiAgICAgICAtLSBtb3ZlIHRvd2FyZCBjdXJy
-ZW50IHdheXBvaW50CiAgICAgICBpZiBkaXN0PjAgdGhlbgogICAgICAgIGxvY2FsIHNwZD1vYi50
-eXAucGF0cm9sX3NwZWVkIG9yIDAuMDMKICAgICAgICBsb2NhbCBueD1vYi5wb3NbMV0rZHgvZGlz
-dCpzcGQKICAgICAgICBsb2NhbCBueT1vYi5wb3NbMl0rZHkvZGlzdCpzcGQKICAgICAgICB0cnlt
-b3ZldG9fcG9zKG9iLnBvcyxueCxueSxvYi50eXAudyBvciAwLjQsZmFsc2UsZmFsc2UpCiAgICAg
-ICBlbmQKICAgICAgZW5kCiAgICAgZW5kCiAgICBlbmQKICAgIAogICBlbHNlaWYgb2IuYWlfdHlw
-ZT09ImZvbGxvdyIgdGhlbgogICAgLS0gZm9sbG93OiBtb3ZlIHRvd2FyZCBwbGF5ZXIgaWYgaW4g
-cmFuZ2UKICAgIGxvY2FsIGR4PXBsYXllci54LW9iLnBvc1sxXQogICAgbG9jYWwgZHk9cGxheWVy
-Lnktb2IucG9zWzJdCiAgICBsb2NhbCBkaXN0PXNxcnQoZHgqZHgrZHkqZHkpCiAgICBsb2NhbCBm
-b2xsb3dfcmFuZ2U9b2IudHlwLmZvbGxvd19yYW5nZSBvciAyMAogICAgaWYgZGlzdDxmb2xsb3df
-cmFuZ2UgYW5kIGRpc3Q_MC4xIHRoZW4KICAgICBsb2NhbCBzcGQ9b2IudHlwLmZvbGxvd19zcGVl
-ZCBvciAwLjA1CiAgICAgbG9jYWwgbng9b2IucG9zWzFdK2R4L2Rpc3Qqc3BkCiAgICAgbG9jYWwg
-bnk9b2IucG9zWzJdK2R5L2Rpc3Qqc3BkCiAgICAgdHJ5bW92ZXRvX3BvcyhvYi5wb3Msbngsbnks
-b2IudHlwLncgb3IgMC40LGZhbHNlLGZhbHNlKQogICAgZW5kCiAgIGVuZAogIGVuZAogZW5kCmVu
-ZA==
+IgotLSBOZXcgcmVuZGVyZXIgbW9kdWxlcwppbmNsdWRlInNyYy9yX3N0YXRlLmx1YSIKaW5jbHVk
+ZSJzcmMvcl9iYXRjaC5sdWEiCmluY2x1ZGUic3JjL3Jfdmlldy5sdWEiCmluY2x1ZGUic3JjL3Jf
+Y2FzdC5sdWEiCmluY2x1ZGUic3JjL3JfZmxvb3IubHVhIgppbmNsdWRlInNyYy9yX3dhbGxzLmx1
+YSIKaW5jbHVkZSJzcmMvcl9zcHJpdGVzLmx1YSIKaW5jbHVkZSJzcmMvcl9kaWFnLmx1YSIKLS0g
+R2FtZSBzeXN0ZW1zCmluY2x1ZGUic3JjL2Rvb3Jfc3lzdGVtLmx1YSIKaW5jbHVkZSJzcmMvZHVu
+Z2Vvbl9nZW4ubHVhIgppbmNsdWRlInRlc3RzL2R1bmdlb25faGFybmVzcy5sdWEiCgotLSBJbml0
+aWFsaXplIHJlbmRlcmVyIG1vZHVsZXMKbG9jYWwgcl9zdGF0ZSA9IGluY2x1ZGUic3JjL3Jfc3Rh
+dGUubHVhIgpsb2NhbCByX2JhdGNoID0gaW5jbHVkZSJzcmMvcl9iYXRjaC5sdWEiCmxvY2FsIHJf
+dmlldyA9IGluY2x1ZGUic3JjL3Jfdmlldy5sdWEiCmxvY2FsIHJfY2FzdCA9IGluY2x1ZGUic3Jj
+L3JfY2FzdC5sdWEiCmxvY2FsIHJfZmxvb3IgPSBpbmNsdWRlInNyYy9yX2Zsb29yLmx1YSIKbG9j
+YWwgcl93YWxscyA9IGluY2x1ZGUic3JjL3Jfd2FsbHMubHVhIgpsb2NhbCByX3Nwcml0ZXMgPSBp
+bmNsdWRlInNyYy9yX3Nwcml0ZXMubHVhIgpsb2NhbCByX2RpYWcgPSBpbmNsdWRlInNyYy9yX2Rp
+YWcubHVhIgoKbG9jYWwgc2NlbmVzPXt9CmxvY2FsIHNjZW5lX3N0YXRlPXt9CmxvY2FsIGN1cnJl
+bnRfc2NlbmU9bmlsCgpsb2NhbCBmdW5jdGlvbiBnZXRfc2NlbmVfc3RhdGUobmFtZSkKIHNjZW5l
+X3N0YXRlW25hbWVdPXNjZW5lX3N0YXRlW25hbWVdIG9yIHt9CiByZXR1cm4gc2NlbmVfc3RhdGVb
+bmFtZV0KZW5kCgpsb2NhbCBmdW5jdGlvbiBzd2l0Y2hfc2NlbmUobmFtZSxwYXJhbXMpCiBsb2Nh
+bCBzY2VuZT1zY2VuZXNbbmFtZV0KIGlmIG5vdCBzY2VuZSB0aGVuCiAgcHJpbnRoKCJ3YXJuaW5n
+OiB1bmtub3duIHNjZW5lICIuLnRvc3RyaW5nKG5hbWUpKQogIHJldHVybgogZW5kCiBpZiBjdXJy
+ZW50X3NjZW5lIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0gYW5kIHNjZW5lc1tjdXJyZW50X3Nj
+ZW5lXS5sZWF2ZSB0aGVuCiAgc2NlbmVzW2N1cnJlbnRfc2NlbmVdLmxlYXZlKGdldF9zY2VuZV9z
+dGF0ZShjdXJyZW50X3NjZW5lKSkKIGVuZAogY3VycmVudF9zY2VuZT1uYW1lCiBsb2NhbCBzdGF0
+ZT1nZXRfc2NlbmVfc3RhdGUobmFtZSkKIGlmIHNjZW5lLmVudGVyIHRoZW4KICBzY2VuZS5lbnRl
+cihzdGF0ZSxwYXJhbXMgb3Ige30pCiBlbmQKZW5kCgpsb2NhbCBmdW5jdGlvbiBzY2VuZV91cGRh
+dGUoKQogaWYgY3VycmVudF9zY2VuZSBhbmQgc2NlbmVzW2N1cnJlbnRfc2NlbmVdIGFuZCBzY2Vu
+ZXNbY3VycmVudF9zY2VuZV0udXBkYXRlIHRoZW4KICBzY2VuZXNbY3VycmVudF9zY2VuZV0udXBk
+YXRlKGdldF9zY2VuZV9zdGF0ZShjdXJyZW50X3NjZW5lKSkKIGVuZAplbmQKCmxvY2FsIGZ1bmN0
+aW9uIHNjZW5lX2RyYXcoKQogaWYgY3VycmVudF9zY2VuZSBhbmQgc2NlbmVzW2N1cnJlbnRfc2Nl
+bmVdIGFuZCBzY2VuZXNbY3VycmVudF9zY2VuZV0uZHJhdyB0aGVuCiAgc2NlbmVzW2N1cnJlbnRf
+c2NlbmVdLmRyYXcoZ2V0X3NjZW5lX3N0YXRlKGN1cnJlbnRfc2NlbmUpKQogZWxzZQogIGNscygw
+KQogZW5kCmVuZAoKLS0gY29uc3RhbnRzCnBsYXllcl9jb2xsaXNpb25fcmFkaXVzPTAuMTUKCmZ1
+bmN0aW9uIF9pbml0KCkKIHdpbmRvdyhzY3JlZW5fd2lkdGgsc2NyZWVuX2hlaWdodCkKIAogLS0g
+cGluIG1hc2tzIHRvIGRlZmF1bHRzIGZvciBzaW5nbGUgY29sb3VyLXRhYmxlIGZhc3QgcGF0aAog
+cG9rZSgweDU1MDgsMHgzZikgcG9rZSgweDU1MDksMHgzZikgcG9rZSgweDU1MGEsMHgzZikgcG9r
+ZSgweDU1MGIsMHgwMCkKIAogLS0gdGlsZSAwIGRyYXdpbmcgc3RhdGU6IHZlcmlmaWVkIG5vdCBy
+ZXF1aXJlZDsgbGVhdmUgMHg1ZjM2IGF0IGRlZmF1bHQgKG5vIGV4cGxpY2l0IHBva2UpCiAtLSBz
+c3ByKCkgdXNhZ2UgdmVyaWZpZWQ6IE5vbmUgaW4gcHJvZHVjdGlvbiBjb2RlIChvbmx5IGluIHNh
+bXBsZSBmaWxlcykKIC0tIFBlciBQaWNvdHJvbiBndWlkZWxpbmVzOiBibGl0KCkgaXMgZmFzdGVy
+OyBIVUQvbWluaW1hcCB1c2UgZGlyZWN0IGRyYXdpbmcKIC0tIGNvbmZpZ3VyYXRpb24gZ3VhcmQ6
+IHByZXZlbnQgZm9nIHBvcHBpbmcgYmV5b25kIGZhci1wbGFuZQogYXNzZXJ0KGZhcl9wbGFuZT49
+Zm9nX2ZhcisxLCJjb25maWcgZXJyb3I6IGZhcl9wbGFuZSBtdXN0IGJlID49IGZvZ19mYXIgKyAx
+IikKIAogLS0gZGVmZW5zaXZlIGRlZmF1bHRzIGlmIGNvbmZpZyBpbmNsdWRlIGZhaWxlZCB0byBz
+ZXQgdGhlbSBmb3IgYW55IHJlYXNvbgogaWYgbm90IG9iamdyaWRfc2l6ZSB0aGVuIG9iamdyaWRf
+c2l6ZT01IGVuZAogaWYgbm90IG9iamdyaWRfYXJyYXlfc2l6ZSB0aGVuIG9iamdyaWRfYXJyYXlf
+c2l6ZT0yNiBlbmQKIAogLS0gZnJhbWUgY291bnRlciBmb3IgYWkgdGltaW5nCiBmcmFtZV9jdD0w
+CiAKIC0tIEluaXRpYWxpemUgbmV3IHJlbmRlcmVyCiByX3N0YXRlLmluaXQoewogIHNjcmVlbl93
+aWR0aCA9IHNjcmVlbl93aWR0aCwKICBzY3JlZW5faGVpZ2h0ID0gc2NyZWVuX2hlaWdodCwKICBy
+YXlfY291bnQgPSByYXlfY291bnQsCiAgc3ByaXRlX2J1Y2tldF9jb3VudCA9IDgsCiAgc3ByaXRl
+X2J1Y2tldF9jYXBhY2l0eSA9IDY0LAogIGRlYnVnX21vZGUgPSBmYWxzZQogfSkKIHJfYmF0Y2gu
+aW5pdCgpCiBwcmludGgoIlttYWluXSBuZXcgcmVuZGVyZXIgaW5pdGlhbGl6ZWQiKQogCiAtLSBD
+b21wYXRpYmlsaXR5IGhlbHBlcnMgZm9yIG1pbmltYXAgZHJhd2luZyAodXNlcyByX2JhdGNoKQog
+ZnVuY3Rpb24gcmJhdGNoX3Jlc2V0KCkKICByX2JhdGNoLnJlY3RfcmVzZXQoKQogZW5kCiBmdW5j
+dGlvbiByYmF0Y2hfcHVzaCh4MCwgeTAsIHgxLCB5MSwgYykKICByX2JhdGNoLnJlY3RfcHVzaCh4
+MCwgeTAsIHgxLCB5MSwgYykKIGVuZAogZnVuY3Rpb24gcmJhdGNoX3N1Ym1pdCgpCiAgcl9iYXRj
+aC5yZWN0X3N1Ym1pdCgpCiBlbmQKIAogLS0gcGxheWVyIHN0YXRlCiBwbGF5ZXI9ewogIHg9NjQs
+eT02NCwKICBhPTAsCiAgc3BkPXBsYXllcl9tb3ZlX3NwZWVkLAogIGtleXM9e30sCiAgaHA9MTAw
+CiB9CiAKIC0tIGludGVyYWN0aW9uIHN0YXRlCiBpbnRlcmFjdGlvbl9hY3RpdmU9ZmFsc2UKIGN1
+cnJlbnRfaW50ZXJhY3Q9bmlsCiAKIC0tIGNvbWJhdCBzdGF0ZQogaW5fY29tYmF0PWZhbHNlCiBj
+dXJyZW50X3RhcmdldD1uaWwKIAogLS0gdHJhcCBtZXNzYWdlIHRpbWVyCiB0cmFwX21zZ190aW1l
+cj0wCiAKIC0tIGNhbWVyYQogY2FtPXtwbGF5ZXIueCxwbGF5ZXIueX0KIAogLS0gbWFwIGFic3Ry
+YWN0aW9uIHdpdGggdXNlcmRhdGEgbGF5ZXJzCiBtYXA9e30KIG1hcC53YWxscz11c2VyZGF0YSgi
+aTE2IiwxMjgsMTI4KQogbWFwLmRvb3JzPXVzZXJkYXRhKCJpMTYiLDEyOCwxMjgpCiBtYXAuZmxv
+b3JzPXVzZXJkYXRhKCJpMTYiLDEyOCwxMjgpCiAKIC0tIGhlbHBlcjogZ2V0IHdhbGwgdGlsZQot
+LSBQdXJwb3NlOiBSZXRyaWV2ZSB3YWxsIHRpbGUgSUQgYXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFy
+YW1ldGVyczogeCwgeSAoZ3JpZCBjb29yZGluYXRlcyAwLTEyNykKIC0tIFJldHVybnM6IHRpbGUg
+SUQgKDA9ZW1wdHksID4wPXdhbGwvZG9vci9leGl0KQogZnVuY3Rpb24gZ2V0X3dhbGwoeCx5KQog
+aWYgeD49MCBhbmQgeDwxMjggYW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KICByZXR1cm4gbWFwLndh
+bGxzOmdldCh4LHkpIG9yIDAKIGVuZAogcmV0dXJuIDAKIGVuZAogCiAtLSBoZWxwZXI6IHNldCB3
+YWxsIHRpbGUKIGZ1bmN0aW9uIHNldF93YWxsKHgseSx2YWwpCiAgaWYgeD49MCBhbmQgeDwxMjgg
+YW5kIHk_PTAgYW5kIHk8MTI4IHRoZW4KCQltYXAud2FsbHM6c2V0KHgseSx2YWwgb3IgMCkKICBl
+bmQKIGVuZAogCiAtLSBoZWxwZXI6IGdldCBkb29yIHRpbGUKIGZ1bmN0aW9uIGdldF9kb29yKHgs
+eSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4g
+bWFwLmRvb3JzOmdldCh4LHkpIG9yIDAKICBlbmQKICByZXR1cm4gMAogZW5kCiAKIC0tIGhlbHBl
+cjogc2V0IGRvb3IgdGlsZQogZnVuY3Rpb24gc2V0X2Rvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFu
+ZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwxMjggdGhlbgogICBtYXAuZG9vcnM6c2V0KHgseSx2YWwg
+b3IgMCkKICBlbmQKIGVuZAoKIC0tIGhlbHBlcjogZ2V0IGZsb29yIHRpbGUKIC0tIFB1cnBvc2U6
+IFJldHJpZXZlIGZsb29yIHR5cGUgSUQgYXQgZ3JpZCBwb3NpdGlvbgogLS0gUGFyYW1ldGVyczog
+eCwgeSAoZ3JpZCBjb29yZGluYXRlcyAwLTEyNykKIC0tIFJldHVybnM6IGZsb29yIHR5cGUgSUQg
+KDA9dXNlIGdsb2JhbCBkZWZhdWx0LCAxLTg9c3BlY2lmaWMgZmxvb3IgdHlwZSBmcm9tIHBsYW5l
+dHlwcykKIC0tIE5vdGVzOiBGbG9vciB0eXBlIElEcyBtYXAgdG8gaW5kaWNlcyBpbiB0aGUgcGxh
+bmV0eXBzIHRhYmxlIGRlZmluZWQgaW4gY29uZmlnLmx1YQogZnVuY3Rpb24gZ2V0X2Zsb29yKHgs
+eSkKICBpZiB4Pj0wIGFuZCB4PDEyOCBhbmQgeT49MCBhbmQgeTwxMjggdGhlbgogICByZXR1cm4g
+bWFwLmZsb29yczpnZXQoeCx5KSBvciAwCiAgZW5kCiAgcmV0dXJuIDAKIGVuZAoKIC0tIGhlbHBl
+cjogc2V0IGZsb29yIHRpbGUKIC0tIFB1cnBvc2U6IFN0b3JlIHBlci1jZWxsIGZsb29yIHR5cGUg
+SURzIGZvciB2YXJpZWQgZmxvb3IgdGV4dHVyZXMKIC0tIFBhcmFtZXRlcnM6IHgsIHkgKGdyaWQg
+Y29vcmRpbmF0ZXMgMC0xMjcpLCB2YWwgKGZsb29yIHR5cGUgSUQgMC04KQogLS0gTm90ZXM6IDA9
+dXNlIGdsb2JhbCBkZWZhdWx0IGZsb29yIHR5cGUsIDEtOD1zcGVjaWZpYyBmbG9vciB0eXBlIGZy
+b20gcGxhbmV0eXBzCiBmdW5jdGlvbiBzZXRfZmxvb3IoeCx5LHZhbCkKICBpZiB4Pj0wIGFuZCB4
+PDEyOCBhbmQgeT49MCBhbmQgeTwxMjggdGhlbgogICAtLSBub3JtYWxpemUgdmFsIHRvIHZhbGlk
+IHJhbmdlIDAtOAogICBpZiB0eXBlKHZhbCl_PSJudW1iZXIiIG9yIHZhbD09bmlsIHRoZW4KICAg
+IHZhbD0wCiAgIGVsc2VpZiB2YWw8MCB0aGVuCiAgICB2YWw9MAogICBlbHNlaWYgdmFsPjggdGhl
+bgogICAgdmFsPTgKICAgZW5kCiAgIG1hcC5mbG9vcnM6c2V0KHgseSx2YWwpCiAgZW5kCiBlbmQK
+IAogZG9vcmdyaWQ9e30KIGZvciBpPTAsMTI3IGRvCiAgZG9vcmdyaWRbaV09e30KICBmb3Igaj0w
+LDEyNyBkbwogICBkb29yZ3JpZFtpXVtqXT1uaWwKICBlbmQKIGVuZAogCiAtLSBpbml0aWFsaXpl
+IGZsb29yIGRhdGEKIGZvciBpPTAsMTI3IGRvCiAgZm9yIGo9MCwxMjcgZG8KICAgc2V0X2Zsb29y
+KGksaiwwKQogIGVuZAogZW5kCiAgCiBkb29ycz17fQogb2JqZWN0cz17fQogYW5pbWF0ZWRfb2Jq
+ZWN0cz17fQogCi0tIExlZ2FjeSBidWZmZXJzIHJlbW92ZWQgKG5vdyBtYW5hZ2VkIGJ5IHJfc3Rh
+dGUpCiAtLSBkeW5hbWljIGJ1ZGdldHMKIGFjdGl2ZV9yYXlfY291bnQ9cmF5X2NvdW50CiByb3df
+c3RyaWRlX2R5bmFtaWM9cm93X3N0cmlkZQogCiAtLSBmb2cgc3RhdGUgZm9yIGh5c3RlcmVzaXMK
+IGxhc3RfZm9nX3o9MAogCiAtLSBwcm9qZWN0aW9uIGNvbnN0YW50IGRlZmluZWQgaW4gY29uZmln
+Lmx1YQogCiAtLSBmbG9vciBhbmQgcm9vZiBzdGF0ZQogZmxvb3I9e3R5cD1wbGFuZXR5cHNbMV0s
+eD0wLHk9MH0KIHJvb2Y9e3R5cD1wbGFuZXR5cHNbM10seD0wLHk9MH0KIAogZ2VuX3N0YXRzPXty
+b29tcz0wLG9iamVjdHM9MCxzZWVkPTAsaGlzdG9yeT17fX0KIHN0YXJ0X3Bvcz17eD1wbGF5ZXIu
+eCx5PXBsYXllci55fQogLS0gbW9kZTogM2Qgb3IgMmQgbWFwCiB2aWV3X21vZGU9IjNkIgogCiAt
+LSBkZWJ1ZyBtb2RlIGZvciByYXkgY2FzdGluZwogZGVidWdfbW9kZT1mYWxzZQpzaG93X2RpYWdu
+b3N0aWNzPWZhbHNlCmVuYWJsZV9kaWFnbm9zdGljc19sb2dnaW5nPWZhbHNlICAtLSBQZXJtYW5l
+bnRseSBkaXNhYmxlZCBmb3IgcHJvZHVjdGlvbiBwZXJmb3JtYW5jZQotLSBPcHRpb25hbDogcmUt
+ZW5hYmxlIGEgbm9uLXJlbmRlciBDUFUgZ292ZXJub3IgKHNhbXBsZXMgQ1BVIG91dHNpZGUgX2Ry
+YXcoKSkKZW5hYmxlX25vbnJlbmRlcl9nb3Zlcm5vcj1mYWxzZQpyZWNlbnRfY3B1PTAKIAogLS0g
+cGVyZm9ybWFuY2UgdmFsaWRhdGlvbiBtb2RlOiBkaXNhYmxlcyBDUFUgZ292ZXJub3IgdG8gc3Rh
+YmlsaXplIG1lYXN1cmVtZW50cwogcGVyZl92YWxpZGF0aW9uPWZhbHNlCiAKIC0tIGRpYWdub3N0
+aWMgY291bnRlcnMgZm9yIHBlcmZvcm1hbmNlIHRyYWNraW5nIChyZWZyZXNoZWQgZWFjaCBmcmFt
+ZSkKIGRpYWdfZnJhbWVfY291bnQ9MAogZGlhZ193YWxsX2NvbHVtbnM9MAogZGlhZ193YWxsX2xv
+ZF9jb2x1bW5zPTAKIGRpYWdfZmxvb3Jfcm93cz0wCiBkaWFnX2Zsb29yX2JhdGNoZXM9MAogZGlh
+Z19zcHJpdGVfY29sdW1ucz0wCiBkaWFnX3Nwcml0ZV9pbXBvc3Rvcl9jb2x1bW5zPTAKIGRpYWdf
+YWN0aXZlX3JheXM9cmF5X2NvdW50CiBsYXN0X2NwdV9zYW1wbGU9MAogCiAtLSB0ZXN0IGRvb3Ig
+bW9kZQogdGVzdF9kb29yX21vZGU9ZmFsc2UKCiAtLSBjcmVhdGUgdGludGVkIGVycm9yIHRleHR1
+cmVzIGZvciBkaWZmZXJlbnQgb2JqZWN0IHR5cGVzIChjaGVja2VyYm9hcmQgcGF0dGVybikKIC0t
+IHdhbGxzOiBtYWdlbnRhL3BpbmsgKDgvMTQpLCBmbG9vcjogYmx1ZS9jeWFuICgxMi8xMyksIGNl
+aWxpbmc6IGdyZWVuL2RhcmsgZ3JlZW4gKDExLzMpCiAtLSBzcHJpdGVzOiB5ZWxsb3cvb3Jhbmdl
+ICgxMC85KSwgcHJvcHM6IHJlZC9icm93biAoOC80KQogZXJyb3JfdGV4dHVyZXMgPSB7CiAgd2Fs
+bCA9IHVzZXJkYXRhKCJ1OCIsIDMyLCAzMiksCiBkb29yID0gdXNlcmRhdGEoInU4IiwgMzIsIDMy
+KSwKICBmbG9vciA9IHVzZXJkYXRhKCJ1OCIsIDMyLCAzMiksCiAgY2VpbGluZyA9IHVzZXJkYXRh
+KCJ1OCIsIDMyLCAzMiksCiAgc3ByaXRlID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKSwKICBkZWZh
+dWx0ID0gdXNlcmRhdGEoInU4IiwgMzIsIDMyKQogfQogCiAtLSBnZW5lcmF0ZSB0aW50ZWQgY2hl
+Y2tlcmJvYXJkcyBmb3IgZWFjaCB0eXBlCiBsb2NhbCB0aW50cyA9IHsKICB3YWxsID0gezgsIDE0
+fSwgICAgICAtLSBtYWdlbnRhL3BpbmsKIGRvb3IgPSB7MiwgNn0sICAgICAgIC0tIHB1cnBsZS9i
+bHVlIChkaXN0aW5jdCBmcm9tIHdhbGxzKQogIGZsb29yID0gezEyLCAxM30sICAgIC0tIGJsdWUv
+Y3lhbgogIGNlaWxpbmcgPSB7MTEsIDN9LCAgIC0tIGdyZWVuL2RhcmsgZ3JlZW4KICBzcHJpdGUg
+PSB7MTAsIDl9LCAgICAtLSB5ZWxsb3cvb3JhbmdlCiAgZGVmYXVsdCA9IHs4LCAxNH0gICAgLS0g
+bWFnZW50YS9waW5rIChmYWxsYmFjaykKIH0KIAogZm9yIHR5cGVfbmFtZSwgY29sb3JzIGluIHBh
+aXJzKHRpbnRzKSBkbwogIGZvciB5PTAsMzEgZG8KICAgZm9yIHg9MCwzMSBkbwogICAgbG9jYWwg
+Y29sb3IgPSAoKGZscih4LzQpICsgZmxyKHkvNCkpICUgMiA9PSAwKSBhbmQgY29sb3JzWzFdIG9y
+IGNvbG9yc1syXQogICAgZXJyb3JfdGV4dHVyZXNbdHlwZV9uYW1lXTpzZXQoeCwgeSwgY29sb3Ip
+CiAgIGVuZAogIGVuZAogZW5kCiAKIC0tIG1haW50YWluIGJhY2t3YXJkIGNvbXBhdGliaWxpdHkg
+d2l0aCBzaW5nbGUgZXJyb3JfdGV4dHVyZQogZXJyb3JfdGV4dHVyZSA9IGVycm9yX3RleHR1cmVz
+LmRlZmF1bHQKCiAtLSByZXNlcnZlIHNwcml0ZSBpbmRleGVzIGZvciBlcnJvciB0ZXh0dXJlcyAo
+YmF0Y2hpbmcgcHJlZmVycyBzcHJpdGUgaW5kZXhlcykKIEVSUk9SX0lEWCA9IHsgd2FsbD04MDAw
+LCBkb29yPTgwMDEsIGZsb29yPTgwMDIsIGNlaWxpbmc9ODAwMywgc3ByaXRlPTgwMDQsIGRlZmF1
+bHQ9ODAwNSB9CiBmb3IgbmFtZSwgdWQgaW4gcGFpcnMoZXJyb3JfdGV4dHVyZXMpIGRvCiAgbG9j
+YWwgaWR4ID0gRVJST1JfSURYW25hbWVdIG9yIEVSUk9SX0lEWC5kZWZhdWx0CiAgc2V0X3Nwcihp
+ZHgsIHVkKQogZW5kCiAKIC0tIFByZWxvYWQgdGV4dHVyZSBjYWNoZSBmb3IgY29tbW9ubHktdXNl
+ZCBzcHJpdGVzICgwLTIwMCkKIC0tIFBvcHVsYXRlIHRleF9jYWNoZSBkaXJlY3RseSB1c2luZyBn
+ZXRfc3ByKCkgdG8gYXZvaWQgd2FybmluZ3MKIHByaW50aCgicHJlbG9hZGluZyB0ZXh0dXJlIGNh
+Y2hlLi4uIikKIGxvY2FsIHByZWxvYWRfc3RhcnQgPSB0aW1lKCkKIGZvciBpPTAsMjAwIGRvCiAg
+bG9jYWwgc3JjPWdldF9zcHIgYW5kIGdldF9zcHIoaSkKICBpZiBzcmMgYW5kIGNhY2hlX3RleCB0
+aGVuCiAgIGNhY2hlX3RleChpLCBzcmMsIGZhbHNlKQogIGVuZAogZW5kCiBsb2NhbCBwcmVsb2Fk
+X3RpbWUgPSAodGltZSgpIC0gcHJlbG9hZF9zdGFydCkgKiAxMDAwCiBwcmludGgoInRleHR1cmUg
+Y2FjaGUgcHJlbG9hZGVkOiAiLi5wcmVsb2FkX3RpbWUuLiJtcyIpCiAtLSBUcmlnZ2VyIEdDIGFm
+dGVyIHByZWxvYWRpbmcgKFBpY290cm9uIGd1aWRlbGluZTogc3RhdCgwKSBkdXJpbmcgcGF1c2Vz
+IG9ubHkpCiBzdGF0KDApCiAKIC0tIGxvZ2dpbmcgaGVscGVyOiBjb25zb2xlICsgcmluZyBidWZm
+ZXIgZm9yIG9wdGlvbmFsIG9uLXNjcmVlbiBlY2hvCiBsb2dfbGluZXMgPSB7fQogZnVuY3Rpb24g
+bG9nKHN0cikKICBwcmludGgoc3RyKQogIGFkZChsb2dfbGluZXMsIHN0cikKICBpZiAjbG9nX2xp
+bmVzID4gMjAwIHRoZW4gZGVsaShsb2dfbGluZXMsIDEpIGVuZAogZW5kCgogLS0gdmFsaWRhdGUg
+YWxsIGNvbmZpZ3VyZWQgc3ByaXRlcyBleGlzdCAoY29tbWVudCBvdXQgZm9yIHByb2R1Y3Rpb24p
+CiB2YWxpZGF0ZV9zcHJpdGVfY29uZmlndXJhdGlvbigpCgogcHJpbnRoKCJwaWNvdHJvbiByYXlj
+YXN0IGVuZ2luZSB2MS4wIikKIHN3aXRjaF9zY2VuZSgibWVudSIpCmVuZAoKLS0gdmFsaWRhdGUg
+c3ByaXRlIGNvbmZpZ3VyYXRpb24gYXQgc3RhcnR1cCAob3B0aW9uYWwsIGNhbiBiZSBkaXNhYmxl
+ZCBmb3IgcGVyZm9ybWFuY2UpCmZ1bmN0aW9uIHZhbGlkYXRlX3Nwcml0ZV9jb25maWd1cmF0aW9u
+KCkKIC0tIGNoZWNrIGVuZW15IHNwcml0ZXMKIGZvciBlbmVteSBpbiBhbGwoZW5lbXlfdHlwZXMp
+IGRvCiAgaWYgbm90IGdldF9zcHIoZW5lbXkuc3ByaXRlKSB0aGVuCiAgIHByaW50aCgiV0FSTklO
+RzogZW5lbXkgc3ByaXRlICIuLmVuZW15LnNwcml0ZS4uIiAoIi4uZW5lbXkubmFtZS4uIikgbm90
+IGZvdW5kIGluIEdGWCBmaWxlcyIpCiAgZW5kCiBlbmQKIAogLS0gY2hlY2sgZGVjb3JhdGlvbiBz
+cHJpdGVzCiBmb3IgZGVjIGluIGFsbChkZWNvcmF0aW9uX3R5cGVzKSBkbwogIGlmIG5vdCBnZXRf
+c3ByKGRlYy5zcHJpdGUpIHRoZW4KICAgcHJpbnRoKCJXQVJOSU5HOiBkZWNvcmF0aW9uIHNwcml0
+ZSAiLi5kZWMuc3ByaXRlLi4iICgiLi5kZWMubmFtZS4uIikgbm90IGZvdW5kIGluIEdGWCBmaWxl
+cyIpCiAgZW5kCiBlbmQKIAogLS0gY2hlY2sgd2FsbCB0ZXh0dXJlIHNwcml0ZXMKIGZvciB0ZXhz
+ZXQgaW4gYWxsKHRleHNldHMpIGRvCiAgZm9yIHZhcmlhbnQgaW4gYWxsKHRleHNldC52YXJpYW50
+cykgZG8KICAgaWYgbm90IGdldF9zcHIodmFyaWFudCkgdGhlbgogICAgcHJpbnRoKCJXQVJOSU5H
+OiB3YWxsIHRleHR1cmUgc3ByaXRlICIuLnZhcmlhbnQuLiIgbm90IGZvdW5kIGluIEdGWCBmaWxl
+cyIpCiAgIGVuZAogIGVuZAogZW5kCiAKIC0tIGNoZWNrIGZsb29yL2NlaWxpbmcgc3ByaXRlcwog
+Zm9yIHR5cCBpbiBhbGwocGxhbmV0eXBzKSBkbwogIGlmIG5vdCBnZXRfc3ByKHR5cC50ZXgpIHRo
+ZW4KICAgcHJpbnRoKCJXQVJOSU5HOiBmbG9vci9jZWlsaW5nIHNwcml0ZSAiLi50eXAudGV4Li4i
+IG5vdCBmb3VuZCBpbiBHRlggZmlsZXMiKQogIGVuZAogZW5kCmVuZAoKZnVuY3Rpb24gdXBkYXRl
+X2dhbWVwbGF5KCkKIC0tIGluY3JlbWVudCBmcmFtZSBjb3VudGVyCiBmcmFtZV9jdCs9MQogCiAt
+LSBvcHRpb25hbDogc2FtcGxlIENQVSBvdXRzaWRlIHJlbmRlciBmcmFtZSAoZXZlcnkgMzAgZnJh
+bWVzKSBmb3Igbm9uLXJlbmRlciBnb3Zlcm5vcgogaWYgZW5hYmxlX25vbnJlbmRlcl9nb3Zlcm5v
+ciBhbmQgKGZyYW1lX2N0JTMwPT0wKSB0aGVuCiAgcmVjZW50X2NwdT1zdGF0KDEpIG9yIDAKIGVu
+ZAogCiAtLSBjb21iYXQgZ2F0aW5nOiBza2lwIG5vcm1hbCB1cGRhdGVzIHdoZW4gaW4gY29tYmF0
+CiBpZiBpbl9jb21iYXQgdGhlbgogIHVwZGF0ZV9jb21iYXQoKQogIHJldHVybgogZW5kCiAKIHVw
+ZGF0ZV9pbnB1dCgpCiB1cGRhdGVfZG9vcnMoKQogCiAtLSB1cGRhdGUgbnBjIGFpIChyYXRlIGxp
+bWl0ZWQsIGRldGVybWluaXN0aWMgZnJhbWUgY2hlY2spCiBpZiBmcmFtZV9jdCVhaV91cGRhdGVf
+cmF0ZT09MCB0aGVuCiAgdXBkYXRlX25wY19haSgpCiBlbmQKIAogY2FtPXtwbGF5ZXIueCxwbGF5
+ZXIueX0KIAogLS0gdXBkYXRlIGZsb29yL2NlaWxpbmcgc2Nyb2xsaW5nCiBmbG9vci54Kz1mbG9v
+ci50eXAueHZlbCBvciAwCiBmbG9vci55Kz1mbG9vci50eXAueXZlbCBvciAwCiByb29mLngrPXJv
+b2YudHlwLnh2ZWwgb3IgMAogcm9vZi55Kz1yb29mLnR5cC55dmVsIG9yIDAKIAogLS0gdXBkYXRl
+IG9iamVjdCBhbmltYXRpb25zCiBmb3Igb2IgaW4gYWxsKGFuaW1hdGVkX29iamVjdHMpIGRvCiAg
+aWYgb2IudHlwIGFuZCBvYi50eXAuZnJhbWVjdCB0aGVuCiAgIG9iLmZyYW1lKz1vYi50eXAuYW5p
+bXNwZAogICBpZiBvYi5hbmltbG9vcCB0aGVuCiAgICBvYi5mcmFtZT1vYi5mcmFtZSVvYi50eXAu
+ZnJhbWVjdAogICBlbHNlCiAgICBvYi5mcmFtZT1taW4ob2IuZnJhbWUsb2IudHlwLmZyYW1lY3Qt
+MSkKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gdG9nZ2xlIHZpZXcgbW9kZSAoZGVidWcgb25seSkK
+IGlmIGRlYnVnX21vZGUgYW5kIChrZXlwKCJ4Iikgb3IgYnRucCg1KSkgdGhlbgogIHZpZXdfbW9k
+ZT12aWV3X21vZGU9PSIzZCIgYW5kICIyZCIgb3IgIjNkIgogZW5kCiAKIC0tIGRlYnVnIG1vZGUg
+dG9nZ2xlIChtb3ZlZCBmcm9tIGJ0bnAoNCkgdG8gYXZvaWQgY29uZmxpY3QpCiBpZiBrZXlwKCJ0
+YWIiKSB0aGVuCiAgZGVidWdfbW9kZT1ub3QgZGVidWdfbW9kZQogZW5kCiAKIC0tIGRpYWdub3N0
+aWNzIG92ZXJsYXkgcmVtb3ZlZDsgbWVyZ2VkIGludG8gZGVidWcgcGFuZWwgKFRhYikKIAogLS0g
+dG9nZ2xlIGRpYWdub3N0aWNzIGxvZ2dpbmcgKGNvbnRyb2xsZXIgYnV0dG9uIDEyKQogaWYgYnRu
+cCgxMikgdGhlbgogIGVuYWJsZV9kaWFnbm9zdGljc19sb2dnaW5nPW5vdCBlbmFibGVfZGlhZ25v
+c3RpY3NfbG9nZ2luZwogIHByaW50aCgiRGlhZ25vc3RpY3MgbG9nZ2luZzogIi4udG9zdHJpbmco
+ZW5hYmxlX2RpYWdub3N0aWNzX2xvZ2dpbmcpKQogZW5kCiAKIC0tIGRlY3JlbWVudCB0cmFwIG1l
+c3NhZ2UgdGltZXIKIGlmIHRyYXBfbXNnX3RpbWVyPjAgdGhlbgogIHRyYXBfbXNnX3RpbWVyLT0x
+CiBlbmQKIAogLS0gdG9nZ2xlIHRlc3QgZG9vciBtb2RlICh3aGVuIG5vdCBpbiAyZCBtYXAgdmll
+dykKIGlmIHZpZXdfbW9kZT09IjNkIiBhbmQgKGtleXAoInYiKSBvciBidG5wKDE1KSkgdGhlbgog
+IHRlc3RfZG9vcl9tb2RlPW5vdCB0ZXN0X2Rvb3JfbW9kZQogZW5kCiAKIC0tIGN5Y2xlIHRlc3Qg
+ZG9vciBvcGVuIHZhbHVlICgwLjAgdG8gMS4wKQogaWYgdGVzdF9kb29yX21vZGUgdGhlbgogIGlm
+IGtleXAoImMiKSB0aGVuCiAgIHRlc3RfZG9vcl9vcGVuPSh0ZXN0X2Rvb3Jfb3BlbiBvciAwKSsw
+LjEKICAgaWYgdGVzdF9kb29yX29wZW4_MSB0aGVuIHRlc3RfZG9vcl9vcGVuPTAgZW5kCiAgZW5k
+CiAgaWYga2V5cCgiZCIpIHRoZW4KICAgdGVzdF9kb29yX29wZW49KHRlc3RfZG9vcl9vcGVuIG9y
+IDApLTAuMQogICBpZiB0ZXN0X2Rvb3Jfb3BlbjwwIHRoZW4gdGVzdF9kb29yX29wZW49MSBlbmQK
+ICBlbmQKIGVuZAogCiAtLSBjeWNsZSBmbG9vciB0eXBlIChmb3IgdGVzdGluZykgd2hlbiBub3Qg
+aW4gZG9vciB0ZXN0IG1vZGUKIGlmIG5vdCB0ZXN0X2Rvb3JfbW9kZSBhbmQga2V5cCgiYyIpIHRo
+ZW4KICBsb2NhbCBjdXJyZW50X2lkeD0xCiAgZm9yIGk9MSwjcGxhbmV0eXBzIGRvCiAgIGlmIHBs
+YW5ldHlwc1tpXS50ZXg9PWZsb29yLnR5cC50ZXggdGhlbgogICAgY3VycmVudF9pZHg9aQogICAg
+YnJlYWsKICAgZW5kCiAgZW5kCiAgZmxvb3IudHlwPXBsYW5ldHlwc1soY3VycmVudF9pZHggJSAj
+cGxhbmV0eXBzKSsxXQogIGZsb29yLngsZmxvb3IueT0wLDAKICAtLSBUZXN0IG1vZGU6IGNsZWFy
+IGNhY2hlIHdoZW4gY3ljbGluZyBmbG9vciB0eXBlcyAoY2FuIGJlIGRpc2FibGVkIGluIHByb2R1
+Y3Rpb24pCiAgaWYgY2xlYXJfdGV4dHVyZV9jYWNoZXMgdGhlbiBjbGVhcl90ZXh0dXJlX2NhY2hl
+cygpIGVuZAogZW5kCiAKIC0tIGN5Y2xlIHJvb2YgdHlwZSAoZm9yIHRlc3RpbmcpIHdoZW4gbm90
+IGluIGRvb3IgdGVzdCBtb2RlCiBpZiBub3QgdGVzdF9kb29yX21vZGUgYW5kIGtleXAoImQiKSB0
+aGVuCiAgbG9jYWwgY3VycmVudF9pZHg9MQogIGZvciBpPTEsI3BsYW5ldHlwcyBkbwogICBpZiBw
+bGFuZXR5cHNbaV0udGV4PT1yb29mLnR5cC50ZXggdGhlbgogICAgY3VycmVudF9pZHg9aQogICAg
+YnJlYWsKICAgZW5kCiAgZW5kCiAgcm9vZi50eXA9cGxhbmV0eXBzWyhjdXJyZW50X2lkeCAlICNw
+bGFuZXR5cHMpKzFdCiAgcm9vZi54LHJvb2YueT0wLDAKICAtLSBUZXN0IG1vZGU6IGNsZWFyIGNh
+Y2hlIHdoZW4gY3ljbGluZyByb29mIHR5cGVzIChjYW4gYmUgZGlzYWJsZWQgaW4gcHJvZHVjdGlv
+bikKICBpZiBjbGVhcl90ZXh0dXJlX2NhY2hlcyB0aGVuIGNsZWFyX3RleHR1cmVfY2FjaGVzKCkg
+ZW5kCiBlbmQKIAogLS0gZGVidWcgcmF5IGNhc3RpbmcgKHJlbW92ZWQgLSB1c2UgZGlhZ25vc3Rp
+Y3Mgb3ZlcmxheSBpbnN0ZWFkIHdpdGggVGFiIGtleSkKIC0tIExlZ2FjeSByYXljYXN0KCkvaGl0
+c2NhbigpIGZ1bmN0aW9ucyBubyBsb25nZXIgYXZhaWxhYmxlIGFmdGVyIHJlbmRlcmVyIHJlZmFj
+dG9yCiAtLSBVc2Ugcl9kaWFnIGRpYWdub3N0aWNzIG92ZXJsYXkgKFRhYiBrZXkpIGZvciBwZXJm
+b3JtYW5jZSBtZXRyaWNzCmVuZAoKZnVuY3Rpb24gZHJhd19nYW1lcGxheSgpCiBjbGlwKDAsMCxz
+Y3JlZW5fd2lkdGgsc2NyZWVuX2hlaWdodCkKIGNscygwKQogCiBsb2NhbCBmcmFtZV9zdGFydD10
+aW1lKCkKIAogZGlhZ19mcmFtZV9jb3VudCs9MQogCi0tIHJlc2V0IHBlci1mcmFtZSBkaWFnbm9z
+dGljcwpkaWFnX3dhbGxfY29sdW1ucz0wCmRpYWdfd2FsbF9sb2RfY29sdW1ucz0wCmRpYWdfZmxv
+b3Jfcm93cz0wCmRpYWdfZmxvb3JfYmF0Y2hlcz0wCmRpYWdfc3ByaXRlX2NvbHVtbnM9MApkaWFn
+X3Nwcml0ZV9pbXBvc3Rvcl9jb2x1bW5zPTAKCi0tIEVuc3VyZSBhZGFwdGl2ZSBjb250cm9scyBh
+cmUgaW5pdGlhbGl6ZWQgb25jZQppZiBub3QgYWN0aXZlX3JheV9jb3VudCB0aGVuIGFjdGl2ZV9y
+YXlfY291bnQ9cmF5X2NvdW50IGVuZAppZiBub3Qgcm93X3N0cmlkZV9keW5hbWljIHRoZW4gcm93
+X3N0cmlkZV9keW5hbWljPXJvd19zdHJpZGUgZW5kCgpsb2NhbCBmdW5jdGlvbiBhZGp1c3RfcmF5
+X2J1ZGdldChjcHVfc2FtcGxlKQogbG9jYWwgbWluX3JheXM9bWF4KDQ4LCBmbHIocmF5X2NvdW50
+KjAuMjUpKQogaWYgY3B1X3NhbXBsZT4wLjkwIHRoZW4KICBhY3RpdmVfcmF5X2NvdW50PW1heCht
+aW5fcmF5cywgYWN0aXZlX3JheV9jb3VudC0xNikKIGVsc2VpZiBjcHVfc2FtcGxlPDAuNzAgdGhl
+bgogIGFjdGl2ZV9yYXlfY291bnQ9bWluKHJheV9jb3VudCwgYWN0aXZlX3JheV9jb3VudCs4KQog
+ZW5kCmVuZAoKLS0gQ29udGludW91cyBDUFUgc2FtcGxpbmcgZm9yIGFkYXB0aXZlIGJ1ZGdldAps
+b2NhbCBjcHVfc2FtcGxlID0gc3RhdCgxKSBvciBsYXN0X2NwdV9zYW1wbGUgb3IgMAppZiBub3Qg
+cGVyZl92YWxpZGF0aW9uIGFuZCBub3QgZW5hYmxlX25vbnJlbmRlcl9nb3Zlcm5vciB0aGVuCiBh
+ZGp1c3RfcmF5X2J1ZGdldChjcHVfc2FtcGxlKQplbmQKCi0tIE9wdGlvbmFsIG5vbi1yZW5kZXIg
+Z292ZXJub3I6IHVzZXMgQ1BVIHNhbXBsZWQgaW4gX3VwZGF0ZSgpCmlmIGVuYWJsZV9ub25yZW5k
+ZXJfZ292ZXJub3IgdGhlbgogYWRqdXN0X3JheV9idWRnZXQocmVjZW50X2NwdSBvciBjcHVfc2Ft
+cGxlKQplbmQKbGFzdF9jcHVfc2FtcGxlPWNwdV9zYW1wbGUKZGlhZ19hY3RpdmVfcmF5cz1hY3Rp
+dmVfcmF5X2NvdW50CiAKIC0tIFByZXBhcmUgZnJhbWUgaW4gbmV3IHJlbmRlcmVyCiByX3N0YXRl
+LnByZXBhcmVfZnJhbWUoKQogcl9zdGF0ZS5jb25maWcuZGVidWdfbW9kZSA9IGRlYnVnX21vZGUK
+IAogLS0gVXBkYXRlIGRlYnVnIG1vZGUKIHJfc3RhdGUuY29uZmlnLmRlYnVnX21vZGUgPSBkZWJ1
+Z19tb2RlCiAKIGlmIHZpZXdfbW9kZT09IjNkIiB0aGVuCiAgLS0gQnVpbGQgY2FtZXJhIHRhYmxl
+CiAgbG9jYWwgY2FtZXJhID0ge3ggPSBwbGF5ZXIueCwgeSA9IHBsYXllci55LCBhID0gcGxheWVy
+LmF9CiAgCiAgLS0gVXBkYXRlIHZpZXcgKGNhbWVyYSBiYXNpcyBhbmQgcmF5IExVVHMpCiAgcl92
+aWV3LnVwZGF0ZShjYW1lcmEsIHJfc3RhdGUsIGZvdiwgYWN0aXZlX3JheV9jb3VudCkKICBsb2Nh
+bCB0X3ZpZXcgPSB0aW1lKCkKICAKICAtLSBDYXN0IHJheXMKICBsb2NhbCBnYW1lX3N0YXRlX2Nh
+c3QgPSB7CiAgICBnZXRfd2FsbCA9IGdldF93YWxsLAogICAgaXNfZG9vciA9IGlzX2Rvb3IsCiAg
+ICBkb29yZ3JpZCA9IGRvb3JncmlkLAogICAgdGVzdF9kb29yX21vZGUgPSB0ZXN0X2Rvb3JfbW9k
+ZSwKICAgIHRlc3RfZG9vcl9vcGVuID0gdGVzdF9kb29yX29wZW4sCiAgICBmYXJfcGxhbmUgPSBm
+YXJfcGxhbmUsCiAgICBtYXBfc2l6ZSA9IG1hcF9zaXplCiAgfQogIHJfY2FzdC5jYXN0X3NjZW5l
+KGNhbWVyYSwgcl92aWV3LCByX3N0YXRlLCBnYW1lX3N0YXRlX2Nhc3QpCiAgbG9jYWwgdF9yYXlj
+YXN0ID0gdGltZSgpCiAgCiAgLS0gRHJhdyBmbG9vciBhbmQgY2VpbGluZwogIGxvY2FsIGdhbWVf
+c3RhdGVfZmxvb3IgPSB7CiAgICBmbG9vciA9IGZsb29yLAogICAgcm9vZiA9IHJvb2YsCiAgICBz
+cHJpdGVfc2l6ZSA9IHNwcml0ZV9zaXplLAogICAgcGVyX2NlbGxfZmxvb3JzX2VuYWJsZWQgPSBw
+ZXJfY2VsbF9mbG9vcnNfZW5hYmxlZCwKICAgIGdldF9mbG9vciA9IGdldF9mbG9vciwKICAgIHBs
+YW5ldHlwcyA9IHBsYW5ldHlwcywKICAgIEVSUk9SX0lEWCA9IEVSUk9SX0lEWCwKICAgIGdldF9z
+cHIgPSBnZXRfc3ByLAogICAgZXJyb3JfdGV4dHVyZXMgPSBlcnJvcl90ZXh0dXJlcwogIH0KICBy
+X2Zsb29yLmRyYXdfZmxvb3JfY2VpbGluZyhjYW1lcmEsIHJfdmlldywgcl9zdGF0ZSwgcl9iYXRj
+aCwgZ2FtZV9zdGF0ZV9mbG9vcikKICBsb2NhbCB0X2Zsb29yID0gdGltZSgpCiAgCiAgLS0gRHJh
+dyB3YWxscwogIGxvY2FsIGdhbWVfc3RhdGVfd2FsbHMgPSB7CiAgICB3YWxsX2xvZF9kaXN0YW5j
+ZSA9IHdhbGxfbG9kX2Rpc3RhbmNlLAogICAgd2FsbF90aW55X3NjcmVlbl9weCA9IHdhbGxfdGlu
+eV9zY3JlZW5fcHgsCiAgICBzcHJpdGVfc2l6ZSA9IHNwcml0ZV9zaXplLAogICAgaXNfZG9vciA9
+IGlzX2Rvb3IsCiAgICBnZXRfc3ByID0gZ2V0X3NwciwKICAgIGVycm9yX3RleHR1cmVzID0gZXJy
+b3JfdGV4dHVyZXMsCiAgICBFUlJPUl9JRFggPSBFUlJPUl9JRFgKICB9CiAgcl93YWxscy5kcmF3
+X3NwYW5zKGNhbWVyYSwgcl92aWV3LCByX3N0YXRlLCByX2JhdGNoLCBnYW1lX3N0YXRlX3dhbGxz
+KQogIGxvY2FsIHRfd2FsbHMgPSB0aW1lKCkKICAKICAtLSBEcmF3IHNwcml0ZXMKICBsb2NhbCBn
+YW1lX3N0YXRlX3Nwcml0ZXMgPSB7CiAgICBvYmplY3RzID0gb2JqZWN0cywKICAgIGZhcl9wbGFu
+ZSA9IGZhcl9wbGFuZSwKICAgIHNwcml0ZV9sb2RfcmF0aW8gPSBzcHJpdGVfbG9kX3JhdGlvLAog
+ICAgZm9nX2ZhciA9IGZvZ19mYXIsCiAgICBzcHJpdGVfc2l6ZSA9IHNwcml0ZV9zaXplLAogICAg
+Z2V0X3NwciA9IGdldF9zcHIsCiAgICBlcnJvcl90ZXh0dXJlcyA9IGVycm9yX3RleHR1cmVzCiAg
+fQogIHJfc3ByaXRlcy5kcmF3KGNhbWVyYSwgcl92aWV3LCByX3N0YXRlLCByX2JhdGNoLCBnYW1l
+X3N0YXRlX3Nwcml0ZXMpCiAgbG9jYWwgdF9zcHJpdGVzID0gdGltZSgpCiAgCiAgbG9jYWwgbXNf
+dmlldyA9ICh0X3ZpZXcgLSBmcmFtZV9zdGFydCkgKiAxMDAwCiAgbG9jYWwgbXNfcmF5Y2FzdCA9
+ICh0X3JheWNhc3QgLSB0X3ZpZXcpICogMTAwMAogIGxvY2FsIG1zX2Zsb29yID0gKHRfZmxvb3Ig
+LSB0X3JheWNhc3QpICogMTAwMAogIGxvY2FsIG1zX3dhbGxzID0gKHRfd2FsbHMgLSB0X2Zsb29y
+KSAqIDEwMDAKICBsb2NhbCBtc19zcHJpdGVzID0gKHRfc3ByaXRlcyAtIHRfd2FsbHMpICogMTAw
+MAogIGxvY2FsIGZyYW1lX21zID0gKHRfc3ByaXRlcyAtIGZyYW1lX3N0YXJ0KSAqIDEwMDAKICAK
+ICAtLSBodWQgKG1pbmltYWwpCiAgcHJpbnQoInBvczoiLi5mbHIocGxheWVyLngpLi4iLCIuLmZs
+cihwbGF5ZXIueSksMiwyLDcpCiAgcHJpbnQoImFuZzoiLi4oZmxyKHBsYXllci5hKjEwMCkvMTAw
+KSwyLDEwLDcpCiAgcHJpbnQoImZwczoiLi5zdGF0KDcpLDIsMTgsNykKICBwcmludCgiaHA6Ii4u
+cGxheWVyLmhwLDIsMjYsNykKICAKICAtLSBpbnRlcmFjdGlvbiBwcm9tcHQKICBpZiBpbnRlcmFj
+dGlvbl9hY3RpdmUgYW5kIGN1cnJlbnRfaW50ZXJhY3QgdGhlbgogICBwcmludCgiW0VdL1o6IGlu
+dGVyYWN0IixzY3JlZW5fY2VudGVyX3gtNDAsc2NyZWVuX2hlaWdodC0yMCwxMSkKICBlbmQKICAK
+ICAtLSB0cmFwIG1lc3NhZ2UKICBpZiB0cmFwX21zZ190aW1lcj4wIHRoZW4KICAgcHJpbnQoInRy
+YXAgc3BydW5nISIsc2NyZWVuX2NlbnRlcl94LTMwLHNjcmVlbl9jZW50ZXJfeSw4KQogIGVuZAog
+IAogLS1bWyBERUJVRyBQQU5FTCBSRU1PVkVEIEZPUiBQUk9EVUNUSU9OIFBFUkZPUk1BTkNFCiBp
+ZiBkZWJ1Z19tb2RlIHRoZW4KICAtLSByZW1vdmVkCiBlbmQKIF1dCiAgCiAtLVtbIFBFUklPRElD
+IExPR0dJTkcgUkVNT1ZFRCBGT1IgUFJPRFVDVElPTiBQRVJGT1JNQU5DRQogaWYgZW5hYmxlX2Rp
+YWdub3N0aWNzX2xvZ2dpbmcgYW5kIGRpYWdfZnJhbWVfY291bnQlNjA9PTAgdGhlbgogIC0tIHJl
+bW92ZWQKIGVuZAogXV0KICAKICAtLSBtaW5pbWFwIEhVRCBvdmVybGF5CiAgZHJhd19taW5pbWFw
+X2h1ZCgpCiBlbHNlCiAgZHJhd19taW5pbWFwKCkKIGVuZAogCiAtLSBjb21iYXQgb3ZlcmxheQog
+aWYgaW5fY29tYmF0IHRoZW4KICByZWN0ZmlsbCgwLHNjcmVlbl9oZWlnaHQtNDAsc2NyZWVuX3dp
+ZHRoLHNjcmVlbl9oZWlnaHQsMCkKICBwcmludCgiZW50ZXJpbmcgY29tYmF0Li4uIixzY3JlZW5f
+Y2VudGVyX3gtNDAsc2NyZWVuX2NlbnRlcl95LDgpCiAgcHJpbnQoIltlbnRlcl0gZXhpdCAodGVt
+cCkiLHNjcmVlbl9jZW50ZXJfeC00MCxzY3JlZW5fY2VudGVyX3krMTAsNykKIGVuZAogCiAtLSBy
+ZXN0b3JlIHBhbGV0dGUgZnJvbSBmb2cgcmVtYXBwaW5nIChzaW5nbGUgcmVzdG9yZSBwZXIgZnJh
+bWUpCiBwYWwoKQogLS0gcmVzZXQgZm9nIHN0YXRlIHNvIGZpcnN0IHNldF9mb2cgYXBwbGllcyBt
+YXBwaW5nIG5leHQgZnJhbWUKIGxhc3RfZm9nX2xldmVsPS0xCiBwcmV2X3BhbD17fQoKIC0tIERy
+YXcgZGlhZ25vc3RpY3Mgb3ZlcmxheSAobmV3IHJlbmRlcmVyKQogcl9kaWFnLmRyYXcocl9zdGF0
+ZSwgZnJhbWVfbXMsIGNwdV9zYW1wbGUpCmVuZAoKbG9jYWwgZnVuY3Rpb24gZ2VuZXJhdGVfbGFi
+X2R1bmdlb24oc3RhdGUsc2VlZCkKIGxvY2FsIHRhcmdldF9zZWVkPXNlZWQgb3IgKDErZmxyKHJu
+ZCg5OTk5OTkpKSkKIGlmIHRhcmdldF9zZWVkPDEgdGhlbiB0YXJnZXRfc2VlZD0xIGVuZAogc3Rh
+cnRfcG9zLGdlbl9zdGF0cz1nZW5lcmF0ZV9kdW5nZW9uKHtzZWVkPXRhcmdldF9zZWVkfSkKIHN0
+YXRlLnNlZWQ9Z2VuX3N0YXRzLnNlZWQKIHN0YXRlLmdlbl9zdGF0cz1nZW5fc3RhdHMKIHN0YXRl
+Lmhpc3Rvcnk9Z2VuX3N0YXRzLmhpc3Rvcnkgb3Ige30KIHN0YXRlLmhpc3RvcnlfY3Vyc29yPW1h
+eCgwLCNzdGF0ZS5oaXN0b3J5LTIwKQogc3RhdGUuaGFybmVzc19yZXN1bHQ9c3RhdGUuaGFybmVz
+c19yZXN1bHQgb3IgbmlsCiB2aWV3X21vZGU9IjJkIgplbmQKCmxvY2FsIGZ1bmN0aW9uIGRyYXdf
+bGFiX21hcChzdGF0ZSkKIGxvY2FsIHNjYWxlPTMKIGxvY2FsIG94PTgKIGxvY2FsIG95PTgKIGxv
+Y2FsIG1hcF9weD1tYXBfc2l6ZSpzY2FsZQogcmVjdGZpbGwoMCwwLHNjcmVlbl93aWR0aC0xLHNj
+cmVlbl9oZWlnaHQtMSwwKQogcmVjdGZpbGwob3gtMixveS0yLG94K21hcF9weCsxLG95K21hcF9w
+eCsxLDEpCiBmb3IgeD0wLG1hcF9zaXplLTEgZG8KICBmb3IgeT0wLG1hcF9zaXplLTEgZG8KICAg
+bG9jYWwgd2FsbD1nZXRfd2FsbCh4LHkpCiAgIGxvY2FsIGZsb29yX3ZhbD1nZXRfZmxvb3IoeCx5
+KQogICBsb2NhbCBjb2xvcgogICBpZiB3YWxsPjAgdGhlbgogICAgY29sb3I9NQogICBlbHNlaWYg
+Zmxvb3JfdmFsPjAgdGhlbgogICAgY29sb3I9NgogICBlbHNlCiAgICBjb2xvcj0wCiAgIGVuZAog
+ICByZWN0ZmlsbChveCt4KnNjYWxlLG95K3kqc2NhbGUsb3greCpzY2FsZStzY2FsZS0xLG95K3kq
+c2NhbGUrc2NhbGUtMSxjb2xvcikKICBlbmQKIGVuZAogZm9yIG5vZGUgaW4gYWxsKGdlbl9ub2Rl
+cykgZG8KICBsb2NhbCByPW5vZGUucmVjdAogIHJlY3Qob3grclsxXSpzY2FsZSxveStyWzJdKnNj
+YWxlLG94K3JbM10qc2NhbGUsb3krcls0XSpzY2FsZSwxMSkKIGVuZAogZm9yIGVkZ2UgaW4gYWxs
+KGdlbl9lZGdlcykgZG8KICBsb2NhbCBjPWVkZ2UubG9ja2VkIGFuZCA4IG9yIDEyCiAgbG9jYWwg
+eDE9b3grZWRnZS5uMS5taWR4KnNjYWxlCiAgbG9jYWwgeTE9b3krZWRnZS5uMS5taWR5KnNjYWxl
+CiAgbG9jYWwgeDI9b3grZWRnZS5uMi5taWR4KnNjYWxlCiAgbG9jYWwgeTI9b3krZWRnZS5uMi5t
+aWR5KnNjYWxlCiAgbGluZSh4MSx5MSx4Mix5MixjKQogIGlmIGVkZ2UuYjEgdGhlbgogICByZWN0
+ZmlsbChveCtlZGdlLmIxLngqc2NhbGUsb3krZWRnZS5iMS55KnNjYWxlLG94K2VkZ2UuYjEueCpz
+Y2FsZStzY2FsZS0xLG95K2VkZ2UuYjEueSpzY2FsZStzY2FsZS0xLGMpCiAgZW5kCiAgaWYgZWRn
+ZS5iMiB0aGVuCiAgIHJlY3RmaWxsKG94K2VkZ2UuYjIueCpzY2FsZSxveStlZGdlLmIyLnkqc2Nh
+bGUsb3grZWRnZS5iMi54KnNjYWxlK3NjYWxlLTEsb3krZWRnZS5iMi55KnNjYWxlK3NjYWxlLTEs
+YykKICBlbmQKIGVuZAogZm9yIGRvb3IgaW4gYWxsKGRvb3JzKSBkbwogIGxvY2FsIGM9ZG9vci5k
+dHlwZT09ZG9vcl9sb2NrZWQgYW5kIDggb3IgMTAKICByZWN0ZmlsbChveCtkb29yLngqc2NhbGUs
+b3krZG9vci55KnNjYWxlLG94K2Rvb3IueCpzY2FsZStzY2FsZS0xLG95K2Rvb3IueSpzY2FsZStz
+Y2FsZS0xLGMpCiBlbmQKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi5wb3MgdGhl
+bgogICBsb2NhbCBjeD1veCtvYi5wb3NbMV0qc2NhbGUKICAgbG9jYWwgY3k9b3krb2IucG9zWzJd
+KnNjYWxlCiAgIGxvY2FsIGNvbG9yPTcKICAgaWYgb2IudHlwPT1vYmpfdHlwZXMua2V5IHRoZW4g
+Y29sb3I9OQogICBlbHNlaWYgb2IudHlwPT1vYmpfdHlwZXMuaG9zdGlsZV9ucGMgdGhlbiBjb2xv
+cj04CiAgIGVsc2VpZiBvYi50eXA9PW9ial90eXBlcy5ub25faG9zdGlsZV9ucGMgdGhlbiBjb2xv
+cj0xMwogICBlbHNlaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09ImludGVyYWN0YWJsZSIgdGhl
+biBjb2xvcj0xMgogICBlbmQKICAgY2lyY2ZpbGwoY3gsY3ksMSxjb2xvcikKICBlbmQKIGVuZAog
+cHJpbnQoImNvbnRyb2xzOiBaPXJhbmRvbSAgWD1yZXBsYXkgIOKGkC-ihpIgc2VlZCAgRj1oYXJu
+ZXNzIiw4LHNjcmVlbl9oZWlnaHQtMjAsNykKIHByaW50KCJzY3JvbGwgbG9nOiDihpEv4oaTICAg
+IG1lbnU6IEcgb3IgTUVOVSIsOCxzY3JlZW5faGVpZ2h0LTEyLDcpCmVuZAoKbG9jYWwgZnVuY3Rp
+b24gZHJhd19sYWJfaGlzdG9yeShzdGF0ZSkKIGxvY2FsIHBhbmVsX3g9c2NyZWVuX3dpZHRoLTE1
+NAogbG9jYWwgcGFuZWxfdz0xNDAKIGxvY2FsIHBhbmVsX3RvcD0xMgogbG9jYWwgcGFuZWxfYm90
+dG9tPXNjcmVlbl9oZWlnaHQtMTIKIGxvY2FsIHBhbmVsX2g9cGFuZWxfYm90dG9tLXBhbmVsX3Rv
+cAoKIHJlY3RmaWxsKHBhbmVsX3gtNCxwYW5lbF90b3AtNCxwYW5lbF94K3BhbmVsX3crMixwYW5l
+bF9ib3R0b20sMCkKIHJlY3QocGFuZWxfeC01LHBhbmVsX3RvcC01LHBhbmVsX3grcGFuZWxfdysz
+LHBhbmVsX2JvdHRvbSsxLDEpCgogbG9jYWwgeT1wYW5lbF90b3AKIGxvY2FsIHNlZWRfdGV4dD0i
+c2VlZDogIi4uKHN0YXRlLnNlZWQgb3IgIj8iKQogbG9jYWwgcm9vbXNfdGV4dD0icm9vbXM6ICIu
+LigjZ2VuX25vZGVzIG9yIDApCiBsb2NhbCBsb2NrZWRfY291bnQ9MAogaWYgZ2VuX2xvY2tlZF9l
+ZGdlcyB0aGVuCiAgZm9yIGUgaW4gYWxsKGdlbl9sb2NrZWRfZWRnZXMpIGRvCiAgIGlmIGUubG9j
+a2VkIHRoZW4gbG9ja2VkX2NvdW50Kz0xIGVuZAogIGVuZAogZW5kCiBsb2NhbCBsb2NrZWRfdGV4
+dD0ibG9ja2VkIGVkZ2VzOiAiLi5sb2NrZWRfY291bnQKIHByaW50KHNlZWRfdGV4dCxwYW5lbF94
+LHksNykgeSs9OAogcHJpbnQocm9vbXNfdGV4dCxwYW5lbF94LHksNykgeSs9OAogcHJpbnQobG9j
+a2VkX3RleHQscGFuZWxfeCx5LDcpIHkrPTEyCgogbG9jYWwgaGlzdG9yeT1zdGF0ZS5oaXN0b3J5
+IG9yIHt9CiBsb2NhbCBhdmFpbGFibGVfc3BhY2U9cGFuZWxfaC0oeS1wYW5lbF90b3ApLTI0CiBs
+b2NhbCBsaW5lX2g9OAogbG9jYWwgbWF4X2xpbmVzPW1heCgwLGZscihhdmFpbGFibGVfc3BhY2Uv
+bGluZV9oKSkKCiBwcmludCgiZ2VuZXJhdGlvbiBsb2ciLHBhbmVsX3gseSwxMSkKIHkrPWxpbmVf
+aAoKIGlmIG1heF9saW5lczw9MCB0aGVuCiAgcHJpbnQoIihwYW5lbCB0b28gc21hbGwpIixwYW5l
+bF94LHksOCkKIGVsc2UKICBsb2NhbCBjdXJzb3I9c3RhdGUuaGlzdG9yeV9jdXJzb3Igb3IgMAog
+IGxvY2FsIG1heF9jdXJzb3I9bWF4KDAsbWF4KCNoaXN0b3J5LW1heF9saW5lcywwKSkKICBpZiBj
+dXJzb3I_bWF4X2N1cnNvciB0aGVuIGN1cnNvcj1tYXhfY3Vyc29yIGVuZAogIGlmIGN1cnNvcjww
+IHRoZW4gY3Vyc29yPTAgZW5kCiAgc3RhdGUuaGlzdG9yeV9jdXJzb3I9Y3Vyc29yCiAgaWYgI2hp
+c3Rvcnk9PTAgdGhlbgogICBwcmludCgiKG5vIGV2ZW50cykiLHBhbmVsX3gseSw1KQogIGVsc2UK
+ICAgZm9yIGk9MSxtYXhfbGluZXMgZG8KICAgIGxvY2FsIGlkeD1jdXJzb3IraQogICAgaWYgaWR4
+PiNoaXN0b3J5IHRoZW4gYnJlYWsgZW5kCiAgICBsb2NhbCBlbnRyeT1oaXN0b3J5W2lkeF0KICAg
+IGlmIGVudHJ5IHRoZW4KICAgICBwcmludChzdHJpbmcuc3ViKGVudHJ5LDEsMzIpLHBhbmVsX3gs
+eSw3KQogICAgIHkrPWxpbmVfaAogICAgZW5kCiAgIGVuZAogIGVuZAogZW5kCgogeT1wYW5lbF9i
+b3R0b20tMTYKIGlmIHN0YXRlLmhhcm5lc3NfcmVzdWx0IHRoZW4KICBsb2NhbCByZXM9c3RhdGUu
+aGFybmVzc19yZXN1bHQKICBsb2NhbCBmYWlsdXJlcz1yZXMuZmFpbHVyZXMgb3IgMAogIGxvY2Fs
+IGNvbG9yPWZhaWx1cmVzPjAgYW5kIDggb3IgMTEKICBwcmludCgiaGFybmVzczogIi4uKHJlcy50
+b3RhbCBvciAwKSxwYW5lbF94LHksY29sb3IpCiAgeSs9bGluZV9oCiAgcHJpbnQoImZhaWx1cmVz
+OiAiLi5mYWlsdXJlcyxwYW5lbF94LHksY29sb3IpCiAgeSs9bGluZV9oCiBlbmQKIHByaW50KCJz
+Y3JvbGw6IOKGkS-ihpMgICBtZW51OiBHL01FTlUiLHBhbmVsX3gseSw2KQplbmQKCnNjZW5lcy5t
+ZW51PXsKIGVudGVyPWZ1bmN0aW9uKHN0YXRlKQogIHN0YXRlLm9wdGlvbnM9eyJTdGFydCBHYW1l
+cGxheSIsIkR1bmdlb24gTGFiIn0KICBzdGF0ZS5pbmRleD1zdGF0ZS5pbmRleCBvciAxCiAgc3Rh
+dGUubWVzc2FnZT0iIgogZW5kLAogdXBkYXRlPWZ1bmN0aW9uKHN0YXRlKQogIGxvY2FsIG1vdmVf
+dXA9YnRucCgyKSBvciBrZXlwKCJ1cCIpIG9yIGtleXAoInciKQogIGxvY2FsIG1vdmVfZG93bj1i
+dG5wKDMpIG9yIGtleXAoImRvd24iKSBvciBrZXlwKCJzIikKICBpZiBtb3ZlX3VwIHRoZW4KICAg
+c3RhdGUuaW5kZXg9bWF4KDEsc3RhdGUuaW5kZXgtMSkKICBlbHNlaWYgbW92ZV9kb3duIHRoZW4K
+ICAgc3RhdGUuaW5kZXg9bWluKCNzdGF0ZS5vcHRpb25zLHN0YXRlLmluZGV4KzEpCiAgZW5kCgog
+IGxvY2FsIGNvbmZpcm09YnRucCg0KSBvciBidG5wKDUpIG9yIGtleXAoInoiKSBvciBrZXlwKCJ4
+Iikgb3Iga2V5cCgiZW50ZXIiKSBvciBrZXlwKCJyZXR1cm4iKQogIGlmIGNvbmZpcm0gdGhlbgog
+ICBsb2NhbCBjaG9pY2U9c3RhdGUub3B0aW9uc1tzdGF0ZS5pbmRleF0KICAgaWYgY2hvaWNlPT0i
+U3RhcnQgR2FtZXBsYXkiIHRoZW4KICAgIHN3aXRjaF9zY2VuZSgiZ2FtZXBsYXkiLHt9KQogICBl
+bHNlaWYgY2hvaWNlPT0iRHVuZ2VvbiBMYWIiIHRoZW4KICAgIHN3aXRjaF9zY2VuZSgiZHVuZ2Vv
+bl9sYWIiLHt9KQogICBlbmQKICBlbmQKIGVuZCwKIGRyYXc9ZnVuY3Rpb24oc3RhdGUpCiAgY2xz
+KDApCiAgcHJpbnQoIlJheWNhc3QgRW5naW5lIixzY3JlZW5fY2VudGVyX3gtNDgsNDAsMTEpCiAg
+cHJpbnQoIk1haW4gTWVudSIsc2NyZWVuX2NlbnRlcl94LTMyLDU2LDcpCiAgZm9yIGlkeCxvcHQg
+aW4gaXBhaXJzKHN0YXRlLm9wdGlvbnMpIGRvCiAgIGxvY2FsIHk9ODArKGlkeC0xKSoxMgogICBs
+b2NhbCBjb2xvcj0oaWR4PT1zdGF0ZS5pbmRleCkgYW5kIDEwIG9yIDcKICAgcHJpbnQoKGlkeD09
+c3RhdGUuaW5kZXggYW5kICI_IiBvciAiICIpLi4iICIuLm9wdCxzY3JlZW5fY2VudGVyX3gtNDAs
+eSxjb2xvcikKICBlbmQKICBwcmludCgiW1pdIGNvbmZpcm0gIFtVUC9ET1dOXSBuYXZpZ2F0ZSIs
+c2NyZWVuX2NlbnRlcl94LTY0LHNjcmVlbl9oZWlnaHQtMzIsNykKIGVuZAp9CgpzY2VuZXMuZ2Ft
+ZXBsYXk9ewogZW50ZXI9ZnVuY3Rpb24oc3RhdGUscGFyYW1zKQogIGxvY2FsIHNlZWQ9cGFyYW1z
+IGFuZCBwYXJhbXMuc2VlZAogIHN0YXJ0X3BvcyxnZW5fc3RhdHM9Z2VuZXJhdGVfZHVuZ2Vvbih7
+c2VlZD1zZWVkfSkKICBwbGF5ZXIueD1zdGFydF9wb3MueAogIHBsYXllci55PXN0YXJ0X3Bvcy55
+CiAgdmlld19tb2RlPSIzZCIKICBzdGF0ZS5zZWVkPWdlbl9zdGF0cy5zZWVkCiBlbmQsCiB1cGRh
+dGU9ZnVuY3Rpb24oc3RhdGUpCiAgaWYgYnRucCg2KSBvciBrZXlwKCJnIikgdGhlbgogICBzd2l0
+Y2hfc2NlbmUoIm1lbnUiKQogICByZXR1cm4KICBlbmQKICB1cGRhdGVfZ2FtZXBsYXkoKQogZW5k
+LAogZHJhdz1mdW5jdGlvbihzdGF0ZSkKICBkcmF3X2dhbWVwbGF5KCkKICBwcmludCgiW01FTlVd
+L0cgdG8gcmV0dXJuIixzY3JlZW5fd2lkdGgtMTIwLHNjcmVlbl9oZWlnaHQtMTAsNykKIGVuZAp9
+CgpzY2VuZXMuZHVuZ2Vvbl9sYWI9ewogZW50ZXI9ZnVuY3Rpb24oc3RhdGUscGFyYW1zKQogIHN0
+YXRlLnNlZWQ9cGFyYW1zIGFuZCBwYXJhbXMuc2VlZAogIGdlbmVyYXRlX2xhYl9kdW5nZW9uKHN0
+YXRlLHN0YXRlLnNlZWQpCiBlbmQsCiB1cGRhdGU9ZnVuY3Rpb24oc3RhdGUpCiAgaWYgYnRucCg2
+KSBvciBrZXlwKCJnIikgdGhlbgogICBzd2l0Y2hfc2NlbmUoIm1lbnUiKQogICByZXR1cm4KICBl
+bmQKICBpZiBrZXlwKCJ6IikgdGhlbgogICBnZW5lcmF0ZV9sYWJfZHVuZ2VvbihzdGF0ZSxuaWwp
+CiAgZWxzZWlmIGtleXAoIngiKSB0aGVuCiAgIGdlbmVyYXRlX2xhYl9kdW5nZW9uKHN0YXRlLHN0
+YXRlLnNlZWQpCiAgZWxzZWlmIGtleXAoImxlZnQiKSBvciBidG5wKDApIHRoZW4KICAgbG9jYWwg
+c2VlZD0oc3RhdGUuc2VlZCBvciAxKS0xCiAgIGlmIHNlZWQ8MSB0aGVuIHNlZWQ9MSBlbmQKICAg
+Z2VuZXJhdGVfbGFiX2R1bmdlb24oc3RhdGUsc2VlZCkKICBlbHNlaWYga2V5cCgicmlnaHQiKSBv
+ciBidG5wKDEpIHRoZW4KICAgbG9jYWwgc2VlZD0oc3RhdGUuc2VlZCBvciAxKSsxCiAgIGdlbmVy
+YXRlX2xhYl9kdW5nZW9uKHN0YXRlLHNlZWQpCiAgZWxzZWlmIGtleXAoImYiKSB0aGVuCiAgIGxv
+Y2FsIHByZXZpb3VzX3NlZWQ9c3RhdGUuc2VlZAogICBzdGF0ZS5oYXJuZXNzX3Jlc3VsdD1kdW5n
+ZW9uX2hhcm5lc3MucnVuKCkKICAgZ2VuZXJhdGVfbGFiX2R1bmdlb24oc3RhdGUscHJldmlvdXNf
+c2VlZCkKICBlbHNlaWYgYnRucCgyKSBvciBrZXlwKCJ1cCIpIG9yIGtleXAoInBhZ2V1cCIpIHRo
+ZW4KICAgc3RhdGUuaGlzdG9yeV9jdXJzb3I9bWF4KDAsKHN0YXRlLmhpc3RvcnlfY3Vyc29yIG9y
+IDApLTEpCiAgZWxzZWlmIGJ0bnAoMykgb3Iga2V5cCgiZG93biIpIG9yIGtleXAoInBhZ2Vkb3du
+IikgdGhlbgogICBsb2NhbCBoaXN0b3J5PXN0YXRlLmhpc3Rvcnkgb3Ige30KICAgbG9jYWwgbWF4
+X2N1cnNvcj1tYXgoMCwjaGlzdG9yeS0xKQogICBzdGF0ZS5oaXN0b3J5X2N1cnNvcj1taW4obWF4
+X2N1cnNvciwoc3RhdGUuaGlzdG9yeV9jdXJzb3Igb3IgMCkrMSkKICBlbmQKIGVuZCwKIGRyYXc9
+ZnVuY3Rpb24oc3RhdGUpCiAgZHJhd19sYWJfbWFwKHN0YXRlKQogIGRyYXdfbGFiX2hpc3Rvcnko
+c3RhdGUpCiBlbmQKfQoKZnVuY3Rpb24gX3VwZGF0ZSgpCiBzY2VuZV91cGRhdGUoKQplbmQKCmZ1
+bmN0aW9uIF9kcmF3KCkKIHNjZW5lX2RyYXcoKQplbmQKCi0tIGRyYXcgMmQgbWluaW1hcCBmb3Ig
+dGVzdGluZwotLSBQdXJwb3NlOiBSZW5kZXIgMkQgdG9wLWRvd24gZGVidWcgdmlldyBvZiBkdW5n
+ZW9uCi0tIEFsZ29yaXRobTogU2NhbGUgMTI4w5cxMjggbWFwIHRvIDI1NsOXMjU2IHBpeGVscyAo
+c2NhbGU9MikKLS0gRGlzcGxheXM6IFdhbGxzLCByb29tcywgZG9vcnMsIG9iamVjdHMsIHBsYXll
+ciBwb3NpdGlvbiBhbmQgZmFjaW5nCi0tIE5vdGVzOiBUb2dnbGVkIHdpdGggWCBidXR0b24sIHVz
+ZWZ1bCBmb3IgZGVidWdnaW5nIGdlbmVyYXRpb24KZnVuY3Rpb24gZHJhd19taW5pbWFwKCkKIGxv
+Y2FsIHNjYWxlPTIKIGxvY2FsIG94LG95PTEwLDEwCiAKIC0tIGJhdGNoIGFsbCB0aWxlIGRyYXdp
+bmcgdG8gcmVkdWNlIGRyYXcgY2FsbCBjb3VudAogcmJhdGNoX3Jlc2V0KCkKIAogLS0gZHJhdyB3
+YWxscyBmcm9tIG1hcC53YWxscyB1c2VyZGF0YSB3aXRoIGZsb29yIGRhdGEgdG8gZGlzdGluZ3Vp
+c2ggY29ycmlkb3JzIGZyb20gdm9pZAogZm9yIHg9MCwxMjcgZG8KICBmb3IgeT0wLDEyNyBkbwog
+ICBsb2NhbCB3YWxsPWdldF93YWxsKHgseSkKICAgbG9jYWwgZmxvb3JfdmFsPWdldF9mbG9vcih4
+LHkpCiAgIGxvY2FsIGNvbG9yCiAgIGlmIHdhbGw_MCB0aGVuCiAgICAtLSB3YWxsIHRpbGUKICAg
+IGNvbG9yPTUKICAgZWxzZWlmIGZsb29yX3ZhbD4wIHRoZW4KICAgIC0tIGNhcnZlZCBjb3JyaWRv
+ci9yb29tIGZsb29yIChmbG9vciB0eXBlIHNldCBkdXJpbmcgZ2VuZXJhdGlvbikKICAgIGNvbG9y
+PTYKICAgZWxzZQogICAgLS0gdW5jYXJ2ZWQgdm9pZCAod2FsbD0wLCBmbG9vcj0wKQogICAgY29s
+b3I9MQogICBlbmQKICAgcmJhdGNoX3B1c2gob3greCpzY2FsZSxveSt5KnNjYWxlLG94K3gqc2Nh
+bGUrc2NhbGUtMSxveSt5KnNjYWxlK3NjYWxlLTEsY29sb3IpCiAgZW5kCiBlbmQKIAogcmJhdGNo
+X3N1Ym1pdCgpCiAKIC0tIGRyYXcgcm9vbXMKIGZvciBub2RlIGluIGFsbChnZW5fbm9kZXMpIGRv
+CiAgbG9jYWwgcj1ub2RlLnJlY3QKICByZWN0KG94K3JbMV0qc2NhbGUsb3krclsyXSpzY2FsZSxv
+eCtyWzNdKnNjYWxlLG95K3JbNF0qc2NhbGUsMTEpCiBlbmQKIAogLS0gYmF0Y2ggZG9vciBkcmF3
+aW5nCiByYmF0Y2hfcmVzZXQoKQogZm9yIGRvb3IgaW4gYWxsKGRvb3JzKSBkbwogIGxvY2FsIGM9
+ZG9vci5kdHlwZT09ZG9vcl9sb2NrZWQgYW5kIDggb3IgMTIKICByYmF0Y2hfcHVzaChveCtkb29y
+Lngqc2NhbGUsb3krZG9vci55KnNjYWxlLG94K2Rvb3IueCpzY2FsZStzY2FsZS0xLG95K2Rvb3Iu
+eSpzY2FsZStzY2FsZS0xLGMpCiBlbmQKIHJiYXRjaF9zdWJtaXQoKQogCiAtLSBkcmF3IG9iamVj
+dHMKIGZvciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBsb2NhbCBjPTcKICBpZiBvYi50eXAgYW5k
+IG9iLnR5cC5raW5kPT0iaG9zdGlsZV9ucGMiIHRoZW4gYz04CiAgZWxzZWlmIG9iLnR5cCBhbmQg
+b2IudHlwLmtpbmQ9PSJkaXJlY3RfcGlja3VwIiB0aGVuCiAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0i
+aGVhcnQiIHRoZW4gYz0xNAogICBlbHNlaWYgb2IudHlwLnN1YnR5cGU9PSJrZXkiIHRoZW4gYz05
+CiAgIGVuZAogIGVsc2VpZiBvYi50eXAgYW5kIG9iLnR5cC5raW5kPT0iaW50ZXJhY3RhYmxlIiB0
+aGVuCiAgIGlmIG9iLnR5cC5zdWJ0eXBlPT0iZXhpdCIgdGhlbiBjPTEyIGVuZAogIGVsc2VpZiBv
+Yi50eXAgYW5kIG9iLnR5cC5raW5kPT0iZGVjb3JhdGl2ZSIgdGhlbiBjPTEzCiAgZW5kCiAgbG9j
+YWwgeD1vYi5wb3NbMV0KICBsb2NhbCB5PW9iLnBvc1syXQogIGNpcmNmaWxsKG94K3gqc2NhbGUs
+b3kreSpzY2FsZSwxLGMpCiBlbmQKIAogLS0gZHJhdyBwbGF5ZXIKIGxvY2FsIHB4LHB5PW94K3Bs
+YXllci54KnNjYWxlLG95K3BsYXllci55KnNjYWxlCiBjaXJjZmlsbChweCxweSwyLDEwKQogbG9j
+YWwgc2EsY2E9c2luKHBsYXllci5hKSxjb3MocGxheWVyLmEpCiBsaW5lKHB4LHB5LHB4K2NhKjYs
+cHkrc2EqNiwxMCkKIAogLS0gc3RhdHMKIHByaW50KCIyZCBtYXAgdmlldyIsMTAsMiw3KQogcHJp
+bnQoInJvb21zOiAiLi5nZW5fc3RhdHMucm9vbXMsMTAsMTAsNykKIHByaW50KCJvYmplY3RzOiAi
+Li5nZW5fc3RhdHMub2JqZWN0cywxMCwxOCw3KQogcHJpbnQoInNlZWQ6ICIuLmdlbl9zdGF0cy5z
+ZWVkLDEwLDI2LDcpCiBpZiBkZWJ1Z19tb2RlIHRoZW4KICBwcmludCgiW3hdIHRvZ2dsZSAzZCIs
+MTAsMzQsNykKIGVuZAplbmQKCi0tIGRyYXcgaHVkIG1pbmltYXAgb3ZlcmxheQotLSBQdXJwb3Nl
+OiBSZW5kZXIgc2Nyb2xsaW5nIHZpZXdwb3J0IG1pbmltYXAgaW4gdG9wLXJpZ2h0IGNvcm5lciBk
+dXJpbmcgM0QgdmlldwotLSBBbGdvcml0aG06IFBsYXllci1jZW50ZXJlZCBjYW1lcmEgd2l0aCBj
+bGlwcGVkIGRyYXdpbmcgb2YgdmlzaWJsZSB0aWxlcyBvbmx5Ci0tIERpc3BsYXlzOiBXYWxscywg
+Zmxvb3JzLCBkb29ycywgb2JqZWN0cywgcGxheWVyIChhdXRvLXNjcm9sbHMgYXMgcGxheWVyIG1v
+dmVzKQotLSBOb3RlczogRml4ZWQgMTIww5c2OHB4IHZpZXdwb3J0IGF0IHRvcC1yaWdodCwgc2Nh
+bGU9Miwgb25seSBkcmF3cyB2aXNpYmxlIHRpbGUgcmFuZ2UKZnVuY3Rpb24gZHJhd19taW5pbWFw
+X2h1ZCgpCiBsb2NhbCBodWRfdz1jZWlsKHNjcmVlbl93aWR0aCowLjI1KQogbG9jYWwgaHVkX2g9
+Y2VpbChzY3JlZW5faGVpZ2h0KjAuMjUpCiBsb2NhbCBodWRfeD1zY3JlZW5fd2lkdGgtaHVkX3ct
+OAogbG9jYWwgaHVkX3k9OAogbG9jYWwgc2NhbGU9MgogCiAtLSBjYW1lcmEgb2Zmc2V0IHRvIGNl
+bnRlciBwbGF5ZXIgaW4gdmlld3BvcnQKIGxvY2FsIGNhbV94PXBsYXllci54KnNjYWxlLWh1ZF93
+LzIKIGxvY2FsIGNhbV95PXBsYXllci55KnNjYWxlLWh1ZF9oLzIKIAogLS0gY2FsY3VsYXRlIHZp
+c2libGUgdGlsZSByYW5nZQogbG9jYWwgeF9taW49bWF4KDAsZmxyKGNhbV94L3NjYWxlKSkKIGxv
+Y2FsIHhfbWF4PW1pbigxMjcsZmxyKChjYW1feCtodWRfdykvc2NhbGUpKQogbG9jYWwgeV9taW49
+bWF4KDAsZmxyKGNhbV95L3NjYWxlKSkKIGxvY2FsIHlfbWF4PW1pbigxMjcsZmxyKChjYW1feSto
+dWRfaCkvc2NhbGUpKQogCiAtLSBzZXQgY2xpcCByZWdpb24KIGNsaXAoaHVkX3gsaHVkX3ksaHVk
+X3csaHVkX2gpCiAKIC0tIGRyYXcgYmFja2dyb3VuZAogcmVjdGZpbGwoaHVkX3gsaHVkX3ksaHVk
+X3graHVkX3ctMSxodWRfeStodWRfaC0xLDApCiAKIC0tIGJhdGNoIG1hcCB0aWxlcyAob25seSB2
+aXNpYmxlIHJhbmdlKQogcmJhdGNoX3Jlc2V0KCkKIGZvciB4PXhfbWluLHhfbWF4IGRvCiAgZm9y
+IHk9eV9taW4seV9tYXggZG8KICAgbG9jYWwgc3g9aHVkX3grKHgqc2NhbGUtY2FtX3gpCiAgIGxv
+Y2FsIHN5PWh1ZF95Kyh5KnNjYWxlLWNhbV95KQogICAKICAgLS0gYWRkaXRpb25hbCBib3VuZHMg
+Y2hlY2sKICAgaWYgc3g_PWh1ZF94IGFuZCBzeDxodWRfeCtodWRfdyBhbmQgc3k_PWh1ZF95IGFu
+ZCBzeTxodWRfeStodWRfaCB0aGVuCiAgICBsb2NhbCB3YWxsPWdldF93YWxsKHgseSkKICAgIGxv
+Y2FsIGZsb29yX3ZhbD1nZXRfZmxvb3IoeCx5KQogICAgbG9jYWwgY29sb3IKICAgIAogICAgaWYg
+d2FsbD4wIHRoZW4KICAgICBjb2xvcj01CiAgICBlbHNlaWYgZmxvb3JfdmFsPjAgdGhlbgogICAg
+IGNvbG9yPTYKICAgIGVsc2UKICAgICBjb2xvcj0xCiAgICBlbmQKICAgIAogICAgcmJhdGNoX3B1
+c2goc3gsc3ksc3grc2NhbGUtMSxzeStzY2FsZS0xLGNvbG9yKQogICBlbmQKICBlbmQKIGVuZAog
+cmJhdGNoX3N1Ym1pdCgpCiAKIC0tIGJhdGNoIGRvb3IgZHJhd2luZyB2aWEgc3BhdGlhbCBxdWVy
+eSBvdmVyIHZpc2libGUgdGlsZXMKIHJiYXRjaF9yZXNldCgpCiBmb3IgeD14X21pbix4X21heCBk
+bwogIGZvciB5PXlfbWluLHlfbWF4IGRvCiAgIGxvY2FsIGRvb3I9ZG9vcmdyaWRbeF0gYW5kIGRv
+b3JncmlkW3hdW3ldIG9yIG5pbAogICBpZiBkb29yIHRoZW4KICAgIGxvY2FsIHN4PWh1ZF94Kyh4
+KnNjYWxlLWNhbV94KQogICAgbG9jYWwgc3k9aHVkX3krKHkqc2NhbGUtY2FtX3kpCiAgICBpZiBz
+eD49aHVkX3ggYW5kIHN4PGh1ZF94K2h1ZF93IGFuZCBzeT49aHVkX3kgYW5kIHN5PGh1ZF95K2h1
+ZF9oIHRoZW4KICAgICBsb2NhbCBjPWRvb3IuZHR5cGU9PWRvb3JfbG9ja2VkIGFuZCA4IG9yIDEy
+CiAgICAgcmJhdGNoX3B1c2goc3gsc3ksc3grc2NhbGUtMSxzeStzY2FsZS0xLGMpCiAgICBlbmQK
+ICAgZW5kCiAgZW5kCiBlbmQKIHJiYXRjaF9zdWJtaXQoKQogCiAtLSBkcmF3IG9iamVjdHMgdmlh
+IGZsYXQgYXJyYXkgaXRlcmF0aW9uIHdpdGhpbiB2aWV3cG9ydCBib3VuZHMKIGZvciBvYiBpbiBh
+bGwob2JqZWN0cykgZG8KICBpZiBvYi5wb3MgdGhlbgogICBsb2NhbCBzeD1odWRfeCsob2IucG9z
+WzFdKnNjYWxlLWNhbV94KQogICBsb2NhbCBzeT1odWRfeSsob2IucG9zWzJdKnNjYWxlLWNhbV95
+KQogICBpZiBzeD49aHVkX3ggYW5kIHN4PGh1ZF94K2h1ZF93IGFuZCBzeT49aHVkX3kgYW5kIHN5
+PGh1ZF95K2h1ZF9oIHRoZW4KICAgIGxvY2FsIGM9NwogICAgaWYgb2IudHlwIGFuZCBvYi50eXAu
+a2luZD09Imhvc3RpbGVfbnBjIiB0aGVuIGM9OAogICAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlw
+LmtpbmQ9PSJkaXJlY3RfcGlja3VwIiB0aGVuCiAgICAgaWYgb2IudHlwLnN1YnR5cGU9PSJoZWFy
+dCIgdGhlbiBjPTE0CiAgICAgZWxzZWlmIG9iLnR5cC5zdWJ0eXBlPT0ia2V5IiB0aGVuIGM9OQog
+ICAgIGVuZAogICAgZWxzZWlmIG9iLnR5cCBhbmQgb2IudHlwLmtpbmQ9PSJpbnRlcmFjdGFibGUi
+IHRoZW4KICAgICBpZiBvYi50eXAuc3VidHlwZT09ImV4aXQiIHRoZW4gYz0xMiBlbmQKICAgIGVs
+c2VpZiBvYi50eXAgYW5kIG9iLnR5cC5raW5kPT0iZGVjb3JhdGl2ZSIgdGhlbiBjPTEzCiAgICBl
+bmQKICAgIGNpcmNmaWxsKHN4LHN5LDEsYykKICAgZW5kCiAgZW5kCiBlbmQKIAogLS0gZHJhdyBw
+bGF5ZXIgKGFsd2F5cyBjZW50ZXJlZCBieSBjYW1lcmEgZGVzaWduKQogbG9jYWwgcHg9aHVkX3gr
+KHBsYXllci54KnNjYWxlLWNhbV94KQogbG9jYWwgcHk9aHVkX3krKHBsYXllci55KnNjYWxlLWNh
+bV95KQogY2lyY2ZpbGwocHgscHksMiwxMCkKIGxpbmUocHgscHkscHgrY2FfY2FjaGVkKjYscHkr
+c2FfY2FjaGVkKjYsMTApCiAKIC0tIG9wdGlvbmFsIGZyYW1lCiByZWN0KGh1ZF94LGh1ZF95LGh1
+ZF94K2h1ZF93LTEsaHVkX3kraHVkX2gtMSw3KQogCiAtLSByZXNldCBjbGlwCiBjbGlwKCkKZW5k
+CgotLSB1bmlmaWVkIGNvbGxpc2lvbiBjaGVjayBmb3Igd2FsbHMsIGRvb3JzLCBhbmQgb2JqZWN0
+cwotLSBQdXJwb3NlOiBVbmlmaWVkIGNvbGxpc2lvbiBkZXRlY3Rpb24gZm9yIHdhbGxzLCBkb29y
+cywgYW5kIG9iamVjdHMKLS0gUGFyYW1ldGVyczogcHgsIHB5ICh3b3JsZCBwb3NpdGlvbiksIHJh
+ZGl1cyAoY29sbGlzaW9uIHJhZGl1cyksIG9wZW5kb29ycyAoYXV0by1vcGVuIGRvb3JzKSwgaXNw
+bGF5ZXIgKGVuYWJsZSBrZXkgY2hlY2tpbmcpCi0tIFJldHVybnM6IGJvb2xlYW4gKHRydWUgaWYg
+Y29sbGlzaW9uIGRldGVjdGVkKQotLSBBbGdvcml0aG06IEdyaWQtYmFzZWQgd2FsbCBjaGVjayAr
+IHNwYXRpYWwgcGFydGl0aW9uaW5nIGZvciBvYmplY3RzCi0tIFNpZGUgZWZmZWN0czogT3BlbnMg
+ZG9vcnMsIHByZXZlbnRzIGRvb3IgY2xvc2luZyB3aGVuIHBsYXllciBpbnNpZGUKZnVuY3Rpb24g
+aXNjb2wocHgscHkscmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikKIGxvY2FsIGNvbD1mYWxzZQog
+b3BlbmRvb3JzPW9wZW5kb29ycyBvciBmYWxzZQogaXNwbGF5ZXI9aXNwbGF5ZXIgb3IgZmFsc2UK
+IAogLS0gY2hlY2sgZ3JpZCBjZWxscyBhcm91bmQgcG9zaXRpb24KIGZvciB4PWZscihweC1yYWRp
+dXMpLGZscihweCtyYWRpdXMpIGRvCiAgZm9yIHk9ZmxyKHB5LXJhZGl1cyksZmxyKHB5K3JhZGl1
+cykgZG8KICAgLS0gYm91bmRzIGNoZWNrCiAgIGlmIHg8MCBvciB4Pj0xMjggb3IgeTwwIG9yIHk_
+PTEyOCB0aGVuCiAgICBjb2w9dHJ1ZQogICAgYnJlYWsKICAgZWxzZQogICAgbG9jYWwgdGlsZT1n
+ZXRfd2FsbCh4LHkpCiAgICAKICAgIC0tIGNoZWNrIGlmIGRvb3IgdGlsZQogICAgaWYgdGlsZT09
+ZG9vcl9ub3JtYWwgb3IgdGlsZT09ZG9vcl9sb2NrZWQgb3IgdGlsZT09ZG9vcl9zdGF5X29wZW4g
+dGhlbgogICAgIGxvY2FsIGRvb3I9ZG9vcmdyaWRbeF1beV0KICAgICBpZiBkb29yIHRoZW4KICAg
+ICAgaWYgZG9vci5vcGVuPT0xIHRoZW4KICAgICAgIC0tIGZ1bGx5IG9wZW46IHByZXZlbnQgY2xv
+c2luZwogICAgICAgZG9vci5vcGVuaW5nPXRydWUKICAgICAgZWxzZQogICAgICAgLS0gZG9vciBw
+YXJ0aWFsbHkgb3BlbiBvciBjbG9zZWQ6IGNvbGxpc2lvbiBkZXRlY3RlZAogICAgICAgY29sPXRy
+dWUKICAgICAgIC0tIGhhbmRsZSB1bmxvY2tpbmcvb3BlbmluZyBiZWZvcmUgZXhpdGluZyBpbm5l
+ciBsb29wCiAgICAgICBpZiBvcGVuZG9vcnMgdGhlbgogICAgICAgIGlmIGRvb3Iua2V5bnVtIHRo
+ZW4KICAgICAgICAgLS0gY2hlY2sgaW52ZW50b3J5IGZvciBrZXkKICAgICAgICAgaWYgaXNwbGF5
+ZXIgdGhlbgogICAgICAgICAgZm9yIGksaXRlbSBpbiBpcGFpcnMocGxheWVyLmtleXMpIGRvCiAg
+ICAgICAgICAgaWYgaXRlbS5rZXludW09PWRvb3Iua2V5bnVtIHRoZW4KICAgICAgICAgICAgLS0g
+cmVtb3ZlIGtleQogICAgICAgICAgICBkZWxpKHBsYXllci5rZXlzLGkpCiAgICAgICAgICAgIGRv
+b3Iua2V5bnVtPW5pbAogICAgICAgICAgICBkb29yLm9wZW5pbmc9dHJ1ZQogICAgICAgICAgICAt
+LSBrZWVwIGNvbD10cnVlLCBkb24ndCBjbGVhciBpbW1lZGlhdGVseQogICAgICAgICAgICBicmVh
+awogICAgICAgICAgIGVuZAogICAgICAgICAgZW5kCiAgICAgICAgIGVuZAogICAgICAgIGVsc2UK
+ICAgICAgICAgLS0gdW5sb2NrZWQKICAgICAgICAgZG9vci5vcGVuaW5nPXRydWUKICAgICAgICAg
+LS0ga2VlcCBjb2w9dHJ1ZSwgZG9uJ3QgY2xlYXIgaW1tZWRpYXRlbHkKICAgICAgICBlbmQKICAg
+ICAgIGVuZAogICAgICAgLS0gZWFybHkgZXhpdCBmcm9tIGlubmVyIGxvb3Agb24gY29sbGlzaW9u
+IChhZnRlciBvcGVuZG9vcnMgaGFuZGxpbmcpCiAgICAgICBicmVhawogICAgICBlbmQKICAgICBl
+bmQKICAgIC0tIGNoZWNrIGlmIGV4aXQgcG9ydGFsCiAgICBlbHNlaWYgKHRpbGU9PWV4aXRfc3Rh
+cnQgb3IgdGlsZT09ZXhpdF9lbmQpIGFuZCBpc3BsYXllciB0aGVuCiAgICAgLS0gcGxhY2Vob2xk
+ZXIgZm9yIGxldmVsIGNvbXBsZXRpb24KICAgIC0tIGNoZWNrIGlmIHdhbGwKICAgIGVsc2VpZiB0
+aWxlPjAgdGhlbgogICAgIGNvbD10cnVlCiAgICAgYnJlYWsKICAgIGVuZAogICBlbmQKICBlbmQK
+ICBpZiBjb2wgdGhlbiBicmVhayBlbmQKIGVuZAogCiAtLSBjaGVjayBzb2xpZCBvYmplY3RzIGFy
+b3VuZCBwb3NpdGlvbiB2aWEgZmxhdCBhcnJheSB3aXRoIGVhcmx5IGRpc3RhbmNlIGN1bGwKIGZv
+ciBvYiBpbiBhbGwob2JqZWN0cykgZG8KICBpZiBvYi50eXAgYW5kIG9iLnR5cC5zb2xpZCBhbmQg
+b2IucG9zIHRoZW4KICAgbG9jYWwgb3g9b2IucG9zWzFdLXB4CiAgIGxvY2FsIG95PW9iLnBvc1sy
+XS1weQogICAtLSBlYXJseSBheGlzLWFsaWduZWQgY3VsbAogICBpZiBhYnMob3gpPChyYWRpdXMr
+KG9iLnR5cC53IG9yIDApKSBhbmQgYWJzKG95KTwocmFkaXVzKyhvYi50eXAudyBvciAwKSkgdGhl
+bgogICAgaWYgbWF4KGFicyhveCksYWJzKG95KSk8KG9iLnR5cC53IG9yIDApIHRoZW4KICAgICBj
+b2w9dHJ1ZQogICAgIC0tIHRyaWdnZXIgaW50ZXJhY3Rpb24gb24gc29saWQgY29udGFjdCBpZiBw
+bGF5ZXIKICAgICBpZiBpc3BsYXllciB0aGVuCiAgICAgIGNoZWNrX2ludGVyYWN0aW9uc19hdChw
+eCxweSkKICAgICBlbmQKICAgICBicmVhawogICAgZW5kCiAgIGVuZAogIGVuZAogZW5kCiAKIHJl
+dHVybiBjb2wKZW5kCgotLSBtb3ZlbWVudCB3cmFwcGVyIHdpdGggc2xpZGluZyBjb2xsaXNpb24K
+LS0gUHVycG9zZTogTW92ZW1lbnQgd2l0aCBzbGlkaW5nIGNvbGxpc2lvbiAodHJ5IGRpYWdvbmFs
+LCB0aGVuIFgsIHRoZW4gWSkKLS0gUGFyYW1ldGVyczogcG9zICh0YWJsZSB3aXRoIHgseSksIHRh
+cmdldF94LCB0YXJnZXRfeSwgcmFkaXVzLCBvcGVuZG9vcnMsIGlzcGxheWVyCi0tIFJldHVybnM6
+IGJvb2xlYW4gKHRydWUgaWYgYW55IG1vdmVtZW50IHN1Y2NlZWRlZCkKLS0gQWxnb3JpdGhtOiBU
+aHJlZS1waGFzZSBjb2xsaXNpb24gY2hlY2sgZm9yIHNtb290aCB3YWxsIHNsaWRpbmcKZnVuY3Rp
+b24gdHJ5bW92ZXRvKHBvcyx0YXJnZXRfeCx0YXJnZXRfeSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxh
+eWVyKQogcmFkaXVzPXJhZGl1cyBvciBwbGF5ZXJfY29sbGlzaW9uX3JhZGl1cwogb3BlbmRvb3Jz
+PW9wZW5kb29ycyBvciBmYWxzZQogaXNwbGF5ZXI9aXNwbGF5ZXIgb3IgZmFsc2UKIAogLS0gdHJ5
+IGRpcmVjdCBtb3ZlbWVudAogaWYgbm90IHJhZGl1cyBvciBub3QgaXNjb2wodGFyZ2V0X3gsdGFy
+Z2V0X3kscmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvcy54LHBvcy55PXRhcmdl
+dF94LHRhcmdldF95CiAgcmV0dXJuIHRydWUKIGVuZAogCiAtLSB0cnkgeC1vbmx5IG1vdmVtZW50
+CiBpZiBhYnMocG9zLngtdGFyZ2V0X3gpPjAuMDEgYW5kIG5vdCBpc2NvbCh0YXJnZXRfeCxwb3Mu
+eSxyYWRpdXMsb3BlbmRvb3JzLGlzcGxheWVyKSB0aGVuCiAgcG9zLng9dGFyZ2V0X3gKICByZXR1
+cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB5LW9ubHkgbW92ZW1lbnQKIGlmIGFicyhwb3MueS10YXJn
+ZXRfeSk_MC4wMSBhbmQgbm90IGlzY29sKHBvcy54LHRhcmdldF95LHJhZGl1cyxvcGVuZG9vcnMs
+aXNwbGF5ZXIpIHRoZW4KICBwb3MueT10YXJnZXRfeQogIHJldHVybiB0cnVlCiBlbmQKIAogcmV0
+dXJuIGZhbHNlCmVuZAoKLS0gbW92ZW1lbnQgd3JhcHBlciBmb3IgcG9zWzFdL3Bvc1syXSBhcnJh
+eSBwb3NpdGlvbnMKZnVuY3Rpb24gdHJ5bW92ZXRvX3Bvcyhwb3NfYXJyYXksdGFyZ2V0X3gsdGFy
+Z2V0X3kscmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikKIHJhZGl1cz1yYWRpdXMgb3IgcGxheWVy
+X2NvbGxpc2lvbl9yYWRpdXMKIG9wZW5kb29ycz1vcGVuZG9vcnMgb3IgZmFsc2UKIGlzcGxheWVy
+PWlzcGxheWVyIG9yIGZhbHNlCiAKIC0tIHRyeSBkaXJlY3QgbW92ZW1lbnQKIGlmIG5vdCByYWRp
+dXMgb3Igbm90IGlzY29sKHRhcmdldF94LHRhcmdldF95LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5
+ZXIpIHRoZW4KICBwb3NfYXJyYXlbMV0scG9zX2FycmF5WzJdPXRhcmdldF94LHRhcmdldF95CiAg
+cmV0dXJuIHRydWUKIGVuZAogCiAtLSB0cnkgeC1vbmx5IG1vdmVtZW50CiBpZiBhYnMocG9zX2Fy
+cmF5WzFdLXRhcmdldF94KT4wLjAxIGFuZCBub3QgaXNjb2wodGFyZ2V0X3gscG9zX2FycmF5WzJd
+LHJhZGl1cyxvcGVuZG9vcnMsaXNwbGF5ZXIpIHRoZW4KICBwb3NfYXJyYXlbMV09dGFyZ2V0X3gK
+ICByZXR1cm4gdHJ1ZQogZW5kCiAKIC0tIHRyeSB5LW9ubHkgbW92ZW1lbnQKIGlmIGFicyhwb3Nf
+YXJyYXlbMl0tdGFyZ2V0X3kpPjAuMDEgYW5kIG5vdCBpc2NvbChwb3NfYXJyYXlbMV0sdGFyZ2V0
+X3kscmFkaXVzLG9wZW5kb29ycyxpc3BsYXllcikgdGhlbgogIHBvc19hcnJheVsyXT10YXJnZXRf
+eQogIHJldHVybiB0cnVlCiBlbmQKIAogcmV0dXJuIGZhbHNlCmVuZAoKZnVuY3Rpb24gdXBkYXRl
+X2lucHV0KCkKIGxvY2FsIHNhLGNhPXNpbihwbGF5ZXIuYSksY29zKHBsYXllci5hKQogCiAtLSBt
+b3ZlbWVudAogLS0gY29tYmluZSBrZXlzIHRvIGF2b2lkIGRvdWJsZS1wcm9jZXNzaW5nIGFuZCBm
+aXggZGlyZWN0aW9uOgogLS0gcG9zaXRpdmUgdHVybiA9IGxlZnQsIG5lZ2F0aXZlIHR1cm4gPSBy
+aWdodAogbG9jYWwgdHVybj0oYnRuKDApIGFuZCAxIG9yIDApLShidG4oMSkgYW5kIDEgb3IgMCkK
+IGlmIHR1cm5_PTAgdGhlbgogIHBsYXllci5hKz10dXJuKnBsYXllcl9yb3RhdGlvbl9zcGVlZAog
+ZW5kCiBpZiBidG4oMikgdGhlbiAtLSB1cAogIGxvY2FsIG54PXBsYXllci54K2NhKnBsYXllci5z
+cGQKICBsb2NhbCBueT1wbGF5ZXIueStzYSpwbGF5ZXIuc3BkCiAgdHJ5bW92ZXRvKHBsYXllcixu
+eCxueSxwbGF5ZXJfY29sbGlzaW9uX3JhZGl1cyx0cnVlLHRydWUpCiBlbmQKIGlmIGJ0bigzKSB0
+aGVuIC0tIGRvd24KICBsb2NhbCBueD1wbGF5ZXIueC1jYSpwbGF5ZXIuc3BkCiAgbG9jYWwgbnk9
+cGxheWVyLnktc2EqcGxheWVyLnNwZAogIHRyeW1vdmV0byhwbGF5ZXIsbngsbnkscGxheWVyX2Nv
+bGxpc2lvbl9yYWRpdXMsdHJ1ZSx0cnVlKQogZW5kCiAKIC0tIGNoZWNrIGZvciBpbnRlcmFjdGlv
+bnMgZXZlcnkgZnJhbWUKIGNoZWNrX2ludGVyYWN0aW9ucygpCiAKIC0tIGludGVyYWN0aW9uIGlu
+cHV0OiBFIGtleSBvciBaIGJ1dHRvbgogaWYga2V5cCgiZSIpIG9yIGJ0bnAoNCkgdGhlbgogIGhh
+bmRsZV9pbnRlcmFjdCgpCiBlbmQKZW5kCgogCgotLSBjaGVjayBpbnRlcmFjdGlvbnMgYXJvdW5k
+IHBsYXllciBwb3NpdGlvbgotLSBQdXJwb3NlOiBTY2FuIG5lYXJieSBvYmplY3RzIGZvciBwcm94
+aW1pdHktYmFzZWQgaW50ZXJhY3Rpb25zCi0tIEFsZ29yaXRobTogM8OXMyBvYmpncmlkIGNlbGwg
+c2NhbiBhcm91bmQgcGxheWVyCi0tIFNpZGUgZWZmZWN0czogQXV0by1jb2xsZWN0cyBwaWNrdXBz
+LCB0cmlnZ2VycyBjb21iYXQsIHNldHMgaW50ZXJhY3Rpb24gZmxhZ3MKLS0gTm90ZXM6IENhbGxl
+ZCBldmVyeSBmcmFtZSBpbiBfdXBkYXRlKCkKZnVuY3Rpb24gY2hlY2tfaW50ZXJhY3Rpb25zKCkK
+IGNoZWNrX2ludGVyYWN0aW9uc19hdChwbGF5ZXIueCxwbGF5ZXIueSkKZW5kCgotLSBjaGVjayBp
+bnRlcmFjdGlvbnMgYXQgc3BlY2lmaWMgcG9zaXRpb24gKGF2b2lkcyByZWN1cnNpb24pCmZ1bmN0
+aW9uIGNoZWNrX2ludGVyYWN0aW9uc19hdChweCxweSkKIC0tIHNjYW4gYWxsIG9iamVjdHMgd2l0
+aCBkaXN0YW5jZSBjdWxsaW5nCiBsb2NhbCBjbG9zZXN0X2ludGVyYWN0PW5pbAogbG9jYWwgY2xv
+c2VzdF9kaXN0PTk5OQogCiBmb3Igb2IgaW4gYWxsKG9iamVjdHMpIGRvCiAgaWYgb2IucG9zIGFu
+ZCBvYi50eXAgdGhlbgogICBsb2NhbCBkeD1vYi5wb3NbMV0tcHgKICAgbG9jYWwgZHk9b2IucG9z
+WzJdLXB5CiAgIGxvY2FsIGRpc3Q9YWJzKGR4KSthYnMoZHkpCiAgIAogICAtLSBkaXJlY3QgcGlj
+a3VwOiBhdXRvLWNvbGxlY3QKICAgaWYgb2IudHlwLmtpbmQ9PSJkaXJlY3RfcGlja3VwIiBhbmQg
+ZGlzdDxpbnRlcmFjdGlvbl9yYW5nZSB0aGVuCiAgICBjb2xsZWN0X2l0ZW0ob2IpCiAgICBkZWwo
+b2JqZWN0cyxvYikKICAgIGlmIG9iLmF1dG9hbmltIHRoZW4gZGVsKGFuaW1hdGVkX29iamVjdHMs
+b2IpIGVuZAogICAKICAgLS0gaG9zdGlsZSBucGM6IHRyaWdnZXIgY29tYmF0CiAgIGVsc2VpZiBv
+Yi50eXAua2luZD09Imhvc3RpbGVfbnBjIiBhbmQgZGlzdDxjb21iYXRfdHJpZ2dlcl9yYW5nZSB0
+aGVuCiAgICBpbl9jb21iYXQ9dHJ1ZQogICAgY3VycmVudF90YXJnZXQ9b2IKICAgCiAgIC0tIGlu
+dGVyYWN0YWJsZTogc2V0IGZsYWcgZm9yIGNsb3Nlc3QKICAgZWxzZWlmIG9iLnR5cC5raW5kPT0i
+aW50ZXJhY3RhYmxlIiBhbmQgZGlzdDxpbnRlcmFjdGlvbl9yYW5nZSB0aGVuCiAgICAtLSB0cmFw
+OiBpbW1lZGlhdGUgZWZmZWN0CiAgICBpZiBvYi50eXAuc3VidHlwZT09InRyYXAiIHRoZW4KICAg
+ICBwbGF5ZXIuaHA9bWF4KDAscGxheWVyLmhwLTEwKQogICAgIHRyYXBfbXNnX3RpbWVyPTYwCiAg
+ICAgZGVsKG9iamVjdHMsb2IpCiAgICAgaWYgb2IuYXV0b2FuaW0gdGhlbiBkZWwoYW5pbWF0ZWRf
+b2JqZWN0cyxvYikgZW5kCiAgICBlbHNlaWYgZGlzdDxjbG9zZXN0X2Rpc3QgdGhlbgogICAgIGNs
+b3Nlc3RfaW50ZXJhY3Q9b2IKICAgICBjbG9zZXN0X2Rpc3Q9ZGlzdAogICAgZW5kCiAgIGVuZAog
+IGVuZAogZW5kCiAKIC0tIHVwZGF0ZSBpbnRlcmFjdGlvbiBzdGF0ZQogaWYgY2xvc2VzdF9pbnRl
+cmFjdCB0aGVuCiAgaW50ZXJhY3Rpb25fYWN0aXZlPXRydWUKICBjdXJyZW50X2ludGVyYWN0PWNs
+b3Nlc3RfaW50ZXJhY3QKIGVsc2UKICBpbnRlcmFjdGlvbl9hY3RpdmU9ZmFsc2UKICBjdXJyZW50
+X2ludGVyYWN0PW5pbAogZW5kCmVuZAoKLS0gY29sbGVjdCBpdGVtIChwaWNrdXApCi0tIFB1cnBv
+c2U6IEhhbmRsZSBwaWNrdXAgY29sbGVjdGlvbiBhbmQgaW52ZW50b3J5IHVwZGF0ZXMKLS0gUGFy
+YW1ldGVyczogb2IgKG9iamVjdCB3aXRoIHR5cC5zdWJ0eXBlKQotLSBTaWRlIGVmZmVjdHM6IEFk
+ZHMgdG8gcGxheWVyLmtleXMsIGluY3JlYXNlcyBwbGF5ZXIuaHAKLS0gTm90ZXM6IENhbGxlZCBi
+eSBjaGVja19pbnRlcmFjdGlvbnNfYXQoKSBmb3IgZGlyZWN0X3BpY2t1cCBvYmplY3RzCmZ1bmN0
+aW9uIGNvbGxlY3RfaXRlbShvYikKIGlmIG9iLnR5cC5zdWJ0eXBlPT0ia2V5IiBhbmQgb2Iua2V5
+bnVtIHRoZW4KICBhZGQocGxheWVyLmtleXMse2tleW51bT1vYi5rZXludW19KQogIHByaW50aCgi
+Y29sbGVjdGVkIGtleSAiLi5vYi5rZXludW0pCiBlbHNlaWYgb2IudHlwLnN1YnR5cGU9PSJoZWFy
+dCIgdGhlbgogIHBsYXllci5ocD1taW4oMTAwLHBsYXllci5ocCsyMCkKICBwcmludGgoImNvbGxl
+Y3RlZCBoZWFydCIpCiBlbHNlCiAgcHJpbnRoKCJjb2xsZWN0ZWQgaXRlbSIpCiBlbmQKZW5kCgot
+LSBoYW5kbGUgaW50ZXJhY3Rpb24gd2hlbiBwbGF5ZXIgcHJlc3NlcyBFL1oKLS0gUHVycG9zZTog
+UHJvY2VzcyBwbGF5ZXItaW5pdGlhdGVkIGludGVyYWN0aW9ucyAoRSBrZXkgLyBaIGJ1dHRvbikK
+LS0gQWxnb3JpdGhtOiBTd2l0Y2ggb24gY3VycmVudF9pbnRlcmFjdC50eXAuc3VidHlwZQotLSBT
+aWRlIGVmZmVjdHM6IE9wZW5zIGNoZXN0cywgYWN0aXZhdGVzIHNocmluZXMsIHJlYWRzIG5vdGVz
+LCB0cmlnZ2VycyBmbG9vciB0cmFuc2l0aW9uCi0tIE5vdGVzOiBPbmx5IHJ1bnMgd2hlbiBpbnRl
+cmFjdGlvbl9hY3RpdmUgZmxhZyBpcyB0cnVlCmZ1bmN0aW9uIGhhbmRsZV9pbnRlcmFjdCgpCiBp
+ZiBub3QgaW50ZXJhY3Rpb25fYWN0aXZlIG9yIG5vdCBjdXJyZW50X2ludGVyYWN0IHRoZW4gcmV0
+dXJuIGVuZAogCiBsb2NhbCBzdWJ0eXBlPWN1cnJlbnRfaW50ZXJhY3QudHlwIGFuZCBjdXJyZW50
+X2ludGVyYWN0LnR5cC5zdWJ0eXBlIG9yICJ1bmtub3duIgogCiBpZiBzdWJ0eXBlPT0iY2hlc3Qi
+IHRoZW4KICAtLSBvcGVuIGNoZXN0IChwbGFjZWhvbGRlcikKICBwbGF5ZXIuaHA9bWluKDEwMCxw
+bGF5ZXIuaHArMTApCiAgcHJpbnRoKCJvcGVuZWQgY2hlc3QiKQogIGRlbChvYmplY3RzLGN1cnJl
+bnRfaW50ZXJhY3QpCiAgaWYgY3VycmVudF9pbnRlcmFjdC5hdXRvYW5pbSB0aGVuIGRlbChhbmlt
+YXRlZF9vYmplY3RzLGN1cnJlbnRfaW50ZXJhY3QpIGVuZAogIAogZWxzZWlmIHN1YnR5cGU9PSJz
+aHJpbmUiIHRoZW4KICAtLSBhY3RpdmF0ZSBzaHJpbmUgKHBsYWNlaG9sZGVyKQogIHBsYXllci5o
+cD0xMDAKICBwcmludGgoImFjdGl2YXRlZCBzaHJpbmUiKQogIAogZWxzZWlmIHN1YnR5cGU9PSJu
+b3RlIiB0aGVuCiAgLS0gcmVhZCBub3RlIChwbGFjZWhvbGRlcikKICBwcmludGgoInJlYWQgbm90
+ZSIpCiAgZGVsKG9iamVjdHMsY3VycmVudF9pbnRlcmFjdCkKICBpZiBjdXJyZW50X2ludGVyYWN0
+LmF1dG9hbmltIHRoZW4gZGVsKGFuaW1hdGVkX29iamVjdHMsY3VycmVudF9pbnRlcmFjdCkgZW5k
+CiAgCiBlbHNlaWYgc3VidHlwZT09ImV4aXQiIHRoZW4KICAtLSB0cmlnZ2VyIG5leHQgZmxvb3IK
+ICBwcmludGgoInVzaW5nIGV4aXQgcG9ydGFsIikKICBnZW5lcmF0ZV9uZXdfZmxvb3IoKQogIAog
+ZW5kCiAKIC0tIGNsZWFyIGludGVyYWN0aW9uIHN0YXRlIGFmdGVyIGhhbmRsaW5nCiBpbnRlcmFj
+dGlvbl9hY3RpdmU9ZmFsc2UKIGN1cnJlbnRfaW50ZXJhY3Q9bmlsCmVuZAoKLS0gZ2VuZXJhdGUg
+bmV3IGZsb29yIChyZWdlbmVyYXRlIGR1bmdlb24pCmZ1bmN0aW9uIGdlbmVyYXRlX25ld19mbG9v
+cigpCiAtLSBpbmNyZW1lbnQgZGlmZmljdWx0eQogZ2VuX3BhcmFtcy5kaWZmaWN1bHR5PW1pbihn
+ZW5fcGFyYW1zLm1heF9kaWZmaWN1bHR5LGdlbl9wYXJhbXMuZGlmZmljdWx0eSsxKQogCiAtLSBj
+bGVhciBleGlzdGluZyBvYmplY3RzCiBvYmplY3RzPXt9CiBhbmltYXRlZF9vYmplY3RzPXt9CiBk
+b29ycz17fQogLS0gYWxzbyBjbGVhciBkb29yZ3JpZCB0byBwcmV2ZW50IHN0YWxlIHJlZmVyZW5j
+ZXMKIGZvciBpPTAsMTI3IGRvCiAgaWYgZG9vcmdyaWRbaV0gdGhlbgogICBmb3Igaj0wLDEyNyBk
+bwogICAgZG9vcmdyaWRbaV1bal09bmlsCiAgIGVuZAogIGVuZAogZW5kCiAKIC0tIHJlZ2VuZXJh
+dGUgZHVuZ2Vvbgogc3RhcnRfcG9zLGdlbl9zdGF0cz1nZW5lcmF0ZV9kdW5nZW9uKCkKLS0gVHJp
+Z2dlciBHQyBhZnRlciBkdW5nZW9uIGdlbmVyYXRpb24gKFBpY290cm9uIGd1aWRlbGluZTogYXZv
+aWQgbWlkLWdhbWVwbGF5IHN0dXR0ZXIpCnN0YXQoMCkKIC0tIGludmFsaWRhdGUgcGVyc2lzdGVu
+dCByZW5kZXIgY2FjaGVzIGZvciBuZXcgZmxvb3IKLS0gUHJvZHVjdGlvbjogY2xlYXIgY2FjaGUg
+b24gbGV2ZWwgbG9hZCB0byBwcmV2ZW50IHN0YWxlIHRleHR1cmUgcmVmZXJlbmNlcwppZiBjbGVh
+cl90ZXh0dXJlX2NhY2hlcyB0aGVuIGNsZWFyX3RleHR1cmVfY2FjaGVzKCkgZW5kCiAKIHByaW50
+aCgiZmxvb3IgY29tcGxldGUhIGRpZmZpY3VsdHk6ICIuLmdlbl9wYXJhbXMuZGlmZmljdWx0eSkK
+IAogLS0gbGV2ZWwgbG9hZCBkaWFnbm9zdGljIHN1bW1hcnkKIHByaW50aCgiPT09IExFVkVMIExP
+QUQgRElBR05PU1RJQ1MgPT09IikKIHByaW50aCgiRmxvb3I6ICIuLihjdXJyZW50X2Zsb29yIG9y
+ICJ1bmtub3duIikpCiBwcmludGgoIkRpZmZpY3VsdHk6ICIuLmdlbl9wYXJhbXMuZGlmZmljdWx0
+eSkKIHByaW50aCgiUm9vbXM6ICIuLmdlbl9zdGF0cy5yb29tcykKIHByaW50aCgiT2JqZWN0czog
+Ii4uZ2VuX3N0YXRzLm9iamVjdHMpCiBwcmludGgoIlNlZWQ6ICIuLmdlbl9zdGF0cy5zZWVkKQpl
+bmQKCi0tIHVwZGF0ZSBjb21iYXQgKHBsYWNlaG9sZGVyKQpmdW5jdGlvbiB1cGRhdGVfY29tYmF0
+KCkKIC0tIHRlbXAgZXhpdDogcHJlc3MgUSBvciBFbnRlcgogaWYga2V5cCgicSIpIG9yIGtleXAo
+ImVudGVyIikgdGhlbgogIGluX2NvbWJhdD1mYWxzZQogIGN1cnJlbnRfdGFyZ2V0PW5pbAogIHBy
+aW50aCgiZXhpdGVkIGNvbWJhdCIpCiBlbmQKZW5kCgotLSB1cGRhdGUgbnBjIGFpIChiYXNpYyBw
+YXRyb2wgYW5kIGZvbGxvdykKZnVuY3Rpb24gdXBkYXRlX25wY19haSgpCiBmb3Igb2IgaW4gYWxs
+KG9iamVjdHMpIGRvCiAgaWYgb2IudHlwIGFuZCBvYi50eXAua2luZD09Imhvc3RpbGVfbnBjIiBh
+bmQgb2IuYWlfdHlwZSB0aGVuCiAgIGxvY2FsIG9sZF94LG9sZF95PW9iLnBvc1sxXSxvYi5wb3Nb
+Ml0KICAgCiAgIGlmIG9iLmFpX3R5cGU9PSJwYXRyb2wiIHRoZW4KICAgIC0tIHBhdHJvbDogY3lj
+bGUgdGhyb3VnaCBwYXRyb2xfcG9pbnRzCiAgICBpZiBvYi5wYXRyb2xfcG9pbnRzIGFuZCAjb2Iu
+cGF0cm9sX3BvaW50cz4wIHRoZW4KICAgICAtLSBpbml0aWFsaXplIHBhdHJvbF9pbmRleCBpZiBu
+aWwgb3IgMAogICAgIGlmIG5vdCBvYi5wYXRyb2xfaW5kZXggb3Igb2IucGF0cm9sX2luZGV4PT0w
+IHRoZW4KICAgICAgb2IucGF0cm9sX2luZGV4PTEKICAgICBlbmQKICAgICAKICAgICBsb2NhbCB0
+YXJnZXQ9b2IucGF0cm9sX3BvaW50c1tvYi5wYXRyb2xfaW5kZXhdCiAgICAgaWYgdGFyZ2V0IHRo
+ZW4KICAgICAgbG9jYWwgZHg9dGFyZ2V0Lngtb2IucG9zWzFdCiAgICAgIGxvY2FsIGR5PXRhcmdl
+dC55LW9iLnBvc1syXQogICAgICBsb2NhbCBkaXN0PXNxcnQoZHgqZHgrZHkqZHkpCiAgICAgIAog
+ICAgICAtLSByZWFjaGVkIHdheXBvaW50OiBhZHZhbmNlIHRvIG5leHQKICAgICAgaWYgZGlzdDww
+LjEgdGhlbgogICAgICAgb2IucGF0cm9sX2luZGV4PShvYi5wYXRyb2xfaW5kZXglI29iLnBhdHJv
+bF9wb2ludHMpKzEKICAgICAgZWxzZQogICAgICAgLS0gbW92ZSB0b3dhcmQgY3VycmVudCB3YXlw
+b2ludAogICAgICAgaWYgZGlzdD4wIHRoZW4KICAgICAgICBsb2NhbCBzcGQ9b2IudHlwLnBhdHJv
+bF9zcGVlZCBvciAwLjAzCiAgICAgICAgbG9jYWwgbng9b2IucG9zWzFdK2R4L2Rpc3Qqc3BkCiAg
+ICAgICAgbG9jYWwgbnk9b2IucG9zWzJdK2R5L2Rpc3Qqc3BkCiAgICAgICAgdHJ5bW92ZXRvX3Bv
+cyhvYi5wb3Msbngsbnksb2IudHlwLncgb3IgMC40LGZhbHNlLGZhbHNlKQogICAgICAgZW5kCiAg
+ICAgIGVuZAogICAgIGVuZAogICAgZW5kCiAgICAKICAgZWxzZWlmIG9iLmFpX3R5cGU9PSJmb2xs
+b3ciIHRoZW4KICAgIC0tIGZvbGxvdzogbW92ZSB0b3dhcmQgcGxheWVyIGlmIGluIHJhbmdlCiAg
+ICBsb2NhbCBkeD1wbGF5ZXIueC1vYi5wb3NbMV0KICAgIGxvY2FsIGR5PXBsYXllci55LW9iLnBv
+c1syXQogICAgbG9jYWwgZGlzdD1zcXJ0KGR4KmR4K2R5KmR5KQogICAgbG9jYWwgZm9sbG93X3Jh
+bmdlPW9iLnR5cC5mb2xsb3dfcmFuZ2Ugb3IgMjAKICAgIGlmIGRpc3Q8Zm9sbG93X3JhbmdlIGFu
+ZCBkaXN0PjAuMSB0aGVuCiAgICAgbG9jYWwgc3BkPW9iLnR5cC5mb2xsb3dfc3BlZWQgb3IgMC4w
+NQogICAgIGxvY2FsIG54PW9iLnBvc1sxXStkeC9kaXN0KnNwZAogICAgIGxvY2FsIG55PW9iLnBv
+c1syXStkeS9kaXN0KnNwZAogICAgIHRyeW1vdmV0b19wb3Mob2IucG9zLG54LG55LG9iLnR5cC53
+IG9yIDAuNCxmYWxzZSxmYWxzZSkKICAgIGVuZAogICBlbmQKICBlbmQKIGVuZAplbmQ=
 :: src/.info.pod
---[[pod,created="2025-11-07 22:14:13",modified="2025-11-12 02:28:40"]]
+--[[pod,created="2025-11-07 22:14:13",modified="2025-11-12 09:54:32"]]
 :: tests/.info.pod
---[[pod,created="2025-11-12 02:28:40",modified="2025-11-12 02:28:40"]]
+--[[pod,created="2025-11-12 09:54:32",modified="2025-11-12 09:54:32"]]
 :: [eoc]

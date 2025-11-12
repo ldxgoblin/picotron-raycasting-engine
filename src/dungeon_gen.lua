@@ -47,6 +47,10 @@ local adaptive_settings=rawget(_G,"gen_adaptive_settings") or {
 local room_failure_streak=0
 local total_room_failures=0
 
+local tick_spacing -- forward declaration
+local gen_log -- forward declaration
+local relax_spacing -- forward declaration
+
 local function hist_push(entry)
  if not observability.capture_history then return end
  add(gen_history,entry)
@@ -54,8 +58,6 @@ local function hist_push(entry)
   deli(gen_history,1)
  end
 end
-
-local tick_spacing
 
 local function register_room_failure(reason)
  room_failure_streak+=1
@@ -75,7 +77,7 @@ local function register_room_success()
  tick_spacing(true)
 end
 
-local function gen_log(tag,msg)
+gen_log=function(tag,msg)
  local line="["..tag.."] "..msg
  hist_push(line)
  if observability.enable_console then printh(line) end
@@ -104,7 +106,7 @@ local function reset_adaptive_spacing()
  total_room_failures=0
 end
 
-local function relax_spacing()
+relax_spacing=function()
  if spacing_relaxations>=(adaptive_settings.spacing_max_relax or 4) then return end
  dynamic_spacing=max(0,dynamic_spacing-(adaptive_settings.spacing_relax_step or 1))
  spacing_relaxations+=1
@@ -112,7 +114,7 @@ local function relax_spacing()
  gen_log("spacing","relaxed spacing to "..dynamic_spacing)
 end
 
-local function tick_spacing(success)
+tick_spacing=function(success)
  if success then
   if spacing_restore_timer>0 then
    spacing_restore_timer-=1
